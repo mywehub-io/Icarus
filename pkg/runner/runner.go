@@ -24,22 +24,55 @@ import (
 )
 
 // Processor defines the interface for message processing implementations.
-// Implementations should handle the business logic for processing individual messages.
+//
+// Goroutine safety: the runner invokes Process concurrently from multiple
+// worker goroutines. Implementations MUST be safe for concurrent use. Shared
+// state (e.g. gRPC clients, connection pools, caches) must use locks or be
+// immutable after construction.
+//
+// Return semantics:
+//   - nil error → processing succeeded; the runner calls ReportSuccess and
+//     ACKs the NATS message.
+//   - non-nil error → processing failed; the runner calls ReportError, which
+//     NAKs the NATS message for redelivery or routes to the DLQ when
+//     MaxDeliver is exhausted. It also invokes ProcessFailureObserver.
+//
+// Context: the ctx passed to Process is derived from the runner's main context
+// with an additional processTimeout deadline. When processTimeout fires,
+// ctx.Err() == context.DeadlineExceeded. Check ctx.Err() before long
+// operations to avoid unnecessary work after cancellation.
 type Processor interface {
 	Process(ctx context.Context, msg *message.Message) (message message.Message, err error)
 }
 
-// ProcessFailureObserver is called after ReportError successfully publishes a failed result,
-// for every processing error regardless of transient vs permanent classification in ReportError.
-// Use it for side effects such as observation (e.g. Argus node.ended). Implementations should be
-// idempotent or tolerate duplicate invocations when JetStream redelivers the same message.
-// Return errors only for logging; the runner does not retry observation.
+// ProcessFailureObserver is called after ReportError successfully publishes a
+// failed result. It is invoked for every processing error regardless of
+// whether the error is transient or permanent.
+//
+// Typical use: emit a node.ended Argus observation event with HasError=true
+// (see pkg/runner/argus/observer.go for the standard implementation).
+//
+// Idempotency: the observer MAY be called more than once for the same message
+// when JetStream redelivers the message after an AckWait timeout. Implementations
+// MUST be idempotent or tolerate duplicate invocations (e.g. use the message
+// dedup key as the Argus event ID).
+//
+// Return errors only for logging; the runner does not retry the observer and
+// does not change the NATS ack outcome based on the observer's return value.
 type ProcessFailureObserver func(ctx context.Context, msg *message.Message, processErr error) error
 
 // RunnerOption configures a Runner at construction time.
+// Options are applied after the Runner struct is initialised and after stream/consumer
+// existence is verified, so option closures may safely reference the resolved config.
 type RunnerOption func(*Runner)
 
-// WithProcessFailureObserver registers an observer invoked after every successful ReportError.
+// WithProcessFailureObserver registers a ProcessFailureObserver that is called after
+// every successful ReportError. Without this option, processing failures are logged but
+// no Argus node.ended event is emitted, which causes nodes to remain in the "running"
+// state in Athena and may cause Hermes trigger-sync to hang indefinitely waiting for
+// the node-ended manifest entry.
+//
+// Use pkg/runner/argus.NewProcessFailureObserver for the standard Argus implementation.
 func WithProcessFailureObserver(obs ProcessFailureObserver) RunnerOption {
 	return func(r *Runner) {
 		r.processFailureObserver = obs
@@ -47,8 +80,24 @@ func WithProcessFailureObserver(obs ProcessFailureObserver) RunnerOption {
 }
 
 // Runner manages concurrent message processing from a NATS JetStream consumer.
-// It pulls messages in batches and dispatches them through an internal worker pool for processing,
-// with automatic success and error reporting to the "result" subject.
+// It pulls messages in batches and dispatches them through an internal worker
+// pool, with automatic success and error reporting to the RESULTS stream.
+//
+// Goroutine safety: Runner itself is not safe for concurrent Start/Stop calls.
+// Call Run once per Runner instance. Run is safe to call from a single
+// goroutine; all internal concurrency is managed by the runner's worker pool.
+//
+// Cancellation: cancel the context passed to Run to initiate graceful shutdown.
+// Run drains the job channel and waits for all in-flight Process calls to
+// complete before returning. In-flight messages are allowed to finish; new
+// pulls stop immediately on context cancellation. If a process context
+// deadline (processTimeout) fires during shutdown, the worker logs a warning
+// and reports the error, then the drain continues.
+//
+// Worker pool size: resolved at construction from Config.WorkerCount,
+// ICARUS_RUNNER_WORKERS env, ICARUS_RUNNER_WORKER_MULTIPLIER × GOMAXPROCS,
+// or GOMAXPROCS as the fallback (in that order). Queue depth defaults to
+// 4 × WorkerCount (capped at 1000).
 type Runner struct {
 	client                 *client.Client
 	processor              Processor
@@ -236,10 +285,31 @@ func (r *Runner) Close() error {
 	return nil
 }
 
-// Run starts the message processing pipeline.
-// It pulls messages from the configured stream and processes them through the internal worker pool.
-// The method blocks until the context is cancelled and all processing goroutines have finished.
-// Returns an error if there's a critical failure that prevents the runner from continuing.
+// Run starts the message processing pipeline and blocks until shutdown completes.
+//
+// Startup: Run launches WorkerCount worker goroutines and one puller goroutine,
+// then enters a pull-dispatch-ack loop. Worker pool sizing is resolved from
+// Config.WorkerCount (see NewRunner for the resolution order).
+//
+// Shutdown — cancel the context to stop: cancelling ctx signals both the puller
+// and all workers. The puller stops pulling immediately; any messages already in
+// jobChan are drained and processed to completion. Run returns only after every
+// in-flight Process call has returned. There is no explicit stop timeout for
+// draining workers — each Process call is bounded by processTimeout, so the
+// maximum drain time is bounded by processTimeout.
+//
+// Error handling on pull failures: transient pull errors are retried with
+// exponential backoff (100 ms → 5 s). Permanent or context-cancelled pull
+// failures cause Run to return the context error.
+//
+// Return values:
+//   - nil — the puller goroutine exited cleanly (rare; requires the pull loop to
+//     return on its own rather than via ctx.Done()).
+//   - context.Canceled / context.DeadlineExceeded — normal shutdown path when
+//     the caller cancels ctx.
+//
+// There is no separate Stop method. Stopping is always done by cancelling the
+// context passed to Run.
 func (r *Runner) Run(ctx context.Context) error {
 	var (
 		backgroundWG sync.WaitGroup
