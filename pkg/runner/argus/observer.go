@@ -45,11 +45,44 @@ func embeddedNodeDepth(nodes []message.EmbeddedNode, nodeID string) (int, bool) 
 }
 
 // NewProcessFailureObserver returns a runner.ProcessFailureObserver that emits Argus
-// node.ended for failed trigger runs. When the triggers processor sets embed_failed_node_id /
-// embed_root_cause (structured embedded failure), the observer does not re-emit the parent
-// (already success) or the failing embedded node (subflow already emitted node.ended), and does
-// not emit anything for downstream embedded nodes that never ran. Otherwise it falls back to
-// emitting parent + all embedded as failed.
+// node.ended events for the failed trigger run.
+//
+// When it fires: the runner calls the returned observer after ReportError has
+// successfully published to the RESULTS stream (i.e., Temporal's workflow
+// activity has received the error signal). The observer is NOT called on
+// successful processing.
+//
+// Idempotency: JetStream may redeliver a message after an AckWait timeout even
+// when the processor already failed and ReportError was called. Each redelivery
+// triggers the observer again. The emitter's EventID (derived from
+// workflowID + runID + nodeID) must be stable across retries so that Athena
+// treats duplicate node.ended events as the same event.
+//
+// Produced payload (node.ended event):
+//   - ClientID, ProjectID, WorkflowID, RunID, NodeID — taken from message
+//     metadata and msg.Workflow / msg.Node.
+//   - Output — always {"error": true, "description": processErr.Error()}.
+//   - HasError = true, ErrorMessage = processErr.Error().
+//   - ContainsNodes — for the parent event, the list of EmbeddedNode IDs so
+//     Athena can mark them all as completed (failed) in one update.
+//
+// Structured embedded failure path: when the processor sets embed_failed_node_id
+// and embed_root_cause in message metadata (see pkg/embedded/runtime constants),
+// the embedded subflow has already emitted node.ended for all embedded nodes it
+// processed (success or failure). This observer then skips re-emission for all
+// embedded nodes (to avoid overwriting their status), and also skips the parent
+// (it already emitted node.ended success). It returns nil immediately.
+//
+// Fallback path: when embed_failed_node_id is absent, the observer emits
+// node.ended (HasError=true) for the parent node first, then for every
+// EmbeddedNode in msg.EmbeddedNodes in order. This covers cases where the
+// processor panicked or failed before the embedded subflow ran.
+//
+// Relationship to Argus packages: this observer calls argusemitter.NodeEndEmitter
+// (from Argus pkg/emitter), which calls argusemitter.PreparePayload and then
+// publishes to the OBSERVATION NATS stream via the Argus pkg/observer. It does
+// not use pkg/observer directly — it is wired to the higher-level
+// NodeEndEmitter abstraction so the caller controls transport details.
 func NewProcessFailureObserver(emitter argusemitter.NodeEndEmitter, logger *zap.Logger) runner.ProcessFailureObserver {
 	if logger == nil {
 		logger = zap.NewNop()

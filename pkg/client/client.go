@@ -52,12 +52,17 @@ type Client struct {
 	blobStorage BlobStorageClient
 }
 
-// NewClient creates a new JetStream SDK client with default configuration.
+// NewClient creates a new JetStream SDK client with default connection configuration.
 // The URL parameter specifies the NATS server address (e.g., "nats://localhost:4222").
-// The resultStream and resultSubject parameters configure where results are published (e.g., RESULTS_UAT, result.uat).
+// resultStream and resultSubject configure where processed results are published
+// (e.g., "RESULTS_UAT" / "result.uat" for UAT; "RESULTS" / "result" for production).
+//
+// NewClient never fails — it returns an inert, disconnected client. All startup
+// failures surface in Connect(). Callers must call Connect() before using
+// Messages or any other service field; using an unconnected client causes a nil
+// pointer panic.
 //
 // Note: JetStream must be enabled on the NATS server for this SDK to function.
-// The client must be connected using Connect() before use.
 //
 // Example:
 //
@@ -177,17 +182,24 @@ func (c *Client) SetLogger(logger *zap.Logger) {
 	}
 }
 
-// Close gracefully closes the NATS connection and cleans up all resources.
-// It drains in-flight messages before closing to ensure no message loss.
+// Close gracefully drains in-flight messages and closes the NATS connection.
 //
-// This method should always be called when done with the client, typically
-// using defer immediately after Connect().
+// Precedence / call order: always stop the Runner first (by cancelling its
+// context and waiting for Run to return), then call Close. If Close is called
+// while the runner's puller or worker goroutines are still active they may
+// receive errors on the next publish/pull attempt; those errors are logged but
+// do not cause data loss because NATS will redeliver unacked messages.
+//
+// Idempotency: calling Close on an already-closed or never-connected client
+// is a no-op (returns nil).
+//
+// After Close, c.Messages is set to nil. Any subsequent call to c.Messages
+// methods panics with a nil pointer dereference.
 //
 // Example:
 //
-//	client := client.NewClient("nats://localhost:4222")
 //	if err := client.Connect(ctx); err != nil {
-//	    client.logger.Fatal("Failed to connect", zap.Error(err))
+//	    logger.Fatal("Failed to connect", zap.Error(err))
 //	}
 //	defer client.Close()
 func (c *Client) Close() error {
@@ -229,16 +241,20 @@ func (c *Client) Connection() *natsclient.Conn {
 	return c.conn
 }
 
-// JetStream returns the JetStream context for advanced JetStream operations.
-// Returns nil if JetStream is not enabled on the NATS server.
+// JetStream returns the underlying JetStream context for advanced operations such as
+// creating streams, inspecting consumer state, or publishing with custom options.
 //
-// This provides direct access to JetStream features like stream and consumer management.
+// Returns nil if Connect() has not been called or if JetStream is not enabled on
+// the NATS server (the latter causes Connect() to fail anyway).
+//
+// Prefer the higher-level c.Messages methods for all routine publish/pull/report
+// operations; JetStream() is intended for administrative tasks (stream/consumer
+// management) and for test helpers that need direct JetStream access.
 //
 // Example:
 //
 //	js := client.JetStream()
 //	if js != nil {
-//	    // Create a stream
 //	    js.AddStream(&nats.StreamConfig{
 //	        Name:     "EVENTS",
 //	        Subjects: []string{"events.>"},

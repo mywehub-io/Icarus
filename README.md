@@ -2235,10 +2235,15 @@ c.Messages.Publish(ctx, "subject", msg)
 
 ## Changelog
 
-- **2026-03-23**: Subflow now emits `node.started` (without input) for all embedded nodes at the start of processing, before any node runs. This provides early timeline visibility; input is backfilled when each node actually runs.
-- **2026-03-23**: Embedded runtime now emits `node.started` even when input is empty by normalizing empty input to `{}`. This preserves lifecycle visibility and allows downstream systems to backfill input later when a richer `node.started` arrives.
-- **2026-03-23**: Embedded runtime now emits `node.ended` for embedded nodes at actual completion time (success and failure paths). Zeus no longer needs to synthesize embedded `node.ended` events from parent unit results.
-- **2026-03-23**: Embedded runtime now propagates `has_error` and `error_message` on embedded `node.ended` emissions, and carries output payload on `node.ended` so Athena can surface error payloads consistently without standalone `node.output`.
-- **2026-02-27**: `NormalizeRawConfig` now merges flattened nodeSchema values into the existing config instead of replacing it. This preserves top-level keys like `connection_id`, `connection`, and `manual_inputs` (from Elysium enrichment) when config uses nodeSchema format, fixing HTTP Client "connection_id is required" errors after enrichment.
-- **2025-11-24**: Standardized embedded processor plugin identifiers. Use `plugin-js`, `plugin-json-operations`, and `plugin-dateformatter` across workflows, configs, and tests.
-- **2025-02-20**: Added `plugin-http-client` embedded processor. Sends HTTP requests using a configured Nyx HTTP connection, optional headers (`manual_inputs`), and input payload. Outputs `status` (number) and `body` (byte). Requires connection enrichment from Elysium (connection_id → connection).
+Recent entries (last 3):
+
+- **[0.10.0] 2026-05-07**: Embedded node failures now propagate correctly through
+  `ProcessFailureObserver` via the new `NodeFailureError` type carrying `NodeID`,
+  `PluginType`, and `Permanent bool`.
+- **[0.9.0] 2026-05-03**: CSV column ordering is now controlled by the `position` field
+  in the schema definition.
+- **[0.8.0] 2026-04-23**: New `ProcessOptions.CodeSeverityOverrides` replaces the
+  removed `ValidationMode`/`StrictValidation`. Allows per-code severity override
+  including `SeverityDrop` to suppress a code entirely.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history.
