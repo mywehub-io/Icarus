@@ -47,6 +47,12 @@ const (
 	// the required Cerberus permission. Maps to gRPC codes.PermissionDenied
 	// (HTTP 403). Do not retry; grant the permission first.
 	PermissionDenied
+
+	// FailedPrecondition indicates that the request is syntactically valid but
+	// cannot be executed in the current system state (e.g. required published
+	// workflow metadata is missing). Maps to gRPC codes.FailedPrecondition
+	// (HTTP 400). Callers should fix the precondition and retry.
+	FailedPrecondition
 )
 
 // AppError is the canonical error type across all Olympus Go services.
@@ -152,6 +158,17 @@ func NewPermissionDeniedError(message string, code string, cause error) *AppErro
 	}
 }
 
+// NewFailedPreconditionError constructs an AppError with Type == FailedPrecondition.
+// Use when the request is valid but cannot be satisfied due to current state.
+func NewFailedPreconditionError(message string, code string, cause error) *AppError {
+	return &AppError{
+		Type:    FailedPrecondition,
+		Message: message,
+		Code:    code,
+		Err:     cause,
+	}
+}
+
 // NewInternalError constructs an AppError with Type == Internal and captures
 // the event in Sentry. metaData is an optional structured string prepended to
 // the Sentry message (e.g. "service=zeus run_id=abc"); pass "" to omit it.
@@ -202,6 +219,8 @@ func (e *AppError) ToGRPCError() error {
 		grpcCode = codes.AlreadyExists
 	case ValidationFailed:
 		grpcCode = codes.InvalidArgument
+	case FailedPrecondition:
+		grpcCode = codes.FailedPrecondition
 	case Internal:
 		fallthrough
 	default:
