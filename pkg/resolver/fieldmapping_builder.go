@@ -1179,15 +1179,11 @@ func buildInputFromMappings(params BuildInputParams) ([]byte, error) {
 		}
 
 		if sourceData == nil {
-			// Track the failure with available field keys
-			fieldKeys := []string{}
-			if sourceResult.ProjectedFields != nil {
-				if nodeFields, hasNode := sourceResult.ProjectedFields[mapping.SourceNodeID]; hasNode {
-					fieldKeys = getMapKeys(nodeFields)
-				}
-			}
-			failedMappings = append(failedMappings, fmt.Sprintf("failed to extract '%s' from source node '%s' (available fields: %v)",
-				mapping.SourceEndpoint, mapping.SourceNodeID, fieldKeys))
+			// The source field is absent from the upstream output — treat as an optional field
+			// and skip silently. The plugin will fall back to its nodeConfig defaults
+			// (e.g. an SFTP node whose path was not overridden will use its configured
+			// default path). Only structural failures (source node not found, non-success
+			// status) are recorded in failedMappings and cause a hard error.
 			continue
 		}
 
@@ -1286,17 +1282,17 @@ func buildInputFromMappings(params BuildInputParams) ([]byte, error) {
 	}
 
 	if len(inputData) == 0 {
-		// No field mappings succeeded - return detailed error instead of falling back to trigger data
 		if len(failedMappings) > 0 {
+			// Structural failures: source node not found or had a non-success status.
 			return nil, fmt.Errorf("field mapping resolution failed: no data could be extracted. Failures: %s",
 				strings.Join(failedMappings, "; "))
 		}
-		// No field mappings at all
-		if len(params.FieldMappings) == 0 {
-			return []byte("{}"), nil
-		}
-		// All mappings were event triggers
-		return nil, fmt.Errorf("field mapping resolution failed: no non-event-trigger field mappings were provided")
+		// inputData is empty but there are no structural failures. This happens when:
+		//   - all source fields were absent from upstream output (optional fields), or
+		//   - all mappings were event triggers, or
+		//   - there were no mappings at all.
+		// Return an empty object so the plugin can apply its nodeConfig defaults.
+		return []byte("{}"), nil
 	}
 
 	result, err := json.Marshal(inputData)
