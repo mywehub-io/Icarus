@@ -5703,14 +5703,14 @@ func TestBuildInputFromMappings_EmptyDestinationEndpoints(t *testing.T) {
 	}
 
 	// Should NOT panic even though DestinationEndpoints is empty.
-	// The builder will return an error because no data could be extracted,
-	// but the critical thing is: no index-out-of-range panic.
-	_, err := buildInputFromMappings(params)
-	if err == nil {
-		t.Fatal("expected error for mapping with empty destinations, got nil")
+	// The mapping produces no output because there are no destinations to write to.
+	// The builder returns {} so that the plugin can fall back to its nodeConfig defaults.
+	result, err := buildInputFromMappings(params)
+	if err != nil {
+		t.Fatalf("expected no error for mapping with empty destinations, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "field mapping resolution failed") {
-		t.Errorf("expected field mapping resolution error, got: %v", err)
+	if string(result) != "{}" {
+		t.Errorf("expected '{}' for mapping with empty destinations, got: %s", string(result))
 	}
 }
 
@@ -5825,14 +5825,55 @@ func TestBuildInputFromMappings_AllEventTriggerMappings(t *testing.T) {
 		SourceResults: map[string]*SourceResult{},
 	}
 
-	// All mappings are event triggers, so no data can be extracted.
-	// The builder returns an error for this case.
-	_, err := buildInputFromMappings(params)
-	if err == nil {
-		t.Fatal("expected error for all-event-trigger mappings, got nil")
+	// All mappings are event triggers, so no field data is extracted.
+	// The builder returns {} so the plugin can fall back to its nodeConfig defaults.
+	result, err := buildInputFromMappings(params)
+	if err != nil {
+		t.Fatalf("expected no error for all-event-trigger mappings, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no non-event-trigger") {
-		t.Errorf("expected 'no non-event-trigger' message, got: %v", err)
+	if string(result) != "{}" {
+		t.Errorf("expected '{}' for all-event-trigger mappings, got: %s", string(result))
+	}
+}
+
+// TestBuildInputFromMappings_NilSourceFieldReturnsEmptyObject verifies that when
+// the upstream output does not contain the field referenced by a field mapping,
+// the builder returns {} instead of an error so that the plugin can fall back to
+// its nodeConfig defaults.
+//
+// Scenario: SFTP List Files is configured with path "/" in its nodeConfig. The
+// trigger fires with no path field. An embedded JSON Parser receives the trigger
+// payload and produces output with no "/path" key. The SFTP field mapping
+// references "/path" from the JSON Parser, which is absent. The builder must
+// return {} — not an error — so the SFTP activity can use its "/"  default.
+func TestBuildInputFromMappings_NilSourceFieldReturnsEmptyObject(t *testing.T) {
+	// JSON Parser produced output with no "/path" key.
+	params := BuildInputParams{
+		FieldMappings: []message.FieldMapping{
+			{
+				SourceNodeID:         "json-parser-node",
+				SourceEndpoint:       "/path",
+				DestinationEndpoints: []string{"/path"},
+			},
+		},
+		SourceResults: map[string]*SourceResult{
+			"json-parser-node": {
+				NodeID: "json-parser-node",
+				Status: "success",
+				ProjectedFields: map[string]map[string]interface{}{
+					// JSON Parser ran successfully but produced no "path" field.
+					"json-parser-node": {"data": map[string]interface{}{"foo": "bar"}},
+				},
+			},
+		},
+	}
+
+	result, err := buildInputFromMappings(params)
+	if err != nil {
+		t.Fatalf("expected no error when source field is absent, got: %v", err)
+	}
+	if string(result) != "{}" {
+		t.Errorf("expected '{}' when source field is absent, got: %s", string(result))
 	}
 }
 
