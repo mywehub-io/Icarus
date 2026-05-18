@@ -1518,6 +1518,10 @@ When neither `message` nor `default_error_message` is set, the runtime uses a de
   - a **field mapping** (e.g. `/errorDescription` as a `FIELD` into a handler node).
 - If at least one such mapping exists, the embedded runtime treats the error as **handled** and does not fail-fast; if no mappings from `pluginError` exist, the error bubbles up and causes the embedded unit / workflow run to fail, making this node useful for hard-stop guards as well as structured error flows.
 
+**Success-path guarantee for `pluginError` consumers:**
+
+Any node that maps from another node's `pluginError` section receives `error = false` and `errorDescription = ""` when that source node **succeeded**, regardless of whether the source is the parent unit, an embedded sibling in the same unit, or a node from a prior unit. The runtime synthesises these defaults at input-resolution time so that a downstream condition checking `error equals false` evaluates correctly without the source node having to include those keys in its own output payload.
+
 ## String Processing Utilities
 
 The SDK includes comprehensive string processing utilities for workflow orchestration and data manipulation:
