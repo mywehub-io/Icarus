@@ -1627,12 +1627,17 @@ func (sp *SubflowProcessor) buildItemInput(
 			if m.SourceSectionId == SectionDefault && IsErrorOnlyOutput(sourceOut) {
 				continue
 			}
+			// Same pluginError success-path enrichment as buildSingleNodeInput.
+			effectiveOut := sourceOut
+			if m.SourceSectionId == SectionPluginError && !IsErrorOnlyOutput(sourceOut) {
+				effectiveOut = withImplicitNoErrorDefaults(sourceOut)
+			}
 			if strings.Contains(m.SourceEndpoint, "//") {
 				// Parse the nested path and extract value considering current context
-				val = sp.extractNestedValueFromSource(sourceOut, m.SourceEndpoint, itemStore, itemIndex)
+				val = sp.extractNestedValueFromSource(effectiveOut, m.SourceEndpoint, itemStore, itemIndex)
 			} else {
 				// Simple path extraction
-				val = sp.extractValue(sourceOut, m.SourceEndpoint)
+				val = sp.extractValue(effectiveOut, m.SourceEndpoint)
 			}
 		}
 
@@ -1900,12 +1905,20 @@ func (sp *SubflowProcessor) buildSingleNodeInput(
 			continue
 		}
 
+		// When reading from a pluginError section on the success path, synthesise the implicit
+		// error:false / errorDescription:"" defaults that the source node never stores itself.
+		// IsErrorOnlyOutput guards the failure path so real error values are never overwritten.
+		effectiveOut := sourceOut
+		if m.SourceSectionId == SectionPluginError && !IsErrorOnlyOutput(sourceOut) {
+			effectiveOut = withImplicitNoErrorDefaults(sourceOut)
+		}
+
 		// Normalize source endpoint: //field -> /$items//field for root-array access
 		normalizedEndpoint := NormalizeRootArrayEndpoint(m.SourceEndpoint)
 
 		// Check for root-as-array with empty sourceEndpoint (pass-through case)
 		if m.SourceEndpoint == "" {
-			if items, ok := sourceOut[RootArrayKey]; ok {
+			if items, ok := effectiveOut[RootArrayKey]; ok {
 				// Pass the raw array directly to destination endpoints
 				for _, dest := range m.DestinationEndpoints {
 					if dest == "" {
@@ -1918,7 +1931,7 @@ func (sp *SubflowProcessor) buildSingleNodeInput(
 			}
 		}
 
-		val := sp.extractValue(sourceOut, normalizedEndpoint)
+		val := sp.extractValue(effectiveOut, normalizedEndpoint)
 		if val == nil {
 			continue
 		}
