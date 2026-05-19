@@ -17,8 +17,9 @@ type Config struct {
 	// Schema is the Icarus schema definition (optional, used if schema_id is not enriched)
 	Schema json.RawMessage `json:"schema,omitempty"`
 
-	// ApplyDefaults applies default values from schema (parse action)
-	// Default: true for parse, false for produce
+	// ApplyDefaults applies default values from schema for fields that are missing in the input.
+	// Default: true for both parse and produce.
+	// Set explicitly to false to skip default injection (e.g. when the caller guarantees all fields are present).
 	ApplyDefaults *bool `json:"apply_defaults,omitempty"`
 
 	// StructureData removes fields not defined in schema
@@ -61,13 +62,13 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// GetApplyDefaults returns the apply_defaults value with action-specific defaults
+// GetApplyDefaults returns the apply_defaults value, defaulting to true for both actions.
+// Schema defaults only fill in missing fields and never overwrite existing values.
 func (c *Config) GetApplyDefaults() bool {
 	if c.ApplyDefaults != nil {
 		return *c.ApplyDefaults
 	}
-	// Default to true for parse (to fill in missing fields), false for produce
-	return c.Action == "parse"
+	return true
 }
 
 // GetStructureData returns the structure_data value with action-specific defaults

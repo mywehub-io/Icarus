@@ -1522,6 +1522,23 @@ When neither `message` nor `default_error_message` is set, the runtime uses a de
 
 Any node that maps from another node's `pluginError` section receives `error = false` and `errorDescription = ""` when that source node **succeeded**, regardless of whether the source is the parent unit, an embedded sibling in the same unit, or a node from a prior unit. The runtime synthesises these defaults at input-resolution time so that a downstream condition checking `error equals false` evaluates correctly without the source node having to include those keys in its own output payload.
 
+### Constant Value Generator (`plugin-constant-value-generator`)
+
+The Constant Value Generator is a source-style embedded node that emits a fixed set of typed values without requiring any input.
+
+**Configuration:**
+
+- **label**: Display name for the node (from the Apollo node schema).
+- **constants**: Array of `{ name, type, value }` entries. Each entry becomes an output port keyed by `name`.
+  - **type**: `string`, `number`, or `boolean`.
+  - **value**: Literal value (stored as text in the schema; native JSON bool/number are accepted when unmarshalling).
+
+**Behavior:**
+
+- Ignores `ProcessInput.Data`; the node has no input fields.
+- On success, returns `ProcessOutput.Data` with one key per constant `name` and the value cast to the appropriate Go type (`string`, `float64`, or `bool`).
+- Registered in `pkg/embedded/processors/registry.go` via `constantvalue.NewConstantValueNode`.
+
 ## String Processing Utilities
 
 The SDK includes comprehensive string processing utilities for workflow orchestration and data manipulation:

@@ -58,12 +58,12 @@ func (n *JsonOpsNode) executeProduce(input runtime.ProcessInput, cfg *Config) ru
 		))
 	}
 
-	// Process with schema (no defaults on produce, structure and validate)
+	// Process with schema: apply defaults per config, structure and validate
 	result, err := engine.ProcessWithSchema(
 		dataToProcess,
 		cfg.Schema,
 		schema.ProcessOptions{
-			ApplyDefaults: false,
+			ApplyDefaults: cfg.GetApplyDefaults(),
 			StructureData: cfg.GetStructureData(),
 		},
 	)

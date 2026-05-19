@@ -43,8 +43,8 @@ func TestConfigDefaults(t *testing.T) {
 	}
 
 	cfgProduce := jsonops.Config{Action: "produce", SchemaID: "sid"}
-	if cfgProduce.GetApplyDefaults() {
-		t.Fatalf("produce should default apply_defaults false")
+	if !cfgProduce.GetApplyDefaults() {
+		t.Fatalf("produce should default apply_defaults true")
 	}
 	if !cfgProduce.GetStructureData() {
 		t.Fatalf("produce should default structure_data true")
