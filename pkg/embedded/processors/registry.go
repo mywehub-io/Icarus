@@ -1,6 +1,7 @@
 package processors
 
 import (
+	"github.com/wehubfusion/Icarus/pkg/embedded/processors/constantvalue"
 	"github.com/wehubfusion/Icarus/pkg/embedded/processors/errornode"
 	"github.com/wehubfusion/Icarus/pkg/embedded/processors/dateformatter"
 	"github.com/wehubfusion/Icarus/pkg/embedded/processors/httpclient"
@@ -36,6 +37,9 @@ func NewProcessorRegistry() runtime.EmbeddedNodeFactory {
 
 	// Register error processor
 	factory.Register("plugin-error", errornode.NewErrorNode)
+
+	// Register constant value generator processor
+	factory.Register("plugin-constant-value-generator", constantvalue.NewConstantValueNode)
 
 	// Future processors can be registered here...
 
