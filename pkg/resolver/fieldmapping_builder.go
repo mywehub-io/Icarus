@@ -987,6 +987,19 @@ func buildInputFromMappings(params BuildInputParams) ([]byte, error) {
 				}
 				continue // Skip fallback
 			}
+
+			// The key is absent from the flat output. For pluginError section
+			// mappings that is the normal success path — the upstream node
+			// completed without writing /error — so synthesise the implicit
+			// "no error" value rather than leaving the destination unset.
+			if mapping.SourceSectionId == runtime.SectionPluginError {
+				if def := pluginErrorSectionDefault(mapping.SourceEndpoint); def != nil {
+					for _, destEndpoint := range mapping.DestinationEndpoints {
+						setFieldAtPath(inputData, destEndpoint, def)
+					}
+					continue
+				}
+			}
 		}
 
 		var sourceResult *SourceResult
@@ -1676,4 +1689,20 @@ func navigateMap(data map[string]interface{}, path string) interface{} {
 	}
 
 	return current
+}
+
+// pluginErrorSectionDefault returns the implicit "no error" value for a given
+// endpoint read from the pluginError section when the key is absent from the
+// flat StandardUnitOutput. An absent key means the upstream node succeeded
+// without explicitly writing /error, so /error defaults to false and
+// /errorDescription defaults to "".
+func pluginErrorSectionDefault(sourceEndpoint string) interface{} {
+	endpoint := strings.TrimPrefix(sourceEndpoint, "/")
+	switch endpoint {
+	case runtime.ErrorOutputKeyError:
+		return false
+	case runtime.ErrorOutputKeyDescription:
+		return ""
+	}
+	return nil
 }
