@@ -336,3 +336,124 @@ func TestShouldSkipNodeForItem_DoesNotSkipWhenSourceHasValidOutput(t *testing.T)
 		t.Fatal("expected condition node to NOT be skipped when its source has valid output")
 	}
 }
+
+// TestShouldSkipNode_SkipsWhenAllSourcesAbsent mirrors
+// TestShouldSkipNodeForItem_SkipsWhenAllSourcesAbsent for the non-iteration path:
+// a node whose only default-section source has no stored output (the upstream was
+// itself skipped) must be skipped instead of running with an empty input map.
+func TestShouldSkipNode_SkipsWhenAllSourcesAbsent(t *testing.T) {
+	const (
+		sourceNode   = "array-error-producer"
+		consumerNode = "error-gate-client"
+	)
+
+	sp := &SubflowProcessor{
+		nodeConfigs: []EmbeddedNodeConfig{
+			{
+				NodeId: consumerNode,
+				FieldMappings: []FieldMapping{
+					{
+						SourceNodeId:    sourceNode,
+						SourceEndpoint:  "/encoded",
+						SourceSectionId: SectionDefault,
+						DataType:        "FIELD",
+					},
+				},
+			},
+		},
+	}
+
+	config := sp.nodeConfigs[0]
+	store := NewNodeOutputStore() // sourceNode has no output in this store
+
+	if !sp.shouldSkipNode(config, store) {
+		t.Fatal("expected consumer node to be skipped when its source has no output")
+	}
+}
+
+// TestShouldSkipNode_DoesNotSkipWhenSourceHasValidOutput mirrors
+// TestShouldSkipNodeForItem_DoesNotSkipWhenSourceHasValidOutput for the non-iteration
+// path: the consumer must run when its default-section source has produced a valid,
+// non-error output.
+func TestShouldSkipNode_DoesNotSkipWhenSourceHasValidOutput(t *testing.T) {
+	const (
+		sourceNode   = "array-error-producer"
+		consumerNode = "error-gate-client"
+	)
+
+	sp := &SubflowProcessor{
+		nodeConfigs: []EmbeddedNodeConfig{
+			{
+				NodeId: consumerNode,
+				FieldMappings: []FieldMapping{
+					{
+						SourceNodeId:    sourceNode,
+						SourceEndpoint:  "/encoded",
+						SourceSectionId: SectionDefault,
+						DataType:        "FIELD",
+					},
+				},
+			},
+		},
+	}
+
+	config := sp.nodeConfigs[0]
+	store := NewNodeOutputStore()
+	store.SetSingleOutput(sourceNode, map[string]interface{}{
+		"encoded": "PID|1||...",
+	})
+
+	if sp.shouldSkipNode(config, store) {
+		t.Fatal("expected consumer node to NOT be skipped when its source has valid output")
+	}
+}
+
+// TestShouldSkipNode_HL7ValidatorReproducer captures the original production
+// scenario:
+//
+//	Hl7 Is Valid (Simple Condition) — emits {true: <hl7>, false: nil}
+//	-> Array Error Producer (event-triggered on /false; skipped when /false is nil)
+//	-> Error Gate Client (FIELD-mapped from Array Error Producer /encoded only;
+//	                      no event mapping; must skip when its only upstream
+//	                      source was skipped and therefore has no stored output)
+//
+// Before the fix in shouldSkipNode, Error Gate Client ran with an empty input
+// map and was reported as status:success rather than being absent from the
+// sync-completion response.
+func TestShouldSkipNode_HL7ValidatorReproducer(t *testing.T) {
+	const (
+		condNode   = "hl7-is-valid"
+		producer   = "array-error-producer"
+		gateClient = "error-gate-client"
+	)
+
+	sp := &SubflowProcessor{
+		nodeConfigs: []EmbeddedNodeConfig{
+			{
+				NodeId: gateClient,
+				FieldMappings: []FieldMapping{
+					{
+						SourceNodeId:    producer,
+						SourceEndpoint:  "/encoded",
+						SourceSectionId: SectionDefault,
+						DataType:        "FIELD",
+					},
+				},
+			},
+		},
+	}
+
+	config := sp.nodeConfigs[0]
+	store := NewNodeOutputStore()
+	// The Simple Condition ran and emitted {true: <hl7>, false: nil}; Array Error
+	// Producer was triggered off /false and was skipped, so it is absent from the
+	// store — exactly the production scenario.
+	store.SetSingleOutput(condNode, map[string]interface{}{
+		"true":  "MSH|^~\\&|...",
+		"false": nil,
+	})
+
+	if !sp.shouldSkipNode(config, store) {
+		t.Fatal("expected Error Gate Client to be skipped when Array Error Producer was filtered out upstream")
+	}
+}

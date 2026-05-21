@@ -1944,8 +1944,13 @@ func (sp *SubflowProcessor) buildSingleNodeInput(
 	return input
 }
 
-// shouldSkipNode checks if a node should be skipped due to event triggers
-// or because all its default-section sources emitted error-only output.
+// shouldSkipNode checks if a node should be skipped due to event triggers, or
+// because every default-section source is either absent from the store
+// (i.e. the upstream node was itself skipped and never produced output) or
+// produced error-only output. Mirrors the per-item semantics of
+// shouldSkipNodeForItem for the non-iteration execution path; the two must
+// stay in sync, otherwise downstream nodes can run with empty input when
+// all of their default sources have been filtered out upstream.
 func (sp *SubflowProcessor) shouldSkipNode(
 	config EmbeddedNodeConfig,
 	store *NodeOutputStore,
@@ -1974,7 +1979,10 @@ func (sp *SubflowProcessor) shouldSkipNode(
 		}
 	}
 
-	// Skip if this node only consumes default (success) section and all such sources have error-only output
+	// Skip if this node only consumes the default (success) section and every such source
+	// is either absent from the store (never ran, e.g. because an upstream gate filtered
+	// it out) or produced error-only output. A missing source is treated as "no valid
+	// output" rather than a reason to keep running.
 	defaultMappings := config.GetDefaultSectionFieldMappings()
 	if len(defaultMappings) == 0 || len(defaultMappings) != len(config.GetFieldMappings()) {
 		return false
@@ -1987,10 +1995,13 @@ func (sp *SubflowProcessor) shouldSkipNode(
 		seen[m.SourceNodeId] = true
 		sourceOut, ok := store.GetOutput(m.SourceNodeId, -1)
 		if !ok {
-			return false
+			// Source was never stored — treat as absent, not a signal to keep running.
+			// (Matches shouldSkipNodeForItem; without this, a downstream node whose sole
+			// upstream was skipped would execute with an empty input map.)
+			continue
 		}
 		if !IsErrorOnlyOutput(sourceOut) {
-			return false
+			return false // At least one source has valid output — do not skip.
 		}
 	}
 	return true

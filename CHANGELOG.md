@@ -13,6 +13,16 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Fixed
+
+- `public:` **Embedded subflow skip logic**: `shouldSkipNode` (non-iteration path) now
+  skips a downstream node when every one of its default-section sources is absent from
+  the output store, matching the per-item behaviour of `shouldSkipNodeForItem`
+  (`f8bf0ae`). Previously, a node whose sole upstream had itself been skipped would
+  run with an empty input map and surface as `status: success` rather than being
+  absent. Affects chains such as `SimpleCondition` → event-gated producer → FIELD-only
+  downstream node. (`pkg/embedded/runtime/subflow.go`)
+
 ## [0.10.0] — 2026-05-07
 
 ### Changed
