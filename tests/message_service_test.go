@@ -228,19 +228,19 @@ func TestMessageServicePullMessagesValidation(t *testing.T) {
 	ctx := context.Background()
 
 	// Test with empty stream name
-	_, err := c.Messages.PullMessages(ctx, "", "consumer", 10)
+	_, err := c.Messages.PullMessages(ctx, "", "", "consumer", 10)
 	if err == nil {
 		t.Error("Expected error for empty stream name")
 	}
 
 	// Test with empty consumer name
-	_, err = c.Messages.PullMessages(ctx, "stream", "", 10)
+	_, err = c.Messages.PullMessages(ctx, "", "stream", "", 10)
 	if err == nil {
 		t.Error("Expected error for empty consumer name")
 	}
 
 	// Test with zero batch size (should default to 10)
-	messages, err := c.Messages.PullMessages(ctx, "stream", "consumer", 0)
+	messages, err := c.Messages.PullMessages(ctx, "", "stream", "consumer", 0)
 	if err != nil {
 		t.Errorf("PullMessages with zero batch size failed: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestMessageServiceContextCancellation(t *testing.T) {
 	}
 
 	// Test PullMessages with cancelled context
-	_, err = c.Messages.PullMessages(ctx, "stream", "consumer", 10)
+	_, err = c.Messages.PullMessages(ctx, "", "stream", "consumer", 10)
 	if err == nil {
 		t.Error("Expected error for cancelled context in PullMessages")
 	}

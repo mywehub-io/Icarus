@@ -53,7 +53,7 @@ func runExamples(ctx context.Context, client *client.Client, sigChan chan os.Sig
 
 	// Create a basic message
 	basicMsg := message.NewMessage()
-	basicMsg.WithPayload( "Hello from Icarus!")
+	basicMsg.WithPayload("Hello from Icarus!")
 	basicMsg.WithMetadata("example", "basic-publish")
 	basicMsg.WithMetadata("timestamp", time.Now().Format(time.RFC3339))
 
@@ -80,7 +80,7 @@ func runExamples(ctx context.Context, client *client.Client, sigChan chan os.Sig
 		"timeout":        30,
 		"retry_count":    3,
 	})
-	workflowMsg.WithPayload( `{"user_id": 12345, "action": "purchase", "amount": 99.99}`)
+	workflowMsg.WithPayload(`{"user_id": 12345, "action": "purchase", "amount": 99.99}`)
 	workflowMsg.WithOutput("database")
 	workflowMsg.WithMetadata("priority", "high")
 	workflowMsg.WithMetadata("environment", "production")
@@ -102,6 +102,7 @@ func runExamples(ctx context.Context, client *client.Client, sigChan chan os.Sig
 
 	// Note: In a real application, you would need to create streams and consumers first
 	// This example demonstrates the pull-based approach using the available API
+	subjectFilter := "workflows.*"
 	streamName := "EVENTS"
 	consumerName := "example-consumer"
 
@@ -113,7 +114,7 @@ func runExamples(ctx context.Context, client *client.Client, sigChan chan os.Sig
 		fmt.Println("Attempting to pull messages...")
 
 		// Pull messages from the consumer
-		messages, err := client.Messages.PullMessages(ctx, streamName, consumerName, 5)
+		messages, err := client.Messages.PullMessages(ctx, subjectFilter, streamName, consumerName, 5)
 		if err != nil {
 			log.Printf("Failed to pull messages: %v", err)
 			return
@@ -180,7 +181,7 @@ func runExamples(ctx context.Context, client *client.Client, sigChan chan os.Sig
 
 	for i, test := range testMessages {
 		testMsg := message.NewMessage()
-		testMsg.WithPayload( test.data)
+		testMsg.WithPayload(test.data)
 		testMsg.WithMetadata("message_type", test.msgType)
 		testMsg.WithMetadata("test_sequence", fmt.Sprintf("%d", i+1))
 
@@ -209,7 +210,7 @@ func runExamples(ctx context.Context, client *client.Client, sigChan chan os.Sig
 	// Report a successful workflow execution
 	successData := `{"status": "completed", "processed_items": 150, "duration": "45.2s"}`
 	resultMessage := message.NewWorkflowMessage(callbackWorkflowID, callbackRunID).
-		WithPayload( successData)
+		WithPayload(successData)
 
 	if err := client.Messages.ReportSuccess(ctx, *resultMessage, nil); err != nil {
 		log.Printf("Failed to report success: %v", err)
@@ -247,7 +248,7 @@ func runExamples(ctx context.Context, client *client.Client, sigChan chan os.Sig
 			"validate": true,
 		},
 	})
-	complexMsg.WithPayload( `{"complex": true, "nested": {"data": [1,2,3]}}`)
+	complexMsg.WithPayload(`{"complex": true, "nested": {"data": [1,2,3]}}`)
 	complexMsg.WithOutput("file-system")
 	complexMsg.WithMetadata("encoding", "utf-8")
 	complexMsg.WithMetadata("compression", "gzip")

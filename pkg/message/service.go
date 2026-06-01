@@ -415,7 +415,7 @@ func (s *MessageService) Publish(ctx context.Context, subject string, msg *Messa
 //
 // Returns the fetched messages or an error if the operation fails.
 // Note: Returns empty slice (not error) when no messages are available within timeout.
-func (s *MessageService) PullMessages(ctx context.Context, stream, consumer string, batchSize int) ([]*Message, error) {
+func (s *MessageService) PullMessages(ctx context.Context, subject, stream, consumer string, batchSize int) ([]*Message, error) {
 	if stream == "" || consumer == "" {
 		s.logger.Error("PullMessages failed: stream and consumer names are required")
 		return nil, fmt.Errorf("stream and consumer names are required")
@@ -426,6 +426,7 @@ func (s *MessageService) PullMessages(ctx context.Context, stream, consumer stri
 	}
 
 	s.logger.Debug("Pulling messages",
+		zap.String("subject", subject),
 		zap.String("stream", stream),
 		zap.String("consumer", consumer),
 		zap.Int("batch_size", batchSize))
@@ -439,7 +440,7 @@ func (s *MessageService) PullMessages(ctx context.Context, stream, consumer stri
 
 	go func() {
 		// Bind to existing consumer
-		sub, err := s.js.PullSubscribe("", consumer, nats.Bind(stream, consumer))
+		sub, err := s.js.PullSubscribe(subject, consumer, nats.Bind(stream, consumer))
 		if err != nil {
 			resultCh <- result{err: err}
 			return

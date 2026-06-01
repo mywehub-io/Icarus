@@ -79,6 +79,14 @@ func WithProcessFailureObserver(obs ProcessFailureObserver) RunnerOption {
 	}
 }
 
+// WithSubjectFilter configures the runner to pull messages from the specified subject
+// instead of the default (stream-level) subject.
+func WithSubjectFilter(subject string) RunnerOption {
+	return func(r *Runner) {
+		r.subject = subject
+	}
+}
+
 // Runner manages concurrent message processing from a NATS JetStream consumer.
 // It pulls messages in batches and dispatches them through an internal worker
 // pool, with automatic success and error reporting to the RESULTS stream.
@@ -101,6 +109,7 @@ func WithProcessFailureObserver(obs ProcessFailureObserver) RunnerOption {
 type Runner struct {
 	client                 *client.Client
 	processor              Processor
+	subject                string
 	stream                 string
 	consumer               string
 	batchSize              int
@@ -348,7 +357,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				return
 			default:
 				// Pull messages from the stream
-				messages, err := r.client.Messages.PullMessages(ctx, r.stream, r.consumer, r.batchSize)
+				messages, err := r.client.Messages.PullMessages(ctx, r.subject, r.stream, r.consumer, r.batchSize)
 				if err != nil {
 					// Check if this is due to context cancellation (graceful shutdown)
 					if ctx.Err() != nil {

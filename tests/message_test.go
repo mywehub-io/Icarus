@@ -36,7 +36,7 @@ func TestMessageCreation(t *testing.T) {
 func TestMessageWithComponents(t *testing.T) {
 	msg := message.NewMessage().
 		WithNode("node-123", map[string]interface{}{"type": "processor"}).
-		WithPayload( "test data").
+		WithPayload("test data").
 		WithOutput("stream")
 
 	if msg.Node.NodeID != "node-123" {
@@ -57,7 +57,7 @@ func TestMessageWithComponents(t *testing.T) {
 func TestMessageSerialization(t *testing.T) {
 	original := message.NewWorkflowMessage("workflow-123", "run-456").
 		WithNode("node-789", map[string]interface{}{"priority": "high"}).
-		WithPayload( "test data content").
+		WithPayload("test data content").
 		WithOutput("stream")
 
 	// Serialize to bytes
@@ -105,7 +105,7 @@ func TestMessagePublishing(t *testing.T) {
 
 	// Test publishing a message
 	msg := message.NewWorkflowMessage("workflow-test", uuid.New().String()).
-		WithPayload( "test message")
+		WithPayload("test message")
 
 	err := c.Messages.Publish(ctx, "test.events.user.created", msg)
 	if err != nil {
@@ -119,7 +119,7 @@ func TestPullMessages(t *testing.T) {
 
 	// Publish a message first
 	msg := message.NewWorkflowMessage("workflow-pull", uuid.New().String()).
-		WithPayload( "pull test message")
+		WithPayload("pull test message")
 
 	err := c.Messages.Publish(ctx, "test.events.user.created", msg)
 	if err != nil {
@@ -130,7 +130,7 @@ func TestPullMessages(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	// Pull messages
-	messages, err := c.Messages.PullMessages(ctx, "TEST_EVENTS", "test_pull_consumer", 10)
+	messages, err := c.Messages.PullMessages(ctx, "test.*", "TEST_EVENTS", "test_pull_consumer", 10)
 	if err != nil {
 		t.Fatalf("Failed to pull messages: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestMessageAckNakTerm(t *testing.T) {
 func TestFromNATSMsg(t *testing.T) {
 	// Create a test message
 	originalMsg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload( "test data")
+		WithPayload("test data")
 
 	data, err := originalMsg.ToBytes()
 	if err != nil {
@@ -256,7 +256,7 @@ func TestFromNATSMsg(t *testing.T) {
 func TestNATSMsgWrapper(t *testing.T) {
 	// Create a test message
 	msg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload( "test data")
+		WithPayload("test data")
 
 	// Note: We don't need to create a real NATS message for this test
 	// The NATSMsg wrapper is what we're testing
@@ -303,7 +303,7 @@ func TestNATSMsgWrapper(t *testing.T) {
 	}
 
 	// Test Respond method
-	response := message.NewMessage().WithPayload( "test response")
+	response := message.NewMessage().WithPayload("test response")
 	err = wrappedMsg.Respond(response)
 	if err != nil {
 		t.Errorf("Respond should not error without real NATS message, got: %v", err)
@@ -532,7 +532,7 @@ func TestMessage_HasSchema(t *testing.T) {
 func TestMessage_SerializationWithEmbeddedNodes(t *testing.T) {
 	original := message.NewWorkflowMessage("workflow-123", "run-456").
 		WithNode("parent-node", nil).
-		WithPayload( "test data")
+		WithPayload("test data")
 
 	embeddedNodes := []message.EmbeddedNode{
 		{
@@ -606,7 +606,7 @@ func TestMessage_WithEmbeddedNodes_Fluent(t *testing.T) {
 	msg := message.NewMessage().
 		WithNode("parent", nil).
 		WithEmbeddedNodes(embeddedNodes).
-		WithPayload( "data")
+		WithPayload("data")
 
 	if !msg.HasEmbeddedNodes() {
 		t.Error("Message should be a unit after WithEmbeddedNodes")

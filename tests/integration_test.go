@@ -32,7 +32,7 @@ func (p *integrationProcessor) Process(ctx context.Context, msg *message.Message
 
 	// Create a result message
 	result := message.NewWorkflowMessage(msg.Workflow.WorkflowID, msg.Workflow.RunID).
-		WithPayload( "processed successfully")
+		WithPayload("processed successfully")
 
 	return *result, nil
 }
@@ -53,7 +53,7 @@ func TestClientMessageServiceIntegration(t *testing.T) {
 
 	// 1. Publish a message
 	msg := message.NewWorkflowMessage(workflowID, runID).
-		WithPayload( "test message data").
+		WithPayload("test message data").
 		WithNode("test-node", map[string]interface{}{"type": "integration"}).
 		WithOutput("stream")
 
@@ -65,7 +65,7 @@ func TestClientMessageServiceIntegration(t *testing.T) {
 	// 2. Pull the message back
 	time.Sleep(10 * time.Millisecond) // Allow message to be stored
 
-	messages, err := c.Messages.PullMessages(ctx, "INTEGRATION_STREAM", "integration_consumer", 1)
+	messages, err := c.Messages.PullMessages(ctx, "", "INTEGRATION_STREAM", "integration_consumer", 1)
 	if err != nil {
 		t.Fatalf("Failed to pull messages: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestRunnerIntegration(t *testing.T) {
 	mockJS := c.Messages // Access the underlying mock through the service
 	for i := 0; i < 3; i++ {
 		testMsg := message.NewWorkflowMessage("integration-workflow", "integration-run").
-			WithPayload( "test data")
+			WithPayload("test data")
 
 		// We need to access the mock JS context to add messages
 		// This is a bit hacky but necessary for integration testing with mocks
@@ -179,7 +179,7 @@ func TestRunnerWithFailingProcessor(t *testing.T) {
 
 	// Add a test message
 	testMsg := message.NewWorkflowMessage("failing-workflow", "failing-run").
-		WithPayload( "test data")
+		WithPayload("test data")
 
 	_, _ = testMsg.ToBytes() // Serialize for validation
 	c.Messages.Publish(context.Background(), "integration.test", testMsg)
@@ -227,7 +227,7 @@ func TestMessageHandlerIntegration(t *testing.T) {
 
 	// Create test message
 	msg := message.NewWorkflowMessage("handler-integration-workflow", "handler-integration-run").
-		WithPayload( "handler test data")
+		WithPayload("handler test data")
 
 	natsMsg := &message.NATSMsg{
 		Message: msg,
@@ -256,7 +256,7 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	// 1. Create and publish initial message
 	initialMsg := message.NewWorkflowMessage(workflowID, runID).
-		WithPayload( "initial data").
+		WithPayload("initial data").
 		WithNode("input-node", map[string]interface{}{"type": "input"}).
 		WithOutput("stream")
 
@@ -268,7 +268,7 @@ func TestEndToEndWorkflow(t *testing.T) {
 	// 2. Simulate processing by pulling and creating result
 	time.Sleep(10 * time.Millisecond)
 
-	messages, err := c.Messages.PullMessages(ctx, "E2E_STREAM", "e2e_consumer", 1)
+	messages, err := c.Messages.PullMessages(ctx, "", "E2E_STREAM", "e2e_consumer", 1)
 	if err != nil {
 		t.Fatalf("Failed to pull messages: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	// 3. Create result message
 	resultMsg := message.NewWorkflowMessage(workflowID, runID).
-		WithPayload( `{"status":"processed"}`).
+		WithPayload(`{"status":"processed"}`).
 		WithNode("output-node", map[string]interface{}{"type": "output"}).
 		WithOutput("callback").
 		WithMetadata("temporal_workflow_id", workflowID).
