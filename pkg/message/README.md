@@ -82,5 +82,5 @@ Accessed via `client.Messages`. Key methods:
 | `ReportSuccess(ctx, result, originalMsg)` | Ack + publish result to the configured result subject |
 | `ReportError(ctx, executionID, workflowID, runID, correlationID, err, originalMsg)` | Ack + publish error result |
 | `EnsureStream(stream)` | Create stream if it does not exist |
-| `EnsureConsumer(stream, consumer)` | Create pull consumer if it does not exist |
+| `EnsureConsumer(stream, consumer, filterSubject)` | Create pull consumer; optional `FilterSubject` for tenant/default routing |
 | `SetBlobStorage(client)` | Inject blob client for large result uploads |

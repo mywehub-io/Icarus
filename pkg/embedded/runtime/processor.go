@@ -335,6 +335,7 @@ func (p *EmbeddedProcessor) processSingleObject(
 		RunID:            unit.RunId,
 		ClientID:         unit.ClientId,
 		ProjectID:        unit.ProjectId,
+		EnvironmentID:    unit.EnvironmentId,
 		LifecycleEmitter: p.config.LifecycleEmitter,
 	}
 	subflow, err := NewSubflowProcessor(subflowCfg)
@@ -434,6 +435,7 @@ func (p *EmbeddedProcessor) processWithConcurrency(
 		RunID:            unit.RunId,
 		ClientID:         unit.ClientId,
 		ProjectID:        unit.ProjectId,
+		EnvironmentID:    unit.EnvironmentId,
 		LifecycleEmitter: p.config.LifecycleEmitter,
 	}
 	subflow, err := NewSubflowProcessor(subflowCfg)

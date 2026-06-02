@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -89,9 +90,16 @@ type MessageService struct {
 	logger            *zap.Logger
 	maxDeliver        int               // Maximum number of delivery attempts before giving up (default: 5)
 	publishMaxRetries int               // Maximum number of retry attempts for publish operations (default: 3)
-	resultStream      string            // JetStream stream name for publishing results (e.g., RESULTS_UAT)
-	resultSubject     string            // Subject for publishing results (e.g., result.uat)
-	blobStorage       BlobStorageClient // Blob storage for large results
+	resultStream          string            // JetStream stream name for publishing results (e.g., RESULTS_UAT)
+	resultSubjectPrefix   string            // Result subject prefix (e.g., result_uat)
+	tenantEnvironmentID   string            // Pod ENVIRONMENT_ID for tenant Elysium (empty = central)
+	blobStorage           BlobStorageClient // Blob storage for large results
+	// inactiveThreshold sets ConsumerConfig.InactiveThreshold on durables created via
+	// EnsureConsumer. Zero (default) disables auto-GC: the durable persists until it is
+	// explicitly deleted. Non-zero values let JetStream delete the durable after the
+	// configured idle period (no pulls/acks). Intended for tenant pods whose lifecycle
+	// is shorter than the platform's; central/shared consumers should leave this at 0.
+	inactiveThreshold     time.Duration
 }
 
 // BlobStorageClient interface for storing large results
@@ -106,11 +114,9 @@ func (s *MessageService) SetBlobStorage(bs BlobStorageClient) {
 }
 
 // NewMessageService creates a new message service with the given JetStream context.
-// Any implementation that satisfies JSContext (including nats.JetStreamContext) can be used.
-// The maxDeliver parameter controls the maximum number of delivery attempts for consumers.
-// The publishMaxRetries parameter controls the maximum number of retry attempts for publish operations.
-// The resultStream and resultSubject parameters configure where results are published (e.g., RESULTS_UAT, result.uat).
-func NewMessageService(js JSContext, maxDeliver int, publishMaxRetries int, resultStream string, resultSubject string) (*MessageService, error) {
+// resultSubject is the result subject prefix (e.g. result_uat); publish appends .<env>.<executionID>.
+// tenantEnvironmentID is the pod-level ENVIRONMENT_ID for tenant runners (may be empty).
+func NewMessageService(js JSContext, maxDeliver int, publishMaxRetries int, resultStream string, resultSubject string, tenantEnvironmentID string) (*MessageService, error) {
 	if js == nil {
 		return nil, fmt.Errorf("JetStream context cannot be nil")
 	}
@@ -129,17 +135,18 @@ func NewMessageService(js JSContext, maxDeliver int, publishMaxRetries int, resu
 	}
 
 	if resultSubject == "" {
-		resultSubject = "result" // Default result subject
+		resultSubject = "result" // Default result subject prefix
 	}
 
 	logger, _ := zap.NewProduction()
 	return &MessageService{
-		js:                js,
-		logger:            logger,
-		maxDeliver:        maxDeliver,
-		publishMaxRetries: publishMaxRetries,
-		resultStream:      resultStream,
-		resultSubject:     resultSubject,
+		js:                  js,
+		logger:              logger,
+		maxDeliver:          maxDeliver,
+		publishMaxRetries:   publishMaxRetries,
+		resultStream:        resultStream,
+		resultSubjectPrefix: resultSubject,
+		tenantEnvironmentID: tenantEnvironmentID,
 	}, nil
 }
 
@@ -148,6 +155,27 @@ func (s *MessageService) SetLogger(logger *zap.Logger) {
 	if logger != nil {
 		s.logger = logger
 	}
+}
+
+// SetInactiveThreshold configures ConsumerConfig.InactiveThreshold for durables
+// created via EnsureConsumer. A positive duration enables JetStream auto-deletion
+// of the durable after the configured idle period; zero (the default) disables
+// auto-GC and the durable persists until explicitly removed.
+//
+// Recommended usage: tenant pods that may be decommissioned set a positive value
+// (e.g. 72h) so orphan durables are reclaimed automatically; central/shared pods
+// leave this at zero.
+//
+// Note: this only affects durables created after the call. Existing durables
+// retain whatever threshold was set when they were first created.
+func (s *MessageService) SetInactiveThreshold(d time.Duration) {
+	if s == nil {
+		return
+	}
+	if d < 0 {
+		d = 0
+	}
+	s.inactiveThreshold = d
 }
 
 // EnsureStream creates the JetStream stream if it doesn't exist, or validates it exists.
@@ -163,7 +191,7 @@ func (s *MessageService) EnsureStream(streamName string) error {
 
 			streamConfig := &nats.StreamConfig{
 				Name:     streamName,
-				Subjects: []string{fmt.Sprintf("%s.*", streamName)},
+				Subjects: []string{streamSubjectPattern(streamName)},
 				Storage:  nats.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
@@ -194,8 +222,8 @@ func (s *MessageService) EnsureStream(streamName string) error {
 }
 
 // EnsureConsumer creates the JetStream consumer if it doesn't exist, or validates it exists.
-// This is a public method that can be called by runners and other components.
-func (s *MessageService) EnsureConsumer(streamName, consumerName string) error {
+// filterSubject when non-empty sets FilterSubject on the durable consumer (tenant/default routing).
+func (s *MessageService) EnsureConsumer(streamName, consumerName, filterSubject string) error {
 	// Try to get consumer info first
 	consumerInfo, err := s.js.ConsumerInfo(streamName, consumerName)
 	if err != nil {
@@ -206,11 +234,13 @@ func (s *MessageService) EnsureConsumer(streamName, consumerName string) error {
 				zap.String("consumer", consumerName))
 
 			consumerConfig := &nats.ConsumerConfig{
-				Durable:       consumerName,
-				AckPolicy:     nats.AckExplicitPolicy,
-				DeliverPolicy: nats.DeliverAllPolicy,
-				MaxAckPending: 1000,
-				MaxDeliver:    s.maxDeliver,
+				Durable:           consumerName,
+				FilterSubject:     filterSubject,
+				AckPolicy:         nats.AckExplicitPolicy,
+				DeliverPolicy:     nats.DeliverAllPolicy,
+				MaxAckPending:     1000,
+				MaxDeliver:        s.maxDeliver,
+				InactiveThreshold: s.inactiveThreshold,
 			}
 
 			_, err = s.js.AddConsumer(streamName, consumerConfig)
@@ -221,7 +251,8 @@ func (s *MessageService) EnsureConsumer(streamName, consumerName string) error {
 			s.logger.Info("Successfully created JetStream consumer",
 				zap.String("stream", streamName),
 				zap.String("consumer", consumerName),
-				zap.Int("max_deliver", s.maxDeliver))
+				zap.Int("max_deliver", s.maxDeliver),
+				zap.Duration("inactive_threshold", s.inactiveThreshold))
 		} else {
 			return fmt.Errorf("failed to get consumer info for '%s' in stream '%s': %w", consumerName, streamName, err)
 		}
@@ -244,8 +275,8 @@ func (s *MessageService) ensureStreamForSubject(subject string) error {
 	var streamName string
 	var isResultSubject bool
 
-	// Check if this is a result subject
-	if s.resultSubject != "" && subject == s.resultSubject {
+	// Check if this is a result subject (prefix match)
+	if s.resultSubjectPrefix != "" && (subject == s.resultSubjectPrefix || strings.HasPrefix(subject, s.resultSubjectPrefix+".")) {
 		// Use the configured result stream
 		streamName = s.resultStream
 		isResultSubject = true
@@ -522,7 +553,7 @@ func (s *MessageService) PullMessages(ctx context.Context, stream, consumer stri
 // PublishResult publishes a ResultMessage to the result stream using JetStream.
 // This is used for reporting unit execution results back to Zeus.
 func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMessage) error {
-	if s.resultSubject == "" {
+	if s.resultSubjectPrefix == "" {
 		s.logger.Error("PublishResult failed: result subject not configured")
 		return sdkerrors.NewValidationError("result subject not configured", "INVALID_CONFIG", nil)
 	}
@@ -532,11 +563,18 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 		return sdkerrors.NewValidationError("result message cannot be nil", "INVALID_MESSAGE", nil)
 	}
 
+	envID := s.tenantEnvironmentID
+	if envID == "" && resultMsg.EnvironmentID != "" {
+		envID = resultMsg.EnvironmentID
+	}
+	applyEnv := envID != ""
+	publishSubject := composeSubject(s.resultSubjectPrefix, envID, resultMsg.ExecutionID, applyEnv)
+
 	// Ensure result stream exists
-	if err := s.ensureStreamForSubject(s.resultSubject); err != nil {
+	if err := s.ensureStreamForSubject(publishSubject); err != nil {
 		s.logger.Error("Failed to ensure result stream exists",
 			zap.String("stream", s.resultStream),
-			zap.String("subject", s.resultSubject),
+			zap.String("subject", publishSubject),
 			zap.Error(err))
 		return sdkerrors.NewInternalError("", "failed to ensure result stream exists", "STREAM_ENSURE_FAILED", err)
 	}
@@ -546,7 +584,7 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 		zap.String("workflow_id", resultMsg.WorkflowID),
 		zap.String("node_id", resultMsg.NodeID),
 		zap.String("status", resultMsg.Status),
-		zap.String("subject", s.resultSubject))
+		zap.String("subject", publishSubject))
 
 	data, err := resultMsg.ToBytes()
 	if err != nil {
@@ -560,7 +598,7 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 	var publishErr error
 	var pubAck *nats.PubAck
 	for attempt := 1; attempt <= s.publishMaxRetries; attempt++ {
-		pubAck, publishErr = s.js.Publish(s.resultSubject, data)
+		pubAck, publishErr = s.js.Publish(publishSubject, data)
 		if publishErr == nil {
 			break
 		}
@@ -597,7 +635,7 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 		zap.String("workflow_id", resultMsg.WorkflowID),
 		zap.String("node_id", resultMsg.NodeID),
 		zap.String("status", resultMsg.Status),
-		zap.String("subject", s.resultSubject),
+		zap.String("subject", publishSubject),
 		zap.String("jetstream_stream", stream),
 		zap.Uint64("jetstream_stream_sequence", seq))
 
@@ -669,6 +707,9 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 
 	// Create result message
 	resultMsg := NewResultMessage(executionID, workflowID, runID, nodeID, "success")
+	if resultMessage.Metadata != nil {
+		resultMsg.EnvironmentID = resultMessage.Metadata["environment_id"]
+	}
 	if correlationID != "" {
 		resultMsg.WithCorrelationID(correlationID)
 	}
@@ -997,4 +1038,15 @@ func ExtractNodeIDFromExecutionID(executionID, workflowID string) string {
 
 	// If format doesn't match, return executionID as-is (fallback)
 	return executionID
+}
+
+func composeSubject(prefix, environmentID, executionID string, applyEnvironment bool) string {
+	if applyEnvironment && environmentID != "" {
+		return prefix + "." + environmentID + "." + executionID
+	}
+	return prefix + "." + executionID
+}
+
+func streamSubjectPattern(streamName string) string {
+	return streamName + ".>"
 }

@@ -12,7 +12,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/nats-io/nats.go v1.46.1
 	github.com/stretchr/testify v1.11.1
-	github.com/wehubfusion/Argus v0.3.4
+	github.com/wehubfusion/Argus v0.3.6
 	go.opentelemetry.io/otel v1.38.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.38.0
 	go.opentelemetry.io/otel/sdk v1.38.0
@@ -51,3 +51,5 @@ require (
 	google.golang.org/protobuf v1.36.10 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/wehubfusion/Argus => ../Argus

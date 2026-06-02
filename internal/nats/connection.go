@@ -55,10 +55,20 @@ type ConnectionConfig struct {
 	// Default is "RESULTS".
 	ResultStream string
 
-	// ResultSubject is the subject where results are published.
-	// This should be environment-specific (e.g., result.uat, result.prod).
+	// ResultSubject is the subject prefix where results are published (e.g., result_uat).
 	// Default is "result".
 	ResultSubject string
+
+	// TenantEnvironmentID is the pod ENVIRONMENT_ID for tenant Elysium runners.
+	TenantEnvironmentID string
+
+	// ConsumerInactiveThreshold sets ConsumerConfig.InactiveThreshold on durables
+	// created via MessageService.EnsureConsumer. Zero (default) disables auto-GC:
+	// the durable persists until explicitly deleted. A positive value lets JetStream
+	// delete the durable after the configured idle period (no pulls/acks). Intended
+	// for tenant pods whose lifecycle is shorter than the platform's; central pods
+	// should leave this at 0.
+	ConsumerInactiveThreshold time.Duration
 }
 
 // DefaultConnectionConfig returns a configuration with sensible defaults

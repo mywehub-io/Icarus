@@ -29,6 +29,7 @@ type SubflowProcessor struct {
 	runID             string
 	clientID          string
 	projectID         string
+	environmentID     string
 	lifecycleEmitter  EmbeddedNodeLifecycleEmitter
 	iterIOAccumulator *iterationIOAccumulator
 	endedMu           sync.Mutex
@@ -101,6 +102,7 @@ func NewSubflowProcessor(config SubflowConfig) (*SubflowProcessor, error) {
 		runID:            config.RunID,
 		clientID:         config.ClientID,
 		projectID:        config.ProjectID,
+		environmentID:    config.EnvironmentID,
 		lifecycleEmitter: config.LifecycleEmitter,
 		endedEmitted:     make(map[string]bool),
 	}, nil
@@ -237,6 +239,7 @@ type SubflowConfig struct {
 	RunID            string
 	ClientID         string
 	ProjectID        string
+	EnvironmentID    string
 	LifecycleEmitter EmbeddedNodeLifecycleEmitter
 }
 
@@ -1402,6 +1405,7 @@ func (sp *SubflowProcessor) emitEmbeddedNodeStart(ctx context.Context, config Em
 			RunID:          sp.runID,
 			ClientID:       sp.clientID,
 			ProjectID:      sp.projectID,
+			EnvironmentID:  sp.environmentID,
 			ParentNodeID:   sp.parentNodeId,
 			EmbeddedNodeID: config.NodeId,
 			Label:          config.Label,
@@ -1430,6 +1434,7 @@ func (sp *SubflowProcessor) emitEmbeddedNodeEnd(ctx context.Context, config Embe
 			RunID:          sp.runID,
 			ClientID:       sp.clientID,
 			ProjectID:      sp.projectID,
+			EnvironmentID:  sp.environmentID,
 			ParentNodeID:   sp.parentNodeId,
 			EmbeddedNodeID: config.NodeId,
 			Label:          config.Label,
