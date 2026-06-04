@@ -49,7 +49,7 @@ v0.5.0 adds `github.com/wehubfusion/Argus` as a dependency for embedded node lif
 observation. If your `go.sum` pins a different version, run:
 
 ```bash
-go get github.com/wehubfusion/Argus@v0.3.4
+go get github.com/wehubfusion/Argus@v0.3.6
 go mod tidy
 ```
 
