@@ -530,9 +530,6 @@ type ResultMessage struct {
 	// Error information (only present when status is "failed")
 	Error *ResultError `json:"error,omitempty"`
 
-	// Tenant environment (empty = default); used for result subject routing.
-	EnvironmentID string `json:"environment_id,omitempty"`
-
 	// Metadata
 	PluginType      string `json:"plugin_type,omitempty"`       // Plugin type that processed the node
 	ExecutionTimeMs int64  `json:"execution_time_ms,omitempty"` // Execution duration in milliseconds

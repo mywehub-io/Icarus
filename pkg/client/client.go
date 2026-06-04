@@ -83,13 +83,6 @@ func NewClient(url string, resultStream string, resultSubject string) *Client {
 	}
 }
 
-// SetTenantEnvironmentID sets the pod ENVIRONMENT_ID used when publishing results (call before Connect).
-func (c *Client) SetTenantEnvironmentID(environmentID string) {
-	if c != nil && c.config != nil {
-		c.config.TenantEnvironmentID = environmentID
-	}
-}
-
 // SetConsumerInactiveThreshold configures the InactiveThreshold applied to durables
 // created via Messages.EnsureConsumer. Zero disables auto-GC. Positive values let
 // JetStream delete the durable after the configured idle period (no pulls/acks).
@@ -179,7 +172,6 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.config.PublishMaxRetries,
 		c.config.ResultStream,
 		c.config.ResultSubject,
-		c.config.TenantEnvironmentID,
 	)
 	if err != nil {
 		// Clean up connection on service initialization failure
@@ -201,7 +193,7 @@ func (c *Client) Connect(ctx context.Context) error {
 func NewClientWithJSContext(js message.JSContext) *Client {
 	logger, _ := zap.NewProduction()
 	// Use defaults: MaxDeliver=5, PublishMaxRetries=3, ResultStream=RESULTS, ResultSubject=result
-	svc, _ := message.NewMessageService(js, 5, 3, "RESULTS", "result", "")
+	svc, _ := message.NewMessageService(js, 5, 3, "RESULTS", "result")
 	return &Client{
 		Messages: svc,
 		logger:   logger,

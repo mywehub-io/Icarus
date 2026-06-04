@@ -129,6 +129,13 @@ func TestPullMessages(t *testing.T) {
 	// Wait for message to be stored
 	time.Sleep(10 * time.Millisecond)
 
+	if err := c.Messages.EnsureStream("TEST_EVENTS"); err != nil {
+		t.Fatalf("Failed to ensure stream: %v", err)
+	}
+	if err := c.Messages.EnsureConsumer("TEST_EVENTS", "test_pull_consumer", ""); err != nil {
+		t.Fatalf("Failed to ensure consumer: %v", err)
+	}
+
 	// Pull messages
 	messages, err := c.Messages.PullMessages(ctx, "TEST_EVENTS", "test_pull_consumer", 10)
 	if err != nil {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -90,10 +89,9 @@ type MessageService struct {
 	logger            *zap.Logger
 	maxDeliver        int               // Maximum number of delivery attempts before giving up (default: 5)
 	publishMaxRetries int               // Maximum number of retry attempts for publish operations (default: 3)
-	resultStream          string            // JetStream stream name for publishing results (e.g., RESULTS_UAT)
-	resultSubjectPrefix   string            // Result subject prefix (e.g., result_uat)
-	tenantEnvironmentID   string            // Pod ENVIRONMENT_ID for tenant Elysium (empty = central)
-	blobStorage           BlobStorageClient // Blob storage for large results
+	resultStream      string            // JetStream stream name for publishing results (e.g., RESULTS_UAT)
+	resultSubject     string            // Subject for publishing results (e.g., result_uat)
+	blobStorage       BlobStorageClient // Blob storage for large results
 	// inactiveThreshold sets ConsumerConfig.InactiveThreshold on durables created via
 	// EnsureConsumer. Zero (default) disables auto-GC: the durable persists until it is
 	// explicitly deleted. Non-zero values let JetStream delete the durable after the
@@ -114,9 +112,9 @@ func (s *MessageService) SetBlobStorage(bs BlobStorageClient) {
 }
 
 // NewMessageService creates a new message service with the given JetStream context.
-// resultSubject is the result subject prefix (e.g. result_uat); publish appends .<env>.<executionID>.
-// tenantEnvironmentID is the pod-level ENVIRONMENT_ID for tenant runners (may be empty).
-func NewMessageService(js JSContext, maxDeliver int, publishMaxRetries int, resultStream string, resultSubject string, tenantEnvironmentID string) (*MessageService, error) {
+// The resultStream and resultSubject parameters configure where results are published
+// (e.g., RESULTS_UAT, result_uat). Results are published flat to resultSubject.
+func NewMessageService(js JSContext, maxDeliver int, publishMaxRetries int, resultStream string, resultSubject string) (*MessageService, error) {
 	if js == nil {
 		return nil, fmt.Errorf("JetStream context cannot be nil")
 	}
@@ -144,9 +142,8 @@ func NewMessageService(js JSContext, maxDeliver int, publishMaxRetries int, resu
 		logger:              logger,
 		maxDeliver:          maxDeliver,
 		publishMaxRetries:   publishMaxRetries,
-		resultStream:        resultStream,
-		resultSubjectPrefix: resultSubject,
-		tenantEnvironmentID: tenantEnvironmentID,
+		resultStream:      resultStream,
+		resultSubject:     resultSubject,
 	}, nil
 }
 
@@ -189,9 +186,14 @@ func (s *MessageService) EnsureStream(streamName string) error {
 			s.logger.Info("Creating JetStream stream",
 				zap.String("stream", streamName))
 
+			subjects := []string{fmt.Sprintf("%s.>", streamName)}
+			if streamName == s.resultStream && s.resultSubject != "" {
+				subjects = []string{s.resultSubject}
+			}
+
 			streamConfig := &nats.StreamConfig{
 				Name:     streamName,
-				Subjects: []string{streamSubjectPattern(streamName)},
+				Subjects: subjects,
 				Storage:  nats.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
@@ -275,8 +277,8 @@ func (s *MessageService) ensureStreamForSubject(subject string) error {
 	var streamName string
 	var isResultSubject bool
 
-	// Check if this is a result subject (prefix match)
-	if s.resultSubjectPrefix != "" && (subject == s.resultSubjectPrefix || strings.HasPrefix(subject, s.resultSubjectPrefix+".")) {
+	// Check if this is a result subject
+	if s.resultSubject != "" && subject == s.resultSubject {
 		// Use the configured result stream
 		streamName = s.resultStream
 		isResultSubject = true
@@ -310,20 +312,18 @@ func (s *MessageService) ensureStreamForSubject(subject string) error {
 
 			// For result subjects, use the configured subject pattern
 			// For other subjects, derive pattern from subject
-			var subjectPattern string
+			var subjects []string
 			if isResultSubject {
-				// Result subjects use the configured subject with > wildcard
-				// e.g., "result.uat.>" matches "result.uat", "result.uat.X", etc.
-				subjectPattern = fmt.Sprintf("%s.>", subject)
+				subjects = []string{s.resultSubject}
 			} else {
 				// Regular subjects use stream name derived pattern
 				// e.g., "HTTP_REQUESTS_UAT.>" for stream "HTTP_REQUESTS_UAT"
-				subjectPattern = fmt.Sprintf("%s.>", streamName)
+				subjects = []string{fmt.Sprintf("%s.>", streamName)}
 			}
 
 			streamConfig := &nats.StreamConfig{
 				Name:     streamName,
-				Subjects: []string{subjectPattern},
+				Subjects: subjects,
 				Storage:  nats.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
@@ -337,7 +337,7 @@ func (s *MessageService) ensureStreamForSubject(subject string) error {
 
 			s.logger.Info("Successfully created JetStream stream",
 				zap.String("stream", streamName),
-				zap.String("subject_pattern", subjectPattern),
+				zap.Strings("subjects", subjects),
 				zap.Bool("is_result_stream", isResultSubject))
 		} else {
 			return fmt.Errorf("failed to get stream info for '%s': %w", streamName, err)
@@ -469,8 +469,14 @@ func (s *MessageService) PullMessages(ctx context.Context, stream, consumer stri
 	resultCh := make(chan result, 1)
 
 	go func() {
-		// Bind to existing consumer
-		sub, err := s.js.PullSubscribe("", consumer, nats.Bind(stream, consumer))
+		info, err := s.js.ConsumerInfo(stream, consumer)
+		if err != nil {
+			resultCh <- result{err: fmt.Errorf("consumer info for %q in %q: %w", consumer, stream, err)}
+			return
+		}
+		filter := info.Config.FilterSubject
+
+		sub, err := s.js.PullSubscribe(filter, consumer, nats.Bind(stream, consumer))
 		if err != nil {
 			resultCh <- result{err: err}
 			return
@@ -553,7 +559,7 @@ func (s *MessageService) PullMessages(ctx context.Context, stream, consumer stri
 // PublishResult publishes a ResultMessage to the result stream using JetStream.
 // This is used for reporting unit execution results back to Zeus.
 func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMessage) error {
-	if s.resultSubjectPrefix == "" {
+	if s.resultSubject == "" {
 		s.logger.Error("PublishResult failed: result subject not configured")
 		return sdkerrors.NewValidationError("result subject not configured", "INVALID_CONFIG", nil)
 	}
@@ -563,12 +569,9 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 		return sdkerrors.NewValidationError("result message cannot be nil", "INVALID_MESSAGE", nil)
 	}
 
-	envID := s.tenantEnvironmentID
-	if envID == "" && resultMsg.EnvironmentID != "" {
-		envID = resultMsg.EnvironmentID
-	}
-	applyEnv := envID != ""
-	publishSubject := composeSubject(s.resultSubjectPrefix, envID, resultMsg.ExecutionID, applyEnv)
+	// Results publish flat to the configured result subject. The subject is
+	// tenant-free and shared; Zeus correlates results by run/execution ID.
+	publishSubject := s.resultSubject
 
 	// Ensure result stream exists
 	if err := s.ensureStreamForSubject(publishSubject); err != nil {
@@ -707,9 +710,6 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 
 	// Create result message
 	resultMsg := NewResultMessage(executionID, workflowID, runID, nodeID, "success")
-	if resultMessage.Metadata != nil {
-		resultMsg.EnvironmentID = resultMessage.Metadata["environment_id"]
-	}
 	if correlationID != "" {
 		resultMsg.WithCorrelationID(correlationID)
 	}
@@ -1040,13 +1040,3 @@ func ExtractNodeIDFromExecutionID(executionID, workflowID string) string {
 	return executionID
 }
 
-func composeSubject(prefix, environmentID, executionID string, applyEnvironment bool) string {
-	if applyEnvironment && environmentID != "" {
-		return prefix + "." + environmentID + "." + executionID
-	}
-	return prefix + "." + executionID
-}
-
-func streamSubjectPattern(streamName string) string {
-	return streamName + ".>"
-}

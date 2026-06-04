@@ -59,9 +59,6 @@ type ConnectionConfig struct {
 	// Default is "result".
 	ResultSubject string
 
-	// TenantEnvironmentID is the pod ENVIRONMENT_ID for tenant Elysium runners.
-	TenantEnvironmentID string
-
 	// ConsumerInactiveThreshold sets ConsumerConfig.InactiveThreshold on durables
 	// created via MessageService.EnsureConsumer. Zero (default) disables auto-GC:
 	// the durable persists until explicitly deleted. A positive value lets JetStream

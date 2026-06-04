@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -66,8 +67,8 @@ type mockJSContext struct {
 }
 
 func (m *mockJSContext) Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
-	// For "result" subject (reporting), return the configured error
-	if subj == "result" && m.reportError != nil {
+	// For result publishes (now always result.<env>.<exec>), return the configured error.
+	if m.reportError != nil && (subj == "result" || strings.HasPrefix(subj, "result.")) {
 		return nil, m.reportError
 	}
 	return &nats.PubAck{Stream: "MOCK", Sequence: 1}, nil
