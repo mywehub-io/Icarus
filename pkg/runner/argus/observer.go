@@ -93,11 +93,9 @@ func NewProcessFailureObserver(emitter argusemitter.NodeEndEmitter, logger *zap.
 		}
 		clientID := ""
 		projectID := ""
-		environmentID := ""
 		if msg.Metadata != nil {
 			clientID = msg.Metadata["client_id"]
 			projectID = msg.Metadata["project_id"]
-			environmentID = msg.Metadata["environment_id"]
 		}
 		if clientID == "" {
 			logger.Warn("runner process failure: node.ended NOT emitted — client_id missing from message metadata (node will stay 'running' in Athena; Hermes trigger-sync may hang waiting for manifest match)",
@@ -188,7 +186,6 @@ func NewProcessFailureObserver(emitter argusemitter.NodeEndEmitter, logger *zap.
 		parentParams := argusemitter.NodeEndEmitParams{
 			ClientID:      clientID,
 			ProjectID:     projectID,
-			EnvironmentID: environmentID,
 			WorkflowID:    workflowID,
 			RunID:         runID,
 			NodeID:        parentID,
@@ -217,7 +214,6 @@ func NewProcessFailureObserver(emitter argusemitter.NodeEndEmitter, logger *zap.
 			if err := emitter.EmitNodeEnd(ctx, argusemitter.NodeEndEmitParams{
 				ClientID:      clientID,
 				ProjectID:     projectID,
-				EnvironmentID: environmentID,
 				WorkflowID:    workflowID,
 				RunID:        runID,
 				NodeID:       en.NodeID,

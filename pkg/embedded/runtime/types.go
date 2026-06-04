@@ -172,8 +172,6 @@ type ExecutionUnit struct {
 	ClientId string `json:"clientId,omitempty"`
 	// ProjectId is the project identifier for observation and multi-tenant isolation
 	ProjectId string `json:"projectId,omitempty"`
-	// EnvironmentId is the tenant environment identifier (empty = default)
-	EnvironmentId string `json:"environmentId,omitempty"`
 	// Label is the human-readable name of the parent node
 	Label string `json:"label"`
 	// Type is the node type (e.g., "plugin")
@@ -218,7 +216,6 @@ type EmbeddedNodeStartInfo struct {
 	RunID          string
 	ClientID       string
 	ProjectID       string
-	EnvironmentID   string
 	ParentNodeID    string
 	EmbeddedNodeID  string
 	Label           string
@@ -230,7 +227,6 @@ type EmbeddedNodeEndInfo struct {
 	RunID          string
 	ClientID       string
 	ProjectID       string
-	EnvironmentID   string
 	ParentNodeID    string
 	EmbeddedNodeID  string
 	Label           string
@@ -246,7 +242,6 @@ type ParentNodeEndInfo struct {
 	RunID        string
 	ClientID     string
 	ProjectID       string
-	EnvironmentID   string
 	ParentNodeID    string
 	// Label is the human-readable node label from the execution plan (for observation events).
 	Label string
@@ -260,7 +255,6 @@ type ParentNodeOutputInfo struct {
 	RunID        string
 	ClientID     string
 	ProjectID       string
-	EnvironmentID   string
 	ParentNodeID    string
 	Label           string
 	Output          map[string]interface{}
@@ -274,7 +268,6 @@ type EmbeddedNodeIOInfo struct {
 	RunID          string
 	ClientID       string
 	ProjectID       string
-	EnvironmentID   string
 	ParentNodeID    string
 	EmbeddedNodeID  string
 	Label           string

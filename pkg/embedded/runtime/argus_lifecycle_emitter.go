@@ -57,7 +57,6 @@ func (e *ArgusEmbeddedNodeLifecycleEmitter) EmitNodeStartEvent(ctx context.Conte
 	if err := e.nodeStartEmitter.EmitNodeStart(ctx, argusemitter.NodeStartEmitParams{
 		ClientID:      info.ClientID,
 		ProjectID:     info.ProjectID,
-		EnvironmentID: info.EnvironmentID,
 		WorkflowID:    info.WorkflowID,
 		RunID:      info.RunID,
 		NodeID:     info.EmbeddedNodeID,
@@ -90,7 +89,6 @@ func (e *ArgusEmbeddedNodeLifecycleEmitter) EmitNodeEndEvent(ctx context.Context
 	if err := e.nodeEndEmitter.EmitNodeEnd(ctx, argusemitter.NodeEndEmitParams{
 		ClientID:      info.ClientID,
 		ProjectID:     info.ProjectID,
-		EnvironmentID: info.EnvironmentID,
 		WorkflowID:    info.WorkflowID,
 		RunID:        info.RunID,
 		NodeID:       nodeID,
