@@ -13,6 +13,10 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Changed
+
+- `internal:` Argus dependency updated to `v0.3.6` (`EnvironmentID` on event structures and emitters).
+
 ### Fixed
 
 - `public:` **Embedded subflow skip logic**: `shouldSkipNode` (non-iteration path) now
