@@ -151,10 +151,10 @@ func TestPullMessagesErrors(t *testing.T) {
 		t.Error("Expected error for empty consumer name")
 	}
 
-	// With mock, nonexistent stream/consumer is not enforced; this should succeed
+	// Pull requires an existing durable consumer
 	_, err = c.Messages.PullMessages(ctx, "NONEXISTENT", "nonexistent", 1)
-	if err != nil {
-		t.Errorf("Unexpected error for mock pull: %v", err)
+	if err == nil {
+		t.Error("Expected error when consumer does not exist")
 	}
 }
 

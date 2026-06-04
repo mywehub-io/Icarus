@@ -212,9 +212,9 @@ func NewProcessFailureObserver(emitter argusemitter.NodeEndEmitter, logger *zap.
 				lbl = en.NodeID
 			}
 			if err := emitter.EmitNodeEnd(ctx, argusemitter.NodeEndEmitParams{
-				ClientID:     clientID,
-				ProjectID:    projectID,
-				WorkflowID:   workflowID,
+				ClientID:      clientID,
+				ProjectID:     projectID,
+				WorkflowID:    workflowID,
 				RunID:        runID,
 				NodeID:       en.NodeID,
 				Label:        lbl,

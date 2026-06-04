@@ -215,10 +215,10 @@ type EmbeddedNodeStartInfo struct {
 	WorkflowID     string
 	RunID          string
 	ClientID       string
-	ProjectID      string
-	ParentNodeID   string
-	EmbeddedNodeID string
-	Label          string
+	ProjectID       string
+	ParentNodeID    string
+	EmbeddedNodeID  string
+	Label           string
 }
 
 // EmbeddedNodeEndInfo carries lifecycle information for an embedded node completion.
@@ -226,12 +226,12 @@ type EmbeddedNodeEndInfo struct {
 	WorkflowID     string
 	RunID          string
 	ClientID       string
-	ProjectID      string
-	ParentNodeID   string
-	EmbeddedNodeID string
-	Label          string
-	HasError       bool
-	ErrorMessage   string
+	ProjectID       string
+	ParentNodeID    string
+	EmbeddedNodeID  string
+	Label           string
+	HasError        bool
+	ErrorMessage    string
 }
 
 // ParentNodeEndInfo carries contextual information about a parent node whose
@@ -241,8 +241,8 @@ type ParentNodeEndInfo struct {
 	WorkflowID   string
 	RunID        string
 	ClientID     string
-	ProjectID    string
-	ParentNodeID string
+	ProjectID       string
+	ParentNodeID    string
 	// Label is the human-readable node label from the execution plan (for observation events).
 	Label string
 	// HasEmbeddedNodes indicates whether this parent has embedded nodes configured.
@@ -254,12 +254,12 @@ type ParentNodeOutputInfo struct {
 	WorkflowID   string
 	RunID        string
 	ClientID     string
-	ProjectID    string
-	ParentNodeID string
-	Label        string
-	Output       map[string]interface{}
-	HasError     bool
-	ErrorMessage string
+	ProjectID       string
+	ParentNodeID    string
+	Label           string
+	Output          map[string]interface{}
+	HasError        bool
+	ErrorMessage    string
 }
 
 // EmbeddedNodeIOInfo carries input or output data for an embedded node emission.
@@ -267,13 +267,13 @@ type EmbeddedNodeIOInfo struct {
 	WorkflowID     string
 	RunID          string
 	ClientID       string
-	ProjectID      string
-	ParentNodeID   string
-	EmbeddedNodeID string
-	Label          string
-	Data           map[string]interface{}
-	HasError       bool
-	ErrorMessage   string
+	ProjectID       string
+	ParentNodeID    string
+	EmbeddedNodeID  string
+	Label           string
+	Data            map[string]interface{}
+	HasError        bool
+	ErrorMessage    string
 }
 
 // StandardUnitOutput represents the flattened output of a unit as a flat map.

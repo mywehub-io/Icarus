@@ -55,9 +55,9 @@ func (e *ArgusEmbeddedNodeLifecycleEmitter) EmitNodeStartEvent(ctx context.Conte
 		return fmt.Errorf("marshal embedded node input for %s: %w", info.EmbeddedNodeID, err)
 	}
 	if err := e.nodeStartEmitter.EmitNodeStart(ctx, argusemitter.NodeStartEmitParams{
-		ClientID:   info.ClientID,
-		ProjectID:  info.ProjectID,
-		WorkflowID: info.WorkflowID,
+		ClientID:      info.ClientID,
+		ProjectID:     info.ProjectID,
+		WorkflowID:    info.WorkflowID,
 		RunID:      info.RunID,
 		NodeID:     info.EmbeddedNodeID,
 		Label:      info.Label,
@@ -87,9 +87,9 @@ func (e *ArgusEmbeddedNodeLifecycleEmitter) EmitNodeEndEvent(ctx context.Context
 		return fmt.Errorf("node end event has nil data")
 	}
 	if err := e.nodeEndEmitter.EmitNodeEnd(ctx, argusemitter.NodeEndEmitParams{
-		ClientID:     info.ClientID,
-		ProjectID:    info.ProjectID,
-		WorkflowID:   info.WorkflowID,
+		ClientID:      info.ClientID,
+		ProjectID:     info.ProjectID,
+		WorkflowID:    info.WorkflowID,
 		RunID:        info.RunID,
 		NodeID:       nodeID,
 		Label:        info.Label,

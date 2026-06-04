@@ -79,6 +79,13 @@ func WithProcessFailureObserver(obs ProcessFailureObserver) RunnerOption {
 	}
 }
 
+// WithConsumerFilterSubject sets the JetStream consumer FilterSubject (tenant/default routing).
+func WithConsumerFilterSubject(filterSubject string) RunnerOption {
+	return func(r *Runner) {
+		r.consumerFilterSubject = filterSubject
+	}
+}
+
 // Runner manages concurrent message processing from a NATS JetStream consumer.
 // It pulls messages in batches and dispatches them through an internal worker
 // pool, with automatic success and error reporting to the RESULTS stream.
@@ -103,6 +110,7 @@ type Runner struct {
 	processor              Processor
 	stream                 string
 	consumer               string
+	consumerFilterSubject  string
 	batchSize              int
 	logger                 *zap.Logger
 	processTimeout         time.Duration
@@ -217,15 +225,6 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 		return nil, errors.New("logger cannot be nil")
 	}
 
-	// Ensure the stream and consumer exist, create them if necessary
-	if err := client.Messages.EnsureStream(stream); err != nil {
-		return nil, fmt.Errorf("failed to ensure stream '%s' exists: %w", stream, err)
-	}
-
-	if err := client.Messages.EnsureConsumer(stream, consumer); err != nil {
-		return nil, fmt.Errorf("failed to ensure consumer '%s' exists: %w", consumer, err)
-	}
-
 	config := DefaultConfig()
 	if cfg != nil {
 		config = *cfg
@@ -245,6 +244,19 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 		jobChan:        make(chan *message.Message, config.QueueSize),
 	}
 
+	for _, opt := range opts {
+		opt(runner)
+	}
+
+	// Ensure the stream and consumer exist, create them if necessary
+	if err := client.Messages.EnsureStream(stream); err != nil {
+		return nil, fmt.Errorf("failed to ensure stream '%s' exists: %w", stream, err)
+	}
+
+	if err := client.Messages.EnsureConsumer(stream, consumer, runner.consumerFilterSubject); err != nil {
+		return nil, fmt.Errorf("failed to ensure consumer '%s' exists: %w", consumer, err)
+	}
+
 	// Setup tracing if configuration is provided
 	if tracingConfig != nil {
 		ctx := context.Background()
@@ -257,12 +269,6 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 			logger.Info("Tracing setup complete",
 				zap.String("service", tracingConfig.ServiceName),
 				zap.String("endpoint", tracingConfig.OTLPEndpoint))
-		}
-	}
-
-	for _, opt := range opts {
-		if opt != nil {
-			opt(runner)
 		}
 	}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -240,6 +241,12 @@ func TestMessageServicePullMessagesValidation(t *testing.T) {
 	}
 
 	// Test with zero batch size (should default to 10)
+	if err := c.Messages.EnsureStream("stream"); err != nil {
+		t.Fatalf("Failed to ensure stream: %v", err)
+	}
+	if err := c.Messages.EnsureConsumer("stream", "consumer", ""); err != nil {
+		t.Fatalf("Failed to ensure consumer: %v", err)
+	}
 	messages, err := c.Messages.PullMessages(ctx, "stream", "consumer", 0)
 	if err != nil {
 		t.Errorf("PullMessages with zero batch size failed: %v", err)
@@ -325,6 +332,55 @@ func TestMessageServiceTimeout(t *testing.T) {
 	err := c.Messages.Publish(ctx, "test.subject", msg)
 	if err == nil {
 		t.Error("Expected timeout error in Publish")
+	}
+}
+
+// capturingJSContext records publish subjects so tests can assert PublishResult
+// wire format (flat for Zeus local result_subject, 3-token when subject ends with .>).
+type capturingJSContext struct {
+	mockJSContext
+	subjects []string
+	mu       sync.Mutex
+}
+
+func (c *capturingJSContext) Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
+	c.mu.Lock()
+	c.subjects = append(c.subjects, subj)
+	c.mu.Unlock()
+	return c.mockJSContext.Publish(subj, data, opts...)
+}
+
+// TestPublishResultUsesFlatSubject verifies that PublishResult publishes to the
+// flat, tenant-free configured result subject verbatim — no environment or
+// execution-id tokens. Zeus correlates results by run/execution ID, not by subject.
+func TestPublishResultUsesFlatSubject(t *testing.T) {
+	tests := []struct {
+		name          string
+		resultSubject string
+	}{
+		{"flat local", "result_development"},
+		{"flat uat", "result_uat"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			js := &capturingJSContext{}
+			svc, err := message.NewMessageService(js, 5, 3, "RESULTS", tt.resultSubject)
+			if err != nil {
+				t.Fatalf("NewMessageService failed: %v", err)
+			}
+			svc.SetLogger(zap.NewNop())
+
+			result := message.NewResultMessage("exec-1", "wf", "run", "node", "success")
+
+			if err := svc.PublishResult(context.Background(), result); err != nil {
+				t.Fatalf("PublishResult returned error: %v", err)
+			}
+
+			if got := js.subjects; len(got) != 1 || got[0] != tt.resultSubject {
+				t.Fatalf("publish subjects = %v, want [%q]", got, tt.resultSubject)
+			}
+		})
 	}
 }
 

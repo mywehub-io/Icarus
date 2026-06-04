@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"time"
 
 	natsclient "github.com/nats-io/nats.go"
 	"github.com/wehubfusion/Icarus/internal/nats"
@@ -82,6 +83,27 @@ func NewClient(url string, resultStream string, resultSubject string) *Client {
 	}
 }
 
+// SetConsumerInactiveThreshold configures the InactiveThreshold applied to durables
+// created via Messages.EnsureConsumer. Zero disables auto-GC. Positive values let
+// JetStream delete the durable after the configured idle period (no pulls/acks).
+// Call before Connect; after Connect, the value is propagated to the MessageService.
+//
+// Use a positive value (e.g. 72h) for tenant pods whose lifecycle is shorter than
+// the platform's so orphan durables are reclaimed automatically. Leave at zero for
+// central/shared pods where the durable must persist regardless of activity.
+func (c *Client) SetConsumerInactiveThreshold(d time.Duration) {
+	if c == nil || c.config == nil {
+		return
+	}
+	if d < 0 {
+		d = 0
+	}
+	c.config.ConsumerInactiveThreshold = d
+	if c.Messages != nil {
+		c.Messages.SetInactiveThreshold(d)
+	}
+}
+
 // NewClientWithConfig creates a new JetStream SDK client with custom configuration.
 // This allows full control over connection parameters such as reconnection settings,
 // timeouts, and authentication.
@@ -157,6 +179,9 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.conn = nil
 		c.js = nil
 		return sdkerrors.NewInternalError("", "failed to initialize message service", "SERVICE_INIT_FAILED", err)
+	}
+	if c.config.ConsumerInactiveThreshold > 0 {
+		msgService.SetInactiveThreshold(c.config.ConsumerInactiveThreshold)
 	}
 	c.Messages = msgService
 
