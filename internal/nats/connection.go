@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
 )
 
 // ConnectionConfig holds configuration for NATS connection
@@ -66,6 +67,10 @@ type ConnectionConfig struct {
 	// for tenant pods whose lifecycle is shorter than the platform's; central pods
 	// should leave this at 0.
 	ConsumerInactiveThreshold time.Duration
+
+	// Logger receives disconnect, reconnect, and closed events. Optional; when nil
+	// connection lifecycle events are not logged.
+	Logger *zap.Logger
 }
 
 // DefaultConnectionConfig returns a configuration with sensible defaults
@@ -73,7 +78,7 @@ func DefaultConnectionConfig(url string) *ConnectionConfig {
 	return &ConnectionConfig{
 		URL:               url,
 		Name:              "nats-sdk-client",
-		MaxReconnects:     10,
+		MaxReconnects:     -1,
 		ReconnectWait:     2 * time.Second,
 		Timeout:           5 * time.Second,
 		MaxDeliver:        5, // Default: retry up to 5 times (2.5 minutes with 30s AckWait)
@@ -99,16 +104,22 @@ func Connect(ctx context.Context, config *ConnectionConfig) (*nats.Conn, error) 
 		nats.ReconnectWait(config.ReconnectWait),
 		nats.Timeout(config.Timeout),
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
-			if err != nil {
-				// In production, use structured logging
-				fmt.Printf("NATS disconnected: %v\n", err)
+			if err == nil || config.Logger == nil {
+				return
 			}
+			config.Logger.Warn("NATS disconnected", zap.Error(err))
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			fmt.Printf("NATS reconnected to %s\n", nc.ConnectedUrl())
+			if config.Logger == nil {
+				return
+			}
+			config.Logger.Info("NATS reconnected", zap.String("connected_url", nc.ConnectedUrl()))
 		}),
-		nats.ClosedHandler(func(nc *nats.Conn) {
-			fmt.Println("NATS connection closed")
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			if config.Logger == nil {
+				return
+			}
+			config.Logger.Warn("NATS connection closed")
 		}),
 	}
 

@@ -60,10 +60,12 @@ func (m *mockProcessor) getCallCount() int {
 
 // mockJSContext implements message.JSContext for testing
 type mockJSContext struct {
-	messages    []*nats.Msg
-	pullError   error
-	reportError error
-	mu          sync.Mutex
+	messages         []*nats.Msg
+	pullError        error
+	pullErrorBudget  int
+	pullAttempts     int
+	reportError      error
+	mu               sync.Mutex
 }
 
 func (m *mockJSContext) Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
@@ -130,6 +132,12 @@ func (m *mockJSContext) addMessage(msg *message.Message) {
 
 func (m *mockJSContext) setPullError(err error) {
 	m.pullError = err
+	m.pullErrorBudget = 0
+}
+
+func (m *mockJSContext) setPullErrorBudget(err error, budget int) {
+	m.pullError = err
+	m.pullErrorBudget = budget
 }
 
 func (m *mockJSContext) setReportError(err error) {
@@ -160,7 +168,10 @@ func (m *mockPullJSSubscription) Pending() (int, int, error) { return 0, 0, nil 
 
 func (m *mockPullJSSubscription) Fetch(batch int, opts ...nats.PullOpt) ([]*nats.Msg, error) {
 	if m.owner.pullError != nil {
-		return nil, m.owner.pullError
+		m.owner.pullAttempts++
+		if m.owner.pullErrorBudget == 0 || m.owner.pullAttempts <= m.owner.pullErrorBudget {
+			return nil, m.owner.pullError
+		}
 	}
 
 	m.owner.mu.Lock()
@@ -206,6 +217,10 @@ func (m *mockClientWrapper) addMessage(msg *message.Message) {
 
 func (m *mockClientWrapper) setPullError(err error) {
 	m.mockJS.setPullError(err)
+}
+
+func (m *mockClientWrapper) setPullErrorBudget(err error, budget int) {
+	m.mockJS.setPullErrorBudget(err, budget)
 }
 
 func (m *mockClientWrapper) setReportError(err error) {
@@ -407,6 +422,30 @@ func TestRunnerRunWithMultipleMessages(t *testing.T) {
 	// Verify the processor was called for all messages
 	if mockProc.getCallCount() != 3 {
 		t.Errorf("Expected processor to be called 3 times, got %d", mockProc.getCallCount())
+	}
+}
+
+func TestRunner_recoversFromPullFailure(t *testing.T) {
+	mockClient := newMockClient()
+	mockClient.setPullErrorBudget(errors.New("consumer info: nats: connection closed"), 3)
+
+	testMsg := message.NewMessage().WithPayload("test data")
+	mockClient.addMessage(testMsg)
+
+	mockProc := &mockProcessor{}
+	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_ = r.Run(ctx)
+	time.Sleep(500 * time.Millisecond)
+
+	if mockProc.getCallCount() < 1 {
+		t.Fatalf("expected processor to run after transient pull errors, got %d calls", mockProc.getCallCount())
 	}
 }
 

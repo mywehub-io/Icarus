@@ -39,8 +39,19 @@ func (c *Client) Connect(ctx context.Context) error
 ```
 
 Establishes TCP, creates the JetStream context, and initialises `c.Messages`. Idempotent —
-returns nil if already connected. Fails with `JETSTREAM_NOT_ENABLED` if the NATS server
-does not have JetStream enabled. (`pkg/client/client.go:119`)
+returns nil if already connected. Clears a stale closed connection before reconnecting.
+Fails with `JETSTREAM_NOT_ENABLED` if the NATS server does not have JetStream enabled.
+
+## `EnsureConnected`
+
+```go
+func (c *Client) EnsureConnected(ctx context.Context) error
+```
+
+Restores a dead connection (mutex-safe). `pkg/runner` invokes this after transport
+errors during pull or result publish. Default `ConnectionConfig` uses unlimited
+`MaxReconnects` (`-1`) so brief NATS outages are handled by nats.go; `EnsureConnected`
+covers permanent connection closure.
 
 ## `Client.Messages`
 

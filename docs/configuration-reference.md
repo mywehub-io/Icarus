@@ -23,13 +23,22 @@ Resolution order for worker count: `Config.WorkerCount` (if > 0) → `ICARUS_RUN
 |---|---|---|
 | `URL` | — | NATS server address |
 | `Name` | — | Client name shown in NATS monitoring |
-| `MaxReconnects` | — | Maximum reconnection attempts (-1 = infinite) |
-| `ReconnectWait` | — | Delay between reconnection attempts |
+| `MaxReconnects` | `-1` | Maximum reconnection attempts (`-1` = unlimited; default via `DefaultConnectionConfig`) |
+| `ReconnectWait` | `2s` | Delay between reconnection attempts |
+| `Logger` | — | Optional `*zap.Logger` for disconnect, reconnect, and closed events |
 | `Timeout` | — | Connection and ping timeout |
 | `MaxDeliver` | `5` | JetStream consumer max deliver (redelivery count before dead-letter) |
 | `PublishMaxRetries` | `3` | Retry count for `ReportSuccess` / `ReportError` publishes |
 | `ResultStream` | — | Overrides the result stream at config level |
 | `ResultSubject` | — | Overrides the result subject at config level |
+
+## `Client.EnsureConnected`
+
+```go
+func (c *Client) EnsureConnected(ctx context.Context) error
+```
+
+Reconnects when the NATS TCP connection is missing or closed. Safe for concurrent use (for example multiple `pkg/runner` instances sharing one client). The Icarus runner calls this automatically after JetStream pull or publish transport errors.
 
 ## `runner.NewRunner` parameters
 

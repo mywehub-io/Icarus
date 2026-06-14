@@ -18,7 +18,7 @@ A clean, future-proof Go SDK for messaging over NATS JetStream with idiomatic pa
 - **Distributed Tracing**: Integrated OpenTelemetry tracing support with Jaeger and OTLP exporters for observability
 - **Callback Reporting**: Automatic success and error reporting to result streams with proper message acknowledgment
 - **Robust Error Handling**: SDK-specific errors with proper error wrapping
-- **Connection Management**: Automatic reconnection and connection health monitoring
+- **Connection Management**: Unlimited nats.go reconnects (`MaxReconnects: -1`) plus `EnsureConnected` for recovery after permanent connection closure
 - **Full JetStream Integration**: Automatic JetStream context initialization and advanced operations
 - **Structured Logging**: Built-in zap logger integration with configurable log levels
 - **Kubernetes-Aware Concurrency Control**: Production-ready goroutine limiting with automatic CPU quota detection, circuit breaker protection, and comprehensive observability
@@ -1019,7 +1019,7 @@ import "github.com/wehubfusion/Icarus/internal/nats"
 config := &nats.ConnectionConfig{
     URL:           "nats://localhost:4222",
     Name:          "my-service",
-    MaxReconnects: 10,
+    MaxReconnects: -1, // unlimited; default in DefaultConnectionConfig
     ReconnectWait: 2 * time.Second,
     Timeout:       5 * time.Second,
     Username:      "user",
@@ -1029,6 +1029,20 @@ config := &nats.ConnectionConfig{
 c := client.NewClientWithConfig(config)
 ```
 
+### NATS self-healing reconnect
+
+`DefaultConnectionConfig` sets `MaxReconnects: -1` so nats.go keeps retrying through brief outages.
+When the connection is permanently closed (for example after a long NATS restart), call
+`EnsureConnected` to rebuild the connection, JetStream context, and `MessageService`:
+
+```go
+if err := c.EnsureConnected(ctx); err != nil {
+    log.Fatalf("NATS reconnect failed: %v", err)
+}
+```
+
+`pkg/runner` calls `EnsureConnected` automatically on JetStream transport errors during pull
+and result publish. Multiple runners may share one client; `EnsureConnected` is mutex-safe.
 
 ### Pull-Based Consumers (JetStream)
 

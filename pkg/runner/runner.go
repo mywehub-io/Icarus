@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	icarusnats "github.com/wehubfusion/Icarus/internal/nats"
 	internaltracing "github.com/wehubfusion/Icarus/internal/tracing"
 	"github.com/wehubfusion/Icarus/pkg/client"
 	"github.com/wehubfusion/Icarus/pkg/message"
@@ -363,6 +364,11 @@ func (r *Runner) Run(ctx context.Context) error {
 					}
 					// This is an actual error, not graceful shutdown
 					r.logger.Error("Error pulling messages", zap.Error(err))
+					if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
+						if r.tryReconnectNATS() {
+							backoffDelay = 100 * time.Millisecond
+						}
+					}
 					// Exponential backoff for errors
 					time.Sleep(backoffDelay)
 					if backoffDelay < maxBackoff {
@@ -642,6 +648,10 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 					zap.String("originalError", processErr.Error()),
 					zap.Error(reportErr))
 
+				if icarusnats.IsTransportError(reportErr) || !r.client.IsConnected() {
+					r.tryReconnectNATS()
+				}
+
 				// Try one more time with a fresh context after a brief delay
 				time.Sleep(2 * time.Second)
 				retryCtx, retryCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -741,6 +751,10 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 				zap.String("runID", runID),
 				zap.Error(reportErr))
 
+			if icarusnats.IsTransportError(reportErr) || !r.client.IsConnected() {
+				r.tryReconnectNATS()
+			}
+
 			// Extract executionID from resultMessage metadata
 			executionID := ""
 			if resultMessage.Metadata != nil {
@@ -760,6 +774,10 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 					zap.String("executionID", executionID),
 					zap.String("originalError", reportErr.Error()),
 					zap.Error(errorReportErr))
+
+				if icarusnats.IsTransportError(errorReportErr) || !r.client.IsConnected() {
+					r.tryReconnectNATS()
+				}
 
 				// Try one more time with a fresh context
 				time.Sleep(2 * time.Second)
@@ -793,4 +811,16 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	}
 
 	return nil
+}
+
+// tryReconnectNATS attempts to restore a dead NATS connection. Returns true on success.
+func (r *Runner) tryReconnectNATS() bool {
+	reconnectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r.client.EnsureConnected(reconnectCtx); err != nil {
+		r.logger.Warn("NATS reconnect failed", zap.Error(err))
+		return false
+	}
+	r.logger.Info("NATS reconnected after transport failure")
+	return true
 }
