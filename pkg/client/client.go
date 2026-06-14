@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	natsclient "github.com/nats-io/nats.go"
@@ -37,10 +38,11 @@ type BlobStorageClient interface {
 //	msg := message.NewMessage("id-123", "Hello World")
 //	client.Messages.Publish(ctx, "events.test", msg)
 type Client struct {
-	conn   *natsclient.Conn
-	js     natsclient.JetStreamContext
-	config *nats.ConnectionConfig
-	logger *zap.Logger
+	conn        *natsclient.Conn
+	js          natsclient.JetStreamContext
+	config      *nats.ConnectionConfig
+	logger      *zap.Logger
+	reconnectMu sync.Mutex
 
 	// Messages provides access to all JetStream messaging operations including
 	// publish, subscribe, request-reply, and pull-based consumers
@@ -115,7 +117,7 @@ func (c *Client) SetConsumerInactiveThreshold(d time.Duration) {
 //	config := &nats.ConnectionConfig{
 //	    URL:           "nats://localhost:4222",
 //	    Name:          "my-service",
-//	    MaxReconnects: 10,
+//	    MaxReconnects: -1,
 //	    ReconnectWait: 2 * time.Second,
 //	}
 //	client := client.NewClientWithConfig(config)
@@ -146,6 +148,16 @@ func NewClientWithConfig(config *nats.ConnectionConfig) *Client {
 func (c *Client) Connect(ctx context.Context) error {
 	if c.conn != nil && c.conn.IsConnected() {
 		return nil // Already connected
+	}
+
+	if c.conn != nil && !c.conn.IsConnected() {
+		c.conn = nil
+		c.js = nil
+		c.Messages = nil
+	}
+
+	if c.config != nil && c.logger != nil {
+		c.config.Logger = c.logger
 	}
 
 	// Establish NATS connection
@@ -183,9 +195,24 @@ func (c *Client) Connect(ctx context.Context) error {
 	if c.config.ConsumerInactiveThreshold > 0 {
 		msgService.SetInactiveThreshold(c.config.ConsumerInactiveThreshold)
 	}
+	if c.blobStorage != nil {
+		msgService.SetBlobStorage(c.blobStorage)
+	}
 	c.Messages = msgService
 
 	return nil
+}
+
+// EnsureConnected reconnects when the NATS connection is missing or closed.
+// Safe for concurrent use from multiple runners sharing one client.
+func (c *Client) EnsureConnected(ctx context.Context) error {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
+	if c.IsConnected() {
+		return nil
+	}
+	return c.Connect(ctx)
 }
 
 // NewClientWithJSContext creates a client wired to a provided JSContext implementation.
@@ -204,6 +231,9 @@ func NewClientWithJSContext(js message.JSContext) *Client {
 func (c *Client) SetLogger(logger *zap.Logger) {
 	if logger != nil {
 		c.logger = logger
+		if c.config != nil {
+			c.config.Logger = logger
+		}
 	}
 }
 
@@ -250,8 +280,7 @@ func (c *Client) Close() error {
 // Example:
 //
 //	if !client.IsConnected() {
-//	    client.logger.Info("Not connected, attempting reconnection...")
-//	    client.Connect(ctx)
+//	    client.EnsureConnected(ctx)
 //	}
 func (c *Client) IsConnected() bool {
 	return nats.IsConnected(c.conn)
@@ -321,14 +350,6 @@ type ConnectionStats struct {
 	Reconnects uint64 // Number of reconnections performed
 }
 
-// ensureConnected checks if the client is connected and returns an error if not.
-func (c *Client) ensureConnected() error {
-	if !c.IsConnected() {
-		return sdkerrors.NewInternalError("", "not connected to NATS", "NOT_CONNECTED", nil)
-	}
-	return nil
-}
-
 // SetBlobStorage injects the blob storage client for large results
 func (c *Client) SetBlobStorage(bs BlobStorageClient) {
 	c.blobStorage = bs
@@ -351,7 +372,7 @@ func (c *Client) SetBlobStorage(bs BlobStorageClient) {
 //	    client.logger.Error("Connection unhealthy", zap.Error(err))
 //	}
 func (c *Client) Ping(ctx context.Context) error {
-	if err := c.ensureConnected(); err != nil {
+	if err := c.EnsureConnected(ctx); err != nil {
 		return err
 	}
 
