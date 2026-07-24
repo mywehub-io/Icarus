@@ -1678,8 +1678,20 @@ func (sp *SubflowProcessor) extractRemainingPath(data map[string]interface{}, se
 	// Get the first segment
 	firstSeg := segments[0]
 
-	// Navigate to the first segment's path
-	current := GetNestedValue(data, firstSeg.Path)
+	var current interface{}
+	if firstSeg.Path == ItemPlaceholderKey {
+		// $item is a reserved placeholder for "the element itself", not a literal
+		// field name to look up. Unwrap the $value wrapper used for primitive
+		// elements (see extractItemDataAsMap); otherwise use the element as-is.
+		if wrapped, ok := data["$value"]; ok && len(data) == 1 {
+			current = wrapped
+		} else {
+			current = data
+		}
+	} else {
+		// Navigate to the first segment's path
+		current = GetNestedValue(data, firstSeg.Path)
+	}
 	if current == nil {
 		return nil
 	}
@@ -1708,7 +1720,7 @@ func (sp *SubflowProcessor) extractRemainingPath(data map[string]interface{}, se
 			itemMap, ok := item.(map[string]interface{})
 			if !ok {
 				// Primitive value - just append if we're at a terminal array
-				if len(remaining) == 0 || (len(remaining) == 1 && remaining[0].Path == "") {
+				if len(remaining) == 0 || (len(remaining) == 1 && (remaining[0].Path == "" || remaining[0].Path == ItemPlaceholderKey)) {
 					result = append(result, item)
 				}
 				continue

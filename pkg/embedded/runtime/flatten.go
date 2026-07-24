@@ -9,6 +9,12 @@ import (
 // it is stored under this key only. Paths starting with "//" are equivalent to "/$items//...".
 const RootArrayKey = "$items"
 
+// ItemPlaceholderKey is the reserved trailing path segment meaning "the current
+// array element itself" rather than a literal field name. It is equivalent to a
+// bare trailing "//" (e.g. "/names//$item" behaves the same as "/names//") but
+// can be used when a source endpoint needs an explicit terminal segment.
+const ItemPlaceholderKey = "$item"
+
 // NormalizeRootArrayEndpoint converts //field notation to /$items//field for root-array access.
 // This ensures consistent key construction when the root of the input is an array.
 // Examples:
