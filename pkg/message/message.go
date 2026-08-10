@@ -18,6 +18,12 @@ const (
 	MetaJetStreamNumPending   = "jetstream_num_pending"
 	// MetaIcarusEnqueueUnixMs is set by the runner when a message is placed on the internal job queue (ms since epoch).
 	MetaIcarusEnqueueUnixMs = "icarus_enqueue_unix_ms"
+	// MetaTraceParent carries a W3C traceparent so a trace can span the publish->consume boundary.
+	// Icarus's NATS publish path (pkg/message/service.go) is header-less (nc.Publish/js.Publish
+	// take no header option), so the traceparent travels inside this already-serialized Metadata
+	// map instead of a NATS message header — no NATS wire-format change needed. Set by a publisher
+	// (e.g. Zeus's node_publisher.go) and read by Runner.processMessage before it starts its span.
+	MetaTraceParent = "traceparent"
 )
 
 // Workflow represents workflow execution information
@@ -534,6 +540,13 @@ type ResultMessage struct {
 	PluginType      string `json:"plugin_type,omitempty"`       // Plugin type that processed the node
 	ExecutionTimeMs int64  `json:"execution_time_ms,omitempty"` // Execution duration in milliseconds
 	ResultSize      int    `json:"result_size,omitempty"`       // Size of result in bytes
+
+	// TraceParent carries a W3C traceparent so a trace can span the Runner-processes-a-node ->
+	// dispatcher-consumes-the-result boundary, mirroring MetaTraceParent on the inbound Message
+	// (see that constant's doc comment for why this travels in the body rather than a NATS
+	// header). Set by Runner.processMessage before ReportSuccess/ReportError and read by the
+	// result consumer (e.g. Zeus's result_consumer.go) before it starts its own span.
+	TraceParent string `json:"trace_parent,omitempty"`
 
 	// Timestamps
 	Timestamp time.Time `json:"timestamp"`  // When the result was generated
