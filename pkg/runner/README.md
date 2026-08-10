@@ -1,7 +1,8 @@
 # pkg/runner
 
-Concurrent message processing framework. Pulls messages from a NATS JetStream consumer,
-dispatches them through a worker pool, and reports results back to Zeus.
+Concurrent message processing framework. Consumes messages from a NATS JetStream consumer
+via the new `nats.go/jetstream` `Consume` API, dispatches them through a worker pool, and
+reports results back to Zeus.
 
 ## Quick start
 
@@ -53,7 +54,7 @@ Your business logic goes here. Return `error` to trigger `ReportError`; return a
 | `processor` | Your `Processor` implementation |
 | `stream` | JetStream stream name; created if it does not exist |
 | `consumer` | JetStream consumer (durable) name; created if it does not exist |
-| `batchSize` | Number of messages to pull per fetch |
+| `batchSize` | Max in-flight pull request size (`jetstream.PullMaxMessages`) |
 | `processTimeout` | Per-message deadline added on top of the parent context |
 | `logger` | Required `*zap.Logger` |
 | `tracingConfig` | Optional OTel tracing; pass nil to disable |

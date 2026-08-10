@@ -3,11 +3,12 @@ package message
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	sdkerrors "github.com/wehubfusion/Icarus/pkg/errors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
@@ -26,74 +27,21 @@ func injectTraceParent(ctx context.Context, resultMsg *ResultMessage) {
 	}
 }
 
-// JSContext defines the minimal subset of JetStream operations the service depends on.
-// This allows tests to provide a mock without requiring a running NATS server.
+// JSContext defines the minimal subset of the new nats.go/jetstream API the service
+// depends on. jetstream.JetStream satisfies this interface directly; tests can
+// provide a mock without requiring a running NATS server.
 type JSContext interface {
-	Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error)
-	PullSubscribe(subj, durable string, opts ...nats.SubOpt) (JSSubscription, error)
-	StreamInfo(stream string) (*nats.StreamInfo, error)
-	AddStream(cfg *nats.StreamConfig) (*nats.StreamInfo, error)
-	ConsumerInfo(stream, consumer string) (*nats.ConsumerInfo, error)
-	AddConsumer(stream string, cfg *nats.ConsumerConfig) (*nats.ConsumerInfo, error)
+	Publish(ctx context.Context, subject string, payload []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error)
+	Stream(ctx context.Context, name string) (jetstream.Stream, error)
+	CreateStream(ctx context.Context, cfg jetstream.StreamConfig) (jetstream.Stream, error)
+	Consumer(ctx context.Context, stream, consumer string) (jetstream.Consumer, error)
+	CreateConsumer(ctx context.Context, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error)
 }
 
-// JSSubscription abstracts operations used by the SDK from a subscription.
-// Implemented by the real nats.Subscription via adapter and by test doubles.
-type JSSubscription interface {
-	Unsubscribe() error
-	Drain() error
-	IsValid() bool
-	Pending() (int, int, error)
-	Fetch(batch int, opts ...nats.PullOpt) ([]*nats.Msg, error)
-}
-
-// WrapNATSJetStream adapts a nats.JetStreamContext to the JSContext interface.
-func WrapNATSJetStream(js nats.JetStreamContext) JSContext {
-	return &natsJSAdapter{js: js}
-}
-
-type natsJSAdapter struct {
-	js nats.JetStreamContext
-}
-
-func (a *natsJSAdapter) Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
-	return a.js.Publish(subj, data, opts...)
-}
-
-func (a *natsJSAdapter) PullSubscribe(subj, durable string, opts ...nats.SubOpt) (JSSubscription, error) {
-	sub, err := a.js.PullSubscribe(subj, durable, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &natsSubAdapter{sub: sub}, nil
-}
-
-func (a *natsJSAdapter) StreamInfo(stream string) (*nats.StreamInfo, error) {
-	return a.js.StreamInfo(stream)
-}
-
-func (a *natsJSAdapter) AddStream(cfg *nats.StreamConfig) (*nats.StreamInfo, error) {
-	return a.js.AddStream(cfg)
-}
-
-func (a *natsJSAdapter) ConsumerInfo(stream, consumer string) (*nats.ConsumerInfo, error) {
-	return a.js.ConsumerInfo(stream, consumer)
-}
-
-func (a *natsJSAdapter) AddConsumer(stream string, cfg *nats.ConsumerConfig) (*nats.ConsumerInfo, error) {
-	return a.js.AddConsumer(stream, cfg)
-}
-
-type natsSubAdapter struct {
-	sub *nats.Subscription
-}
-
-func (s *natsSubAdapter) Unsubscribe() error         { return s.sub.Unsubscribe() }
-func (s *natsSubAdapter) Drain() error               { return s.sub.Drain() }
-func (s *natsSubAdapter) IsValid() bool              { return s.sub.IsValid() }
-func (s *natsSubAdapter) Pending() (int, int, error) { return s.sub.Pending() }
-func (s *natsSubAdapter) Fetch(batch int, opts ...nats.PullOpt) ([]*nats.Msg, error) {
-	return s.sub.Fetch(batch, opts...)
+// WrapJetStream adapts a jetstream.JetStream to the JSContext interface.
+// jetstream.JetStream already implements JSContext, so this is a type-safe cast.
+func WrapJetStream(js jetstream.JetStream) JSContext {
+	return js
 }
 
 // MessageService provides methods for publishing and managing messages over JetStream.
@@ -111,7 +59,7 @@ type MessageService struct {
 	// explicitly deleted. Non-zero values let JetStream delete the durable after the
 	// configured idle period (no pulls/acks). Intended for tenant pods whose lifecycle
 	// is shorter than the platform's; central/shared consumers should leave this at 0.
-	inactiveThreshold     time.Duration
+	inactiveThreshold time.Duration
 }
 
 // BlobStorageClient interface for storing large results
@@ -152,10 +100,10 @@ func NewMessageService(js JSContext, maxDeliver int, publishMaxRetries int, resu
 
 	logger, _ := zap.NewProduction()
 	return &MessageService{
-		js:                  js,
-		logger:              logger,
-		maxDeliver:          maxDeliver,
-		publishMaxRetries:   publishMaxRetries,
+		js:                js,
+		logger:            logger,
+		maxDeliver:        maxDeliver,
+		publishMaxRetries: publishMaxRetries,
 		resultStream:      resultStream,
 		resultSubject:     resultSubject,
 	}, nil
@@ -191,12 +139,13 @@ func (s *MessageService) SetInactiveThreshold(d time.Duration) {
 
 // EnsureStream creates the JetStream stream if it doesn't exist, or validates it exists.
 // This is a public method that can be called by runners and other components.
-func (s *MessageService) EnsureStream(streamName string) error {
+// Existing streams are never modified.
+func (s *MessageService) EnsureStream(ctx context.Context, streamName string) error {
 	// Check if stream exists
-	streamInfo, err := s.js.StreamInfo(streamName)
+	stream, err := s.js.Stream(ctx, streamName)
 	if err != nil {
 		// Stream doesn't exist, create it
-		if err == nats.ErrStreamNotFound {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
 			s.logger.Info("Creating JetStream stream",
 				zap.String("stream", streamName))
 
@@ -205,16 +154,16 @@ func (s *MessageService) EnsureStream(streamName string) error {
 				subjects = []string{s.resultSubject}
 			}
 
-			streamConfig := &nats.StreamConfig{
+			streamConfig := jetstream.StreamConfig{
 				Name:     streamName,
 				Subjects: subjects,
-				Storage:  nats.FileStorage,
+				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
 				Replicas: 1,
 			}
 
-			_, err = s.js.AddStream(streamConfig)
+			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
 				return fmt.Errorf("failed to create stream '%s': %w", streamName, err)
 			}
@@ -229,9 +178,13 @@ func (s *MessageService) EnsureStream(streamName string) error {
 		}
 	} else {
 		// Stream exists, log its status
+		msgs := uint64(0)
+		if info := stream.CachedInfo(); info != nil {
+			msgs = info.State.Msgs
+		}
 		s.logger.Info("JetStream stream already exists",
 			zap.String("stream", streamName),
-			zap.Uint64("messages", streamInfo.State.Msgs))
+			zap.Uint64("messages", msgs))
 	}
 
 	return nil
@@ -239,27 +192,28 @@ func (s *MessageService) EnsureStream(streamName string) error {
 
 // EnsureConsumer creates the JetStream consumer if it doesn't exist, or validates it exists.
 // filterSubject when non-empty sets FilterSubject on the durable consumer (tenant/default routing).
-func (s *MessageService) EnsureConsumer(streamName, consumerName, filterSubject string) error {
+// Existing durables are never modified (their config is left exactly as deployed).
+func (s *MessageService) EnsureConsumer(ctx context.Context, streamName, consumerName, filterSubject string) error {
 	// Try to get consumer info first
-	consumerInfo, err := s.js.ConsumerInfo(streamName, consumerName)
+	consumer, err := s.js.Consumer(ctx, streamName, consumerName)
 	if err != nil {
 		// Consumer doesn't exist, create it
-		if err == nats.ErrConsumerNotFound {
+		if errors.Is(err, jetstream.ErrConsumerNotFound) {
 			s.logger.Info("Creating JetStream consumer",
 				zap.String("stream", streamName),
 				zap.String("consumer", consumerName))
 
-			consumerConfig := &nats.ConsumerConfig{
+			consumerConfig := jetstream.ConsumerConfig{
 				Durable:           consumerName,
 				FilterSubject:     filterSubject,
-				AckPolicy:         nats.AckExplicitPolicy,
-				DeliverPolicy:     nats.DeliverAllPolicy,
+				AckPolicy:         jetstream.AckExplicitPolicy,
+				DeliverPolicy:     jetstream.DeliverAllPolicy,
 				MaxAckPending:     1000,
 				MaxDeliver:        s.maxDeliver,
 				InactiveThreshold: s.inactiveThreshold,
 			}
 
-			_, err = s.js.AddConsumer(streamName, consumerConfig)
+			_, err = s.js.CreateConsumer(ctx, streamName, consumerConfig)
 			if err != nil {
 				return fmt.Errorf("failed to create consumer '%s' in stream '%s': %w", consumerName, streamName, err)
 			}
@@ -274,91 +228,34 @@ func (s *MessageService) EnsureConsumer(streamName, consumerName, filterSubject 
 		}
 	} else {
 		// Consumer exists, log its status
+		pending := uint64(0)
+		if info := consumer.CachedInfo(); info != nil {
+			pending = info.NumPending
+		}
 		s.logger.Info("JetStream consumer already exists",
 			zap.String("stream", streamName),
 			zap.String("consumer", consumerName),
-			zap.Uint64("pending", consumerInfo.NumPending))
+			zap.Uint64("pending", pending))
 	}
 
 	return nil
 }
 
-// ensureStreamForSubject ensures a stream exists that can handle the given subject.
-// For result subjects, it uses the configured resultStream.
-// For other subjects, it extracts the stream name from the subject (first segment before dot)
-// and creates the stream if it doesn't exist.
-func (s *MessageService) ensureStreamForSubject(subject string) error {
-	var streamName string
-	var isResultSubject bool
-
-	// Check if this is a result subject
-	if s.resultSubject != "" && subject == s.resultSubject {
-		// Use the configured result stream
-		streamName = s.resultStream
-		isResultSubject = true
-		s.logger.Debug("Using configured result stream",
-			zap.String("stream", streamName),
-			zap.String("subject", subject))
-	} else {
-		// Extract stream name from subject (first part before dot)
-		streamName = subject
-		if idx := len(subject); idx > 0 {
-			// Find first dot to extract stream name
-			for i, c := range subject {
-				if c == '.' {
-					streamName = subject[:i]
-					break
-				}
-			}
-		}
+// GetConsumer returns a handle to an existing JetStream consumer, bound to the
+// stream. The handle is used by the runner to start a Consume() message loop.
+// The consumer must already exist (see EnsureConsumer); this method never
+// creates or modifies consumers.
+func (s *MessageService) GetConsumer(ctx context.Context, stream, consumer string) (jetstream.Consumer, error) {
+	if stream == "" || consumer == "" {
+		s.logger.Error("GetConsumer failed: stream and consumer names are required")
+		return nil, fmt.Errorf("stream and consumer names are required")
 	}
 
-	// Check if stream exists
-	_, err := s.js.StreamInfo(streamName)
+	cons, err := s.js.Consumer(ctx, stream, consumer)
 	if err != nil {
-		// Stream doesn't exist
-		if err == nats.ErrStreamNotFound {
-			// Create stream (both result streams and regular streams)
-			s.logger.Info("Creating JetStream stream for subject",
-				zap.String("stream", streamName),
-				zap.String("subject", subject),
-				zap.Bool("is_result_stream", isResultSubject))
-
-			// For result subjects, use the configured subject pattern
-			// For other subjects, derive pattern from subject
-			var subjects []string
-			if isResultSubject {
-				subjects = []string{s.resultSubject}
-			} else {
-				// Regular subjects use stream name derived pattern
-				// e.g., "HTTP_REQUESTS_UAT.>" for stream "HTTP_REQUESTS_UAT"
-				subjects = []string{fmt.Sprintf("%s.>", streamName)}
-			}
-
-			streamConfig := &nats.StreamConfig{
-				Name:     streamName,
-				Subjects: subjects,
-				Storage:  nats.FileStorage,
-				MaxAge:   24 * time.Hour,
-				MaxMsgs:  100000,
-				Replicas: 1,
-			}
-
-			_, err = s.js.AddStream(streamConfig)
-			if err != nil {
-				return fmt.Errorf("failed to create stream '%s' for subject '%s': %w", streamName, subject, err)
-			}
-
-			s.logger.Info("Successfully created JetStream stream",
-				zap.String("stream", streamName),
-				zap.Strings("subjects", subjects),
-				zap.Bool("is_result_stream", isResultSubject))
-		} else {
-			return fmt.Errorf("failed to get stream info for '%s': %w", streamName, err)
-		}
+		return nil, fmt.Errorf("consumer %q in %q: %w", consumer, stream, err)
 	}
-
-	return nil
+	return cons, nil
 }
 
 // getMessageIdentifier creates a unique identifier for logging purposes
@@ -380,194 +277,46 @@ func (s *MessageService) getMessageIdentifier(msg *Message) string {
 	return fmt.Sprintf("timestamp:%s", msg.CreatedAt)
 }
 
-// Publish publishes a message to the specified subject using JetStream.
-// The message is persisted according to the stream's configuration.
-// If no stream exists for the subject, one will be created automatically.
-// Returns an error if the publish fails.
-func (s *MessageService) Publish(ctx context.Context, subject string, msg *Message) error {
-	if subject == "" {
-		s.logger.Error("Publish failed: subject cannot be empty")
-		return sdkerrors.NewValidationError("subject cannot be empty", "INVALID_SUBJECT", nil)
-	}
+// ensureResultStream ensures the configured result stream exists so results can
+// be published to resultSubject. The stream is created on first use and never
+// modified afterwards.
+func (s *MessageService) ensureResultStream(ctx context.Context) error {
+	streamName := s.resultStream
 
-	if msg == nil {
-		s.logger.Error("Publish failed: message cannot be nil")
-		return sdkerrors.NewValidationError("message cannot be nil", "INVALID_MESSAGE", nil)
-	}
-
-	// Ensure a stream exists for this subject
-	if err := s.ensureStreamForSubject(subject); err != nil {
-		s.logger.Error("Failed to ensure stream exists",
-			zap.String("subject", subject),
-			zap.Error(err))
-		return sdkerrors.NewInternalError("", "failed to ensure stream exists", "STREAM_ENSURE_FAILED", err)
-	}
-
-	s.logger.Debug("Publishing message",
-		zap.String("subject", subject),
-		zap.String("message_identifier", s.getMessageIdentifier(msg)))
-
-	data, err := msg.ToBytes()
+	// Check if stream exists
+	_, err := s.js.Stream(ctx, streamName)
 	if err != nil {
-		s.logger.Error("Failed to marshal message",
-			zap.String("subject", subject),
-			zap.String("message_identifier", s.getMessageIdentifier(msg)),
-			zap.Error(err))
-		return sdkerrors.NewInternalError("", "failed to marshal message", "MARSHAL_FAILED", err)
-	}
+		// Stream doesn't exist
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			s.logger.Info("Creating JetStream stream for subject",
+				zap.String("stream", streamName),
+				zap.String("subject", s.resultSubject),
+				zap.Bool("is_result_stream", true))
 
-	// Create a channel to handle publish result
-	resultCh := make(chan error, 1)
-
-	go func() {
-		_, err := s.js.Publish(subject, data)
-		resultCh <- err
-	}()
-
-	select {
-	case <-ctx.Done():
-		s.logger.Warn("Publish cancelled",
-			zap.String("subject", subject),
-			zap.String("message_identifier", s.getMessageIdentifier(msg)),
-			zap.Error(ctx.Err()))
-		return fmt.Errorf("publish cancelled: %w", ctx.Err())
-	case err := <-resultCh:
-		if err != nil {
-			s.logger.Error("Failed to publish message to JetStream",
-				zap.String("subject", subject),
-				zap.String("message_identifier", s.getMessageIdentifier(msg)),
-				zap.Error(err))
-			return sdkerrors.NewInternalError("", "failed to publish message to JetStream", "PUBLISH_FAILED", err)
-		}
-		s.logger.Info("Message published successfully",
-			zap.String("subject", subject),
-			zap.String("message_identifier", s.getMessageIdentifier(msg)))
-		return nil
-	}
-}
-
-// PullMessages pulls messages from a JetStream pull-based consumer.
-// This method fetches messages in batches on demand, providing explicit flow control.
-//
-// Messages are NOT automatically acknowledged - the caller must handle acknowledgment
-// by calling Ack(), Nak(), or Term() on the returned messages as appropriate.
-// Use this method when you want explicit control over when messages are fetched and acknowledged.
-//
-// Parameters:
-//   - stream: The name of the JetStream stream
-//   - consumer: The name of the durable consumer
-//   - batchSize: The maximum number of messages to fetch (defaults to 10 if <= 0)
-//
-// Returns the fetched messages or an error if the operation fails.
-// Note: Returns empty slice (not error) when no messages are available within timeout.
-func (s *MessageService) PullMessages(ctx context.Context, stream, consumer string, batchSize int) ([]*Message, error) {
-	if stream == "" || consumer == "" {
-		s.logger.Error("PullMessages failed: stream and consumer names are required")
-		return nil, fmt.Errorf("stream and consumer names are required")
-	}
-
-	if batchSize <= 0 {
-		batchSize = 10
-	}
-
-	s.logger.Debug("Pulling messages",
-		zap.String("stream", stream),
-		zap.String("consumer", consumer),
-		zap.Int("batch_size", batchSize))
-
-	// Create a channel to handle pull result
-	type result struct {
-		msgs []*Message
-		err  error
-	}
-	resultCh := make(chan result, 1)
-
-	go func() {
-		info, err := s.js.ConsumerInfo(stream, consumer)
-		if err != nil {
-			resultCh <- result{err: fmt.Errorf("consumer info for %q in %q: %w", consumer, stream, err)}
-			return
-		}
-		filter := info.Config.FilterSubject
-
-		sub, err := s.js.PullSubscribe(filter, consumer, nats.Bind(stream, consumer))
-		if err != nil {
-			resultCh <- result{err: err}
-			return
-		}
-		defer sub.Unsubscribe()
-
-		// Fetch messages with timeout - use context deadline if available, otherwise default to 3 seconds
-		timeout := 3 * time.Second
-		if deadline, ok := ctx.Deadline(); ok {
-			if remaining := time.Until(deadline); remaining > 0 && remaining < timeout {
-				timeout = remaining
+			streamConfig := jetstream.StreamConfig{
+				Name:     streamName,
+				Subjects: []string{s.resultSubject},
+				Storage:  jetstream.FileStorage,
+				MaxAge:   24 * time.Hour,
+				MaxMsgs:  100000,
+				Replicas: 1,
 			}
-		}
 
-		natsMessages, err := sub.Fetch(batchSize, nats.MaxWait(timeout))
-		if err != nil {
-			// Check if this is a timeout error - this is normal when no messages are available
-			if err == nats.ErrTimeout {
-				// Return empty slice for timeout, not an error
-				resultCh <- result{msgs: []*Message{}}
-				return
-			}
-			resultCh <- result{err: err}
-			return
-		}
-
-		messages := make([]*Message, 0, len(natsMessages))
-		for _, natsMsg := range natsMessages {
-			msg, err := FromNATSMsg(natsMsg)
+			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
-				deliverCount := ""
-				if md, mdErr := natsMsg.Metadata(); mdErr == nil && md != nil {
-					deliverCount = strconv.FormatUint(md.NumDelivered, 10)
-				}
-				s.logger.Warn("Dropping malformed pulled message; NAK for redelivery",
-					zap.String("stream", stream),
-					zap.String("consumer", consumer),
-					zap.String("subject", natsMsg.Subject),
-					zap.String("jetstream_deliver_count", deliverCount),
-					zap.Error(err))
-				_ = natsMsg.Nak()
-				continue
+				return fmt.Errorf("failed to create stream '%s' for subject '%s': %w", streamName, s.resultSubject, err)
 			}
-			// Do NOT acknowledge - let the application handle acknowledgment
-			// Store the NATS message reference in the Message for later acknowledgment
-			msg.natsMsg = natsMsg
-			AttachJetStreamMetadata(msg, natsMsg)
-			messages = append(messages, msg)
-		}
 
-		resultCh <- result{msgs: messages}
-	}()
-
-	select {
-	case <-ctx.Done():
-		// Use debug level for graceful shutdown, warn for unexpected cancellation
-		if ctx.Err() == context.Canceled {
-			s.logger.Debug("Pull messages cancelled during shutdown",
-				zap.String("stream", stream),
-				zap.String("consumer", consumer))
+			s.logger.Info("Successfully created JetStream stream",
+				zap.String("stream", streamName),
+				zap.Strings("subjects", streamConfig.Subjects),
+				zap.Bool("is_result_stream", true))
 		} else {
-			s.logger.Warn("Pull messages cancelled",
-				zap.String("stream", stream),
-				zap.String("consumer", consumer),
-				zap.Error(ctx.Err()))
+			return fmt.Errorf("failed to get stream info for '%s': %w", streamName, err)
 		}
-		return nil, fmt.Errorf("pull cancelled: %w", ctx.Err())
-	case res := <-resultCh:
-		if res.err != nil {
-			s.logger.Error("Failed to pull messages from JetStream",
-				zap.String("stream", stream),
-				zap.String("consumer", consumer),
-				zap.Error(res.err))
-			return nil, sdkerrors.NewInternalError("", "failed to pull messages from JetStream", "PULL_FAILED", res.err)
-		}
-		return res.msgs, nil
 	}
+
+	return nil
 }
 
 // PublishResult publishes a ResultMessage to the result stream using JetStream.
@@ -588,7 +337,7 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 	publishSubject := s.resultSubject
 
 	// Ensure result stream exists
-	if err := s.ensureStreamForSubject(publishSubject); err != nil {
+	if err := s.ensureResultStream(ctx); err != nil {
 		s.logger.Error("Failed to ensure result stream exists",
 			zap.String("stream", s.resultStream),
 			zap.String("subject", publishSubject),
@@ -613,9 +362,9 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 
 	// Retry logic for critical result publishing
 	var publishErr error
-	var pubAck *nats.PubAck
+	var pubAck *jetstream.PubAck
 	for attempt := 1; attempt <= s.publishMaxRetries; attempt++ {
-		pubAck, publishErr = s.js.Publish(publishSubject, data)
+		pubAck, publishErr = s.js.Publish(ctx, publishSubject, data)
 		if publishErr == nil {
 			break
 		}
@@ -662,7 +411,7 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 // ReportSuccess publishes unit execution result to JetStream result stream.
 // For results <1.5MB, includes full payload inline. For larger results, stores in
 // blob storage and includes blob reference.
-func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Message, msg *nats.Msg) error {
+func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Message, msg jetstream.Msg) error {
 	startTime := time.Now()
 
 	if ctx.Err() != nil {
@@ -840,10 +589,10 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 //   - runID: The unique identifier of this specific workflow execution run
 //   - correlationID: Optional correlation ID for tracking
 //   - err: The error that occurred (can be *AppError or regular error)
-//   - msg: NATS message to acknowledge/nak after error reporting (can be nil)
+//   - msg: JetStream message to acknowledge/nak after error reporting (can be nil)
 //
 // Returns an error if the result cannot be published.
-func (s *MessageService) ReportError(ctx context.Context, executionID, workflowID, runID, correlationID string, err error, msg *nats.Msg) error {
+func (s *MessageService) ReportError(ctx context.Context, executionID, workflowID, runID, correlationID string, err error, msg jetstream.Msg) error {
 	startTime := time.Now()
 
 	if ctx.Err() != nil {
@@ -1004,7 +753,7 @@ func (s *MessageService) ReportError(ctx context.Context, executionID, workflowI
 }
 
 // jetStreamDeliverCountStr returns JetStream NumDelivered for grep-friendly diagnostics, or "".
-func jetStreamDeliverCountStr(msg *nats.Msg) string {
+func jetStreamDeliverCountStr(msg jetstream.Msg) string {
 	if msg == nil {
 		return ""
 	}
@@ -1055,4 +804,3 @@ func ExtractNodeIDFromExecutionID(executionID, workflowID string) string {
 	// If format doesn't match, return executionID as-is (fallback)
 	return executionID
 }
-

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
 	icarusnats "github.com/wehubfusion/Icarus/internal/nats"
 	internaltracing "github.com/wehubfusion/Icarus/internal/tracing"
 	"github.com/wehubfusion/Icarus/pkg/client"
@@ -251,11 +252,12 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 	}
 
 	// Ensure the stream and consumer exist, create them if necessary
-	if err := client.Messages.EnsureStream(stream); err != nil {
+	ensureCtx := context.Background()
+	if err := client.Messages.EnsureStream(ensureCtx, stream); err != nil {
 		return nil, fmt.Errorf("failed to ensure stream '%s' exists: %w", stream, err)
 	}
 
-	if err := client.Messages.EnsureConsumer(stream, consumer, runner.consumerFilterSubject); err != nil {
+	if err := client.Messages.EnsureConsumer(ensureCtx, stream, consumer, runner.consumerFilterSubject); err != nil {
 		return nil, fmt.Errorf("failed to ensure consumer '%s' exists: %w", consumer, err)
 	}
 
@@ -295,24 +297,27 @@ func (r *Runner) Close() error {
 
 // Run starts the message processing pipeline and blocks until shutdown completes.
 //
-// Startup: Run launches WorkerCount worker goroutines and one puller goroutine,
-// then enters a pull-dispatch-ack loop. Worker pool sizing is resolved from
-// Config.WorkerCount (see NewRunner for the resolution order).
+// Startup: Run launches WorkerCount worker goroutines and one consume-supervision
+// goroutine. The supervision goroutine starts a JetStream Consume() loop
+// (new nats.go/jetstream API) that delivers messages to a callback; the callback
+// wraps each message and dispatches it into the internal job queue with a
+// blocking send, which provides natural backpressure. Worker pool sizing is
+// resolved from Config.WorkerCount (see NewRunner for the resolution order).
 //
-// Shutdown — cancel the context to stop: cancelling ctx signals both the puller
-// and all workers. The puller stops pulling immediately; any messages already in
+// Shutdown — cancel the context to stop: cancelling ctx stops the Consume loop
+// and all workers. Message delivery stops immediately; any messages already in
 // jobChan are drained and processed to completion. Run returns only after every
 // in-flight Process call has returned. There is no explicit stop timeout for
 // draining workers — each Process call is bounded by processTimeout, so the
 // maximum drain time is bounded by processTimeout.
 //
-// Error handling on pull failures: transient pull errors are retried with
-// exponential backoff (100 ms → 5 s). Permanent or context-cancelled pull
-// failures cause Run to return the context error.
+// Error handling on consume failures: transient errors (heartbeat misses during
+// server blips) are retried by the JetStream library itself. Fatal ErrHandler
+// failures and unexpected Consume stops (Closed without ErrHandler, e.g.
+// consumer deleted) restart the Consume loop with exponential backoff
+// (100 ms → 5 s), reconnecting the client when the transport is down.
 //
 // Return values:
-//   - nil — the puller goroutine exited cleanly (rare; requires the pull loop to
-//     return on its own rather than via ctx.Done()).
 //   - context.Canceled / context.DeadlineExceeded — normal shutdown path when
 //     the caller cancels ctx.
 //
@@ -341,7 +346,43 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	// Start message puller goroutine
+	// Consume callback: wrap the JetStream message and dispatch it into the
+	// worker pool. The blocking send into jobChan provides backpressure — the
+	// JetStream library stops requesting more messages while the callback blocks.
+	handleMsg := func(jsMsg jetstream.Msg) {
+		msg, err := message.FromJetStreamMsg(jsMsg)
+		if err != nil {
+			deliverCount := ""
+			if md, mdErr := jsMsg.Metadata(); mdErr == nil && md != nil {
+				deliverCount = strconv.FormatUint(md.NumDelivered, 10)
+			}
+			r.logger.Warn("Dropping malformed consumed message; NAK for redelivery",
+				zap.String("stream", r.stream),
+				zap.String("consumer", r.consumer),
+				zap.String("subject", jsMsg.Subject()),
+				zap.String("jetstream_deliver_count", deliverCount),
+				zap.Error(err))
+			_ = jsMsg.Nak()
+			return
+		}
+		if msg.Metadata == nil {
+			msg.Metadata = make(map[string]string)
+		}
+		if _, ok := msg.Metadata[message.MetaIcarusEnqueueUnixMs]; !ok {
+			msg.WithMetadata(message.MetaIcarusEnqueueUnixMs, fmt.Sprintf("%d", time.Now().UnixMilli()))
+		}
+		r.logger.Info("Runner dispatching consumed message to job queue",
+			zap.String("stream", r.stream),
+			zap.String("consumer", r.consumer),
+			zap.Int("job_queue_depth", len(r.jobChan)),
+			zap.Int("job_queue_cap", cap(r.jobChan)),
+			zap.Int("worker_count", r.config.WorkerCount),
+			zap.Int("batch_size_config", r.batchSize))
+		dispatchMessage(msg)
+	}
+
+	// Start consume supervision goroutine. It keeps a JetStream Consume() loop
+	// alive, restarting it (with reconnect when needed) after fatal failures.
 	backgroundWG.Add(1)
 	go func() {
 		defer backgroundWG.Done()
@@ -349,74 +390,144 @@ func (r *Runner) Run(ctx context.Context) error {
 		backoffDelay := 100 * time.Millisecond
 		maxBackoff := 5 * time.Second
 
+		// waitBackoff sleeps for the current backoff delay (doubling it up to
+		// maxBackoff) unless the context is cancelled first.
+		waitBackoff := func() bool {
+			select {
+			case <-time.After(backoffDelay):
+				if backoffDelay < maxBackoff {
+					backoffDelay *= 2
+				}
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
 				r.logger.Info("Shutting down message processor...")
 				return
 			default:
-				// Pull messages from the stream
-				messages, err := r.client.Messages.PullMessages(ctx, r.stream, r.consumer, r.batchSize)
-				if err != nil {
-					// Check if this is due to context cancellation (graceful shutdown)
-					if ctx.Err() != nil {
-						r.logger.Debug("Message pulling stopped due to context cancellation")
-						return // Context cancelled
-					}
-					// This is an actual error, not graceful shutdown
-					r.logger.Error("Error pulling messages", zap.Error(err))
-					if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
-						if r.tryReconnectNATS() {
-							backoffDelay = 100 * time.Millisecond
-						}
-					}
-					// Exponential backoff for errors
-					time.Sleep(backoffDelay)
-					if backoffDelay < maxBackoff {
-						backoffDelay *= 2
-					}
-					continue
+			}
+
+			cons, err := r.client.Messages.GetConsumer(ctx, r.stream, r.consumer)
+			if err != nil {
+				if ctx.Err() != nil {
+					r.logger.Debug("Message consuming stopped due to context cancellation")
+					return
 				}
-
-				if len(messages) == 0 {
-					// No messages available, use shorter backoff to avoid busy waiting
-					// but don't reset backoff completely as this is normal behavior
-					select {
-					case <-time.After(500 * time.Millisecond):
-					case <-ctx.Done():
-						return
+				r.logger.Error("Error resolving JetStream consumer", zap.Error(err))
+				if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
+					if r.tryReconnectNATS() {
+						backoffDelay = 100 * time.Millisecond
 					}
-					continue
 				}
+				if !waitBackoff() {
+					return
+				}
+				continue
+			}
 
-				// Reset backoff on successful pull
-				backoffDelay = 100 * time.Millisecond
-
-				// Dispatch messages via worker pool
-				batchLen := len(messages)
-				for i, msg := range messages {
+			// Buffered channel so the error handler never blocks. Keep the latest
+			// error (replace stale) so a later fatal is not dropped after a
+			// transient heartbeat miss. Some terminal conditions stop Consume
+			// without invoking ErrHandler — those are covered by Closed() below.
+			consumeErrCh := make(chan error, 1)
+			consumeCtx, err := cons.Consume(handleMsg,
+				jetstream.PullMaxMessages(r.batchSize),
+				jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, cerr error) {
 					select {
-					case <-ctx.Done():
-						return // Context cancelled, stop sending messages
+					case consumeErrCh <- cerr:
 					default:
-						if msg.Metadata == nil {
-							msg.Metadata = make(map[string]string)
+						select {
+						case <-consumeErrCh:
+						default:
 						}
-						if _, ok := msg.Metadata[message.MetaIcarusEnqueueUnixMs]; !ok {
-							msg.WithMetadata(message.MetaIcarusEnqueueUnixMs, fmt.Sprintf("%d", time.Now().UnixMilli()))
+						select {
+						case consumeErrCh <- cerr:
+						default:
 						}
-						r.logger.Info("Runner dispatching pulled message to job queue",
+					}
+				}),
+			)
+			if err != nil {
+				r.logger.Error("Error starting JetStream consume", zap.Error(err))
+				if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
+					if r.tryReconnectNATS() {
+						backoffDelay = 100 * time.Millisecond
+					}
+				}
+				if !waitBackoff() {
+					return
+				}
+				continue
+			}
+
+			r.logger.Info("JetStream consume started",
+				zap.String("stream", r.stream),
+				zap.String("consumer", r.consumer),
+				zap.Int("batch_size", r.batchSize))
+			backoffDelay = 100 * time.Millisecond
+
+			// Block until shutdown, a fatal consume error, or Consume stopping on
+			// its own (Closed). Watching Closed matches the old pull-loop habit of
+			// always continuing after a failed fetch — nats.go can Stop() on
+			// e.g. consumer deleted without calling ConsumeErrHandler.
+			restart := false
+			for !restart {
+				select {
+				case <-ctx.Done():
+					consumeCtx.Stop()
+					// Wait for the consume goroutine (including any in-flight
+					// callback) to finish so nothing sends on jobChan after Run
+					// closes it. A callback blocked in dispatchMessage unblocks
+					// via ctx.Done().
+					<-consumeCtx.Closed()
+					r.logger.Info("Shutting down message processor...")
+					return
+				case cerr := <-consumeErrCh:
+					// Only true Consume fatals tear down the loop. Do not treat
+					// !IsConnected as fatal here: during nats auto-reconnect the
+					// library may emit ErrNoHeartbeat while Consume is still alive
+					// and will re-issue pulls on CONNECTED. Stopping would fight that.
+					if isFatalConsumeError(cerr) {
+						r.logger.Error("JetStream consume failure; restarting consume loop",
 							zap.String("stream", r.stream),
 							zap.String("consumer", r.consumer),
-							zap.Int("batch_index", i),
-							zap.Int("batch_len", batchLen),
-							zap.Int("job_queue_depth", len(r.jobChan)),
-							zap.Int("job_queue_cap", cap(r.jobChan)),
-							zap.Int("worker_count", r.config.WorkerCount),
-							zap.Int("batch_size_config", r.batchSize))
-						dispatchMessage(msg)
+							zap.Error(cerr))
+						consumeCtx.Stop()
+						<-consumeCtx.Closed()
+						if icarusnats.IsTransportError(cerr) || !r.client.IsConnected() {
+							r.tryReconnectNATS()
+						}
+						restart = true
+					} else {
+						// Transient (e.g. missed heartbeats during a server blip);
+						// the JetStream library keeps retrying pulls on its own.
+						r.logger.Warn("JetStream consume transient error",
+							zap.String("stream", r.stream),
+							zap.String("consumer", r.consumer),
+							zap.Error(cerr))
 					}
+				case <-consumeCtx.Closed():
+					if ctx.Err() != nil {
+						r.logger.Info("Shutting down message processor...")
+						return
+					}
+					r.logger.Error("JetStream consume stopped; restarting consume loop",
+						zap.String("stream", r.stream),
+						zap.String("consumer", r.consumer))
+					if !r.client.IsConnected() {
+						r.tryReconnectNATS()
+					}
+					restart = true
 				}
+			}
+
+			if !waitBackoff() {
+				return
 			}
 		}
 	}()
@@ -659,7 +770,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 			reportCtx, reportCancel := context.WithTimeout(backgroundWithSpan(span), 10*time.Minute)
 			defer reportCancel()
 
-			if reportErr := r.client.Messages.ReportError(reportCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetNATSMsg()); reportErr != nil {
+			if reportErr := r.client.Messages.ReportError(reportCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetJetStreamMsg()); reportErr != nil {
 				// Critical: If we can't report the error, log it extensively but don't fail silently
 				r.logger.Error("CRITICAL: Failed to report error to JetStream - workflow may hang",
 					zap.String("workflowID", workflowID),
@@ -675,7 +786,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 				// Try one more time with a fresh context after a brief delay
 				time.Sleep(2 * time.Second)
 				retryCtx, retryCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
-				if retryErr := r.client.Messages.ReportError(retryCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetNATSMsg()); retryErr != nil {
+				if retryErr := r.client.Messages.ReportError(retryCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetJetStreamMsg()); retryErr != nil {
 					r.logger.Error("CRITICAL: Retry also failed to report error to JetStream",
 						zap.String("workflowID", workflowID),
 						zap.String("runID", runID),
@@ -765,7 +876,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	if workflowID != "" && runID != "" {
 		reportCtx, reportCancel := context.WithTimeout(backgroundWithSpan(span), 10*time.Minute)
 		defer reportCancel()
-		if reportErr := r.client.Messages.ReportSuccess(reportCtx, resultMessage, msg.GetNATSMsg()); reportErr != nil {
+		if reportErr := r.client.Messages.ReportSuccess(reportCtx, resultMessage, msg.GetJetStreamMsg()); reportErr != nil {
 			r.logger.Error("Error reporting success, will report as error to workflow",
 				zap.String("workflowID", workflowID),
 				zap.String("runID", runID),
@@ -786,7 +897,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 			errorCtx, errorCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
 			defer errorCancel()
 
-			if errorReportErr := r.client.Messages.ReportError(errorCtx, executionID, workflowID, runID, correlationID, reportErr, msg.GetNATSMsg()); errorReportErr != nil {
+			if errorReportErr := r.client.Messages.ReportError(errorCtx, executionID, workflowID, runID, correlationID, reportErr, msg.GetJetStreamMsg()); errorReportErr != nil {
 				// Critical: If we can't report the error, log it extensively
 				r.logger.Error("CRITICAL: Failed to report error to workflow after success report failed - workflow may hang",
 					zap.String("workflowID", workflowID),
@@ -802,7 +913,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 				// Try one more time with a fresh context
 				time.Sleep(2 * time.Second)
 				retryCtx, retryCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
-				if retryErr := r.client.Messages.ReportError(retryCtx, executionID, workflowID, runID, correlationID, reportErr, msg.GetNATSMsg()); retryErr != nil {
+				if retryErr := r.client.Messages.ReportError(retryCtx, executionID, workflowID, runID, correlationID, reportErr, msg.GetJetStreamMsg()); retryErr != nil {
 					r.logger.Error("CRITICAL: Retry also failed to report error to JetStream",
 						zap.String("workflowID", workflowID),
 						zap.String("executionID", executionID),
@@ -831,6 +942,18 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	}
 
 	return nil
+}
+
+// isFatalConsumeError reports whether an error surfaced by the JetStream
+// ConsumeErrHandler requires tearing down and restarting the Consume loop
+// (as opposed to transient errors the library retries internally).
+func isFatalConsumeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, jetstream.ErrConsumerDeleted) ||
+		errors.Is(err, jetstream.ErrConsumerNotFound) ||
+		errors.Is(err, jetstream.ErrConnectionClosed)
 }
 
 // tryReconnectNATS attempts to restore a dead NATS connection. Returns true on success.

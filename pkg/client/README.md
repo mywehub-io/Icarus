@@ -38,7 +38,8 @@ Full control over reconnection, timeouts, `MaxDeliver`, and `PublishMaxRetries`.
 func (c *Client) Connect(ctx context.Context) error
 ```
 
-Establishes TCP, creates the JetStream context, and initialises `c.Messages`. Idempotent —
+Establishes TCP, creates the JetStream context via `jetstream.New(conn)` (new
+`nats.go/jetstream` API), and initialises `c.Messages`. Idempotent —
 returns nil if already connected. Clears a stale closed connection before reconnecting.
 Fails with `JETSTREAM_NOT_ENABLED` if the NATS server does not have JetStream enabled.
 
@@ -48,14 +49,14 @@ Fails with `JETSTREAM_NOT_ENABLED` if the NATS server does not have JetStream en
 func (c *Client) EnsureConnected(ctx context.Context) error
 ```
 
-Restores a dead connection (mutex-safe). `pkg/runner` invokes this after transport
-errors during pull or result publish. Default `ConnectionConfig` uses unlimited
+Restores a dead connection (mutex-safe). `pkg/runner` invokes this after fatal
+consume errors and transport errors during result publish. Default `ConnectionConfig` uses unlimited
 `MaxReconnects` (`-1`) so brief NATS outages are handled by nats.go; `EnsureConnected`
 covers permanent connection closure.
 
 ## `Client.Messages`
 
-`*message.MessageService` — access pull consumers, publish results, and manage streams.
+`*message.MessageService` — resolve consumers, publish results, and manage streams.
 Only available after `Connect` succeeds.
 
 ## Blob storage
@@ -72,9 +73,8 @@ are uploaded to Azure Blob Storage instead of sent inline over NATS. (`pkg/clien
 | Method | Description |
 |---|---|
 | `IsConnected()` | Returns true when the NATS TCP connection is live |
-| `Ping(ctx)` | Flushes and returns an error if the server is unreachable |
-| `Stats()` | Returns `ConnectionStats` (messages sent/received, reconnect count) |
-| `JetStream()` | Returns the raw `nats.JetStreamContext` for advanced operations |
+| `JetStream()` | Returns the `jetstream.JetStream` context for advanced operations |
+| `Connection()` | Returns the underlying `*nats.Conn` (e.g. for legacy integrations) |
 | `Close()` | Drains in-flight messages and closes the TCP connection |
 
 ## Testing without a real NATS server

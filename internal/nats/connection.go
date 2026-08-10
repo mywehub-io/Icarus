@@ -173,26 +173,3 @@ func Close(conn *nats.Conn) error {
 func IsConnected(conn *nats.Conn) bool {
 	return conn != nil && conn.IsConnected()
 }
-
-// WaitForConnection waits for the connection to be established or context to expire
-func WaitForConnection(ctx context.Context, conn *nats.Conn, checkInterval time.Duration) error {
-	if conn == nil {
-		return fmt.Errorf("connection is nil")
-	}
-
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	for {
-		if conn.IsConnected() {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("connection wait cancelled: %w", ctx.Err())
-		case <-ticker.C:
-			// Continue waiting
-		}
-	}
-}

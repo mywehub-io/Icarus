@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/wehubfusion/Icarus/pkg/client"
+	sdkerrors "github.com/wehubfusion/Icarus/pkg/errors"
 	"github.com/wehubfusion/Icarus/pkg/message"
 	"go.uber.org/zap"
 )
@@ -56,24 +57,52 @@ func TestMessageServiceReportSuccess(t *testing.T) {
 	resultMessage := message.NewWorkflowMessage("workflow-123", "run-456").
 		WithPayload("success result")
 
-	// Create a mock NATS message for acknowledgment
-	natsMsg := &nats.Msg{
-		Subject: "test.subject",
-		Reply:   "test.reply",
-		Data:    []byte("test data"),
-	}
+	// Create a mock JetStream message for acknowledgment
+	jsMsg := newMockMsg("test.subject", []byte("test data"))
 
-	// Test ReportSuccess (will fail without Temporal metadata, which is expected)
-	err := c.Messages.ReportSuccess(ctx, *resultMessage, natsMsg)
-	// Expect error: missing Temporal callback metadata
+	// Test ReportSuccess (will fail without execution metadata, which is expected)
+	err := c.Messages.ReportSuccess(ctx, *resultMessage, jsMsg)
+	// Expect error: missing execution metadata
 	if err == nil {
-		t.Error("Expected error when Temporal callback metadata is missing")
+		t.Error("Expected error when execution metadata is missing")
 	}
 
-	// Test ReportSuccess without NATS message (will also fail without Temporal metadata)
+	// Test ReportSuccess without JetStream message (will also fail without execution metadata)
 	err = c.Messages.ReportSuccess(ctx, *resultMessage, nil)
 	if err == nil {
-		t.Error("Expected error when Temporal callback metadata is missing")
+		t.Error("Expected error when execution metadata is missing")
+	}
+}
+
+func TestMessageServiceReportSuccessAcksAfterPublish(t *testing.T) {
+	mockJS := NewMockJS()
+	c := client.NewClientWithJSContext(mockJS)
+	ctx := context.Background()
+
+	// Build a fully-populated result message (Payload carries execution context;
+	// inline result data must be valid JSON)
+	resultMessage := message.NewWorkflowMessage("workflow-123", "run-456").
+		WithMetadata("execution_id", "workflow-123-node-1-1700000000000").
+		WithNode("node-1", nil).
+		WithPayload(`{"status":"success"}`)
+
+	jsMsg := newMockMsg("test.subject", []byte("test data"))
+
+	if err := c.Messages.ReportSuccess(ctx, *resultMessage, jsMsg); err != nil {
+		t.Fatalf("ReportSuccess failed: %v", err)
+	}
+
+	// The result must be published to the flat result subject...
+	subjects := mockJS.publishedSubjects()
+	if len(subjects) != 1 || subjects[0] != "result" {
+		t.Fatalf("published subjects = %v, want [result]", subjects)
+	}
+	// ...and the source message ACKed only after the publish succeeded
+	if !jsMsg.wasAcked() {
+		t.Error("Expected source message to be ACKed after successful result publish")
+	}
+	if jsMsg.wasNakked() {
+		t.Error("Source message must not be NAKed on success")
 	}
 }
 
@@ -85,25 +114,47 @@ func TestMessageServiceReportError(t *testing.T) {
 	runID := "run-456"
 	errorMsg := fmt.Errorf("processing failed")
 
-	// Create a mock NATS message for acknowledgment
+	// Create a mock JetStream message for acknowledgment
 	executionID := "exec-" + uuid.New().String()
 
-	natsMsg := &nats.Msg{
-		Subject: "test.subject",
-		Reply:   "test.reply",
-		Data:    []byte("test data"),
-	}
+	jsMsg := newMockMsg("test.subject", []byte("test data"))
 
 	// Test ReportError (should succeed with JetStream)
-	err := c.Messages.ReportError(ctx, executionID, workflowID, runID, "", errorMsg, natsMsg)
+	err := c.Messages.ReportError(ctx, executionID, workflowID, runID, "", errorMsg, jsMsg)
 	if err != nil {
 		t.Errorf("ReportError failed: %v", err)
 	}
 
-	// Test ReportError without NATS message (should also succeed)
+	// Plain errors are transient (internal) → source message must be NAKed for redelivery
+	if !jsMsg.wasNakked() {
+		t.Error("Expected transient error to NAK the source message")
+	}
+
+	// Test ReportError without JetStream message (should also succeed)
 	err = c.Messages.ReportError(ctx, executionID, workflowID, runID, "", errorMsg, nil)
 	if err != nil {
 		t.Errorf("ReportError failed: %v", err)
+	}
+}
+
+func TestMessageServiceReportErrorPermanentAcks(t *testing.T) {
+	c := client.NewClientWithJSContext(NewMockJS())
+	ctx := context.Background()
+
+	jsMsg := newMockMsg("test.subject", []byte("test data"))
+
+	permanentErr := sdkerrors.NewBadRequestError("bad input", "BAD_INPUT", nil)
+	err := c.Messages.ReportError(ctx, "exec-1", "workflow-123", "run-456", "", permanentErr, jsMsg)
+	if err != nil {
+		t.Fatalf("ReportError failed: %v", err)
+	}
+
+	// Permanent (non-internal) errors must ACK to suppress redelivery
+	if !jsMsg.wasAcked() {
+		t.Error("Expected permanent error to ACK the source message")
+	}
+	if jsMsg.wasNakked() {
+		t.Error("Permanent error must not NAK the source message")
 	}
 }
 
@@ -118,8 +169,7 @@ func TestMessageServiceReportSuccessValidation(t *testing.T) {
 		t.Error("Expected validation error for message without workflow")
 	}
 
-	// Test with message missing Temporal callback metadata (new requirement)
-	// Framework auto-populates timestamps but Temporal metadata is required
+	// Test with message missing execution metadata
 	invalidMessage2 := &message.Message{
 		Workflow: &message.Workflow{WorkflowID: "test", RunID: "test"},
 		Payload: func() *message.Payload {
@@ -129,12 +179,12 @@ func TestMessageServiceReportSuccessValidation(t *testing.T) {
 		UpdatedAt: time.Now().Format(time.RFC3339),
 	}
 	err = c.Messages.ReportSuccess(ctx, *invalidMessage2, nil)
-	// Expect error: missing Temporal callback metadata
+	// Expect error: missing execution metadata
 	if err == nil {
-		t.Error("Expected error when Temporal callback metadata is missing")
+		t.Error("Expected error when execution metadata is missing")
 	}
 
-	// Test with message missing UpdatedAt and Temporal metadata
+	// Test with message missing UpdatedAt and execution metadata
 	invalidMessage3 := &message.Message{
 		Workflow: &message.Workflow{WorkflowID: "test", RunID: "test"},
 		Payload: func() *message.Payload {
@@ -144,9 +194,9 @@ func TestMessageServiceReportSuccessValidation(t *testing.T) {
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
 	err = c.Messages.ReportSuccess(ctx, *invalidMessage3, nil)
-	// Expect error: missing Temporal callback metadata
+	// Expect error: missing execution metadata
 	if err == nil {
-		t.Error("Expected error when Temporal callback metadata is missing")
+		t.Error("Expected error when execution metadata is missing")
 	}
 
 	// Test with message missing payload
@@ -165,42 +215,45 @@ func TestMessageServiceReportErrorValidation(t *testing.T) {
 	c := client.NewClientWithJSContext(NewMockJS())
 	ctx := context.Background()
 
-	// Test ReportError validation
-	// These tests verify that errors are properly handled when client is missing
-
 	executionID := "exec-" + uuid.New().String()
 
-	// Test with empty workflow ID (will fail due to missing Temporal client)
+	// Test with empty workflow ID
 	err := c.Messages.ReportError(ctx, executionID, "", "run-123", "", fmt.Errorf("error message"), nil)
 	if err == nil {
-		t.Error("Expected error when Temporal client not initialized")
+		t.Error("Expected error for empty workflow ID")
 	}
 
-	// Test with empty run ID (will fail due to missing Temporal client)
+	// Test with empty run ID
 	err = c.Messages.ReportError(ctx, executionID, "workflow-123", "", "", fmt.Errorf("error message"), nil)
 	if err == nil {
-		t.Error("Expected error when Temporal client not initialized")
+		t.Error("Expected error for empty run ID")
+	}
+
+	// Test with empty execution ID
+	err = c.Messages.ReportError(ctx, "", "workflow-123", "run-123", "", fmt.Errorf("error message"), nil)
+	if err == nil {
+		t.Error("Expected error for empty execution ID")
 	}
 }
 
-// mockJSContextWithErrors extends mockJSContext to simulate publish errors
+// mockJSContextWithErrors extends MockJS to simulate publish errors on all subjects
 type mockJSContextWithErrors struct {
-	*mockJSContext
+	*MockJS
 	publishError error
 }
 
-func (m *mockJSContextWithErrors) Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
+func (m *mockJSContextWithErrors) Publish(ctx context.Context, subject string, payload []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
 	if m.publishError != nil {
 		return nil, m.publishError
 	}
-	return m.mockJSContext.Publish(subj, data, opts...)
+	return m.MockJS.Publish(ctx, subject, payload, opts...)
 }
 
 func TestMessageServiceReportWithPublishError(t *testing.T) {
 	// Create mock with publish error
 	mockJS := &mockJSContextWithErrors{
-		mockJSContext: &mockJSContext{},
-		publishError:  errors.New("publish failed"),
+		MockJS:       NewMockJS(),
+		publishError: errors.New("publish failed"),
 	}
 
 	c := client.NewClientWithJSContext(mockJS)
@@ -208,6 +261,8 @@ func TestMessageServiceReportWithPublishError(t *testing.T) {
 
 	// Test ReportSuccess with publish error
 	resultMessage := message.NewWorkflowMessage("workflow-123", "run-456").
+		WithMetadata("execution_id", "workflow-123-node-1-1700000000000").
+		WithNode("node-1", nil).
 		WithPayload("success result")
 
 	err := c.Messages.ReportSuccess(ctx, *resultMessage, nil)
@@ -224,57 +279,6 @@ func TestMessageServiceReportWithPublishError(t *testing.T) {
 	}
 }
 
-func TestMessageServicePullMessagesValidation(t *testing.T) {
-	c := client.NewClientWithJSContext(NewMockJS())
-	ctx := context.Background()
-
-	// Test with empty stream name
-	_, err := c.Messages.PullMessages(ctx, "", "consumer", 10)
-	if err == nil {
-		t.Error("Expected error for empty stream name")
-	}
-
-	// Test with empty consumer name
-	_, err = c.Messages.PullMessages(ctx, "stream", "", 10)
-	if err == nil {
-		t.Error("Expected error for empty consumer name")
-	}
-
-	// Test with zero batch size (should default to 10)
-	if err := c.Messages.EnsureStream("stream"); err != nil {
-		t.Fatalf("Failed to ensure stream: %v", err)
-	}
-	if err := c.Messages.EnsureConsumer("stream", "consumer", ""); err != nil {
-		t.Fatalf("Failed to ensure consumer: %v", err)
-	}
-	messages, err := c.Messages.PullMessages(ctx, "stream", "consumer", 0)
-	if err != nil {
-		t.Errorf("PullMessages with zero batch size failed: %v", err)
-	}
-	// Should not error, batch size should be defaulted
-	_ = messages
-}
-
-func TestMessageServicePublishValidation(t *testing.T) {
-	c := client.NewClientWithJSContext(NewMockJS())
-	ctx := context.Background()
-
-	msg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload("test data")
-
-	// Test with empty subject
-	err := c.Messages.Publish(ctx, "", msg)
-	if err == nil {
-		t.Error("Expected error for empty subject")
-	}
-
-	// Test with nil message
-	err = c.Messages.Publish(ctx, "test.subject", nil)
-	if err == nil {
-		t.Error("Expected error for nil message")
-	}
-}
-
 func TestMessageServiceContextCancellation(t *testing.T) {
 	c := client.NewClientWithJSContext(NewMockJS())
 
@@ -282,26 +286,11 @@ func TestMessageServiceContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	msg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload("test data")
-
-	// Test Publish with cancelled context
-	err := c.Messages.Publish(ctx, "test.subject", msg)
-	if err == nil {
-		t.Error("Expected error for cancelled context in Publish")
-	}
-
-	// Test PullMessages with cancelled context
-	_, err = c.Messages.PullMessages(ctx, "stream", "consumer", 10)
-	if err == nil {
-		t.Error("Expected error for cancelled context in PullMessages")
-	}
-
 	// Test ReportSuccess with cancelled context
 	resultMessage := message.NewWorkflowMessage("workflow-123", "run-456").
 		WithPayload("success result")
 
-	err = c.Messages.ReportSuccess(ctx, *resultMessage, nil)
+	err := c.Messages.ReportSuccess(ctx, *resultMessage, nil)
 	if err == nil {
 		t.Error("Expected error for cancelled context in ReportSuccess")
 	}
@@ -313,41 +302,28 @@ func TestMessageServiceContextCancellation(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error for cancelled context in ReportError")
 	}
-}
 
-func TestMessageServiceTimeout(t *testing.T) {
-	c := client.NewClientWithJSContext(NewMockJS())
-
-	// Create a context with very short timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-
-	// Wait for timeout
-	time.Sleep(1 * time.Millisecond)
-
-	msg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload("test data")
-
-	// Test operations with timed out context
-	err := c.Messages.Publish(ctx, "test.subject", msg)
+	// Test PublishResult with cancelled context
+	result := message.NewResultMessage("exec-1", "wf", "run", "node", "success")
+	err = c.Messages.PublishResult(ctx, result)
 	if err == nil {
-		t.Error("Expected timeout error in Publish")
+		t.Error("Expected error for cancelled context in PublishResult")
 	}
 }
 
 // capturingJSContext records publish subjects so tests can assert PublishResult
-// wire format (flat for Zeus local result_subject, 3-token when subject ends with .>).
+// wire format (flat, tenant-free result subject).
 type capturingJSContext struct {
-	mockJSContext
+	*MockJS
 	subjects []string
 	mu       sync.Mutex
 }
 
-func (c *capturingJSContext) Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
+func (c *capturingJSContext) Publish(ctx context.Context, subject string, payload []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
 	c.mu.Lock()
-	c.subjects = append(c.subjects, subj)
+	c.subjects = append(c.subjects, subject)
 	c.mu.Unlock()
-	return c.mockJSContext.Publish(subj, data, opts...)
+	return c.MockJS.Publish(ctx, subject, payload, opts...)
 }
 
 // TestPublishResultUsesFlatSubject verifies that PublishResult publishes to the
@@ -364,7 +340,7 @@ func TestPublishResultUsesFlatSubject(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			js := &capturingJSContext{}
+			js := &capturingJSContext{MockJS: NewMockJS()}
 			svc, err := message.NewMessageService(js, 5, 3, "RESULTS", tt.resultSubject)
 			if err != nil {
 				t.Fatalf("NewMessageService failed: %v", err)

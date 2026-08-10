@@ -3,13 +3,11 @@ package tests
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	nats "github.com/nats-io/nats.go"
 	"github.com/wehubfusion/Icarus/pkg/client"
 	sdkerrors "github.com/wehubfusion/Icarus/pkg/errors"
 	"github.com/wehubfusion/Icarus/pkg/message"
@@ -39,7 +37,7 @@ func (m *mockProcessor) Process(ctx context.Context, msg *message.Message) (mess
 	}
 	// Return a default result message
 	resultMessage := message.NewMessage().
-		WithPayload( `{"status":"processed"}`)
+		WithPayload(`{"status":"processed"}`)
 
 	// Copy workflow information if it exists
 	if msg.Workflow != nil {
@@ -58,146 +56,8 @@ func (m *mockProcessor) getCallCount() int {
 	return m.callCount
 }
 
-// mockJSContext implements message.JSContext for testing
-type mockJSContext struct {
-	messages         []*nats.Msg
-	pullError        error
-	pullErrorBudget  int
-	pullAttempts     int
-	reportError      error
-	mu               sync.Mutex
-}
-
-func (m *mockJSContext) Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
-	// For result publishes (now always result.<env>.<exec>), return the configured error.
-	if m.reportError != nil && (subj == "result" || strings.HasPrefix(subj, "result.")) {
-		return nil, m.reportError
-	}
-	return &nats.PubAck{Stream: "MOCK", Sequence: 1}, nil
-}
-
-func (m *mockJSContext) Subscribe(subj string, cb nats.MsgHandler, opts ...nats.SubOpt) (message.JSSubscription, error) {
-	return &mockJSSubscription{}, nil
-}
-
-func (m *mockJSContext) PullSubscribe(subj, durable string, opts ...nats.SubOpt) (message.JSSubscription, error) {
-	return &mockPullJSSubscription{owner: m, durable: durable}, nil
-}
-
-func (m *mockJSContext) StreamInfo(stream string) (*nats.StreamInfo, error) {
-	// Always return success for mock
-	return &nats.StreamInfo{
-		Config: nats.StreamConfig{Name: stream},
-		State:  nats.StreamState{},
-	}, nil
-}
-
-func (m *mockJSContext) AddStream(cfg *nats.StreamConfig) (*nats.StreamInfo, error) {
-	// Always return success for mock
-	return &nats.StreamInfo{
-		Config: *cfg,
-		State:  nats.StreamState{},
-	}, nil
-}
-
-func (m *mockJSContext) ConsumerInfo(stream, consumer string) (*nats.ConsumerInfo, error) {
-	// Always return success for mock
-	return &nats.ConsumerInfo{
-		Stream: stream,
-		Name:   consumer,
-		Config: nats.ConsumerConfig{Durable: consumer},
-	}, nil
-}
-
-func (m *mockJSContext) AddConsumer(stream string, cfg *nats.ConsumerConfig) (*nats.ConsumerInfo, error) {
-	// Always return success for mock
-	return &nats.ConsumerInfo{
-		Stream: stream,
-		Name:   cfg.Durable,
-		Config: *cfg,
-	}, nil
-}
-
-func (m *mockJSContext) addMessage(msg *message.Message) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	data, _ := msg.ToBytes()
-	natsMsg := &nats.Msg{
-		Subject: "test.subject",
-		Data:    data,
-		Reply:   "reply.subject",
-	}
-	m.messages = append(m.messages, natsMsg)
-}
-
-func (m *mockJSContext) setPullError(err error) {
-	m.pullError = err
-	m.pullErrorBudget = 0
-}
-
-func (m *mockJSContext) setPullErrorBudget(err error, budget int) {
-	m.pullError = err
-	m.pullErrorBudget = budget
-}
-
-func (m *mockJSContext) setReportError(err error) {
-	m.reportError = err
-}
-
-// mockJSSubscription implements message.JSSubscription
-type mockJSSubscription struct{}
-
-func (m *mockJSSubscription) Unsubscribe() error         { return nil }
-func (m *mockJSSubscription) Drain() error               { return nil }
-func (m *mockJSSubscription) IsValid() bool              { return true }
-func (m *mockJSSubscription) Pending() (int, int, error) { return 0, 0, nil }
-func (m *mockJSSubscription) Fetch(batch int, opts ...nats.PullOpt) ([]*nats.Msg, error) {
-	return []*nats.Msg{}, nil
-}
-
-// mockPullJSSubscription implements pull-based subscription
-type mockPullJSSubscription struct {
-	owner   *mockJSContext
-	durable string
-}
-
-func (m *mockPullJSSubscription) Unsubscribe() error         { return nil }
-func (m *mockPullJSSubscription) Drain() error               { return nil }
-func (m *mockPullJSSubscription) IsValid() bool              { return true }
-func (m *mockPullJSSubscription) Pending() (int, int, error) { return 0, 0, nil }
-
-func (m *mockPullJSSubscription) Fetch(batch int, opts ...nats.PullOpt) ([]*nats.Msg, error) {
-	if m.owner.pullError != nil {
-		m.owner.pullAttempts++
-		if m.owner.pullErrorBudget == 0 || m.owner.pullAttempts <= m.owner.pullErrorBudget {
-			return nil, m.owner.pullError
-		}
-	}
-
-	m.owner.mu.Lock()
-	defer m.owner.mu.Unlock()
-
-	if len(m.owner.messages) == 0 {
-		return []*nats.Msg{}, nil
-	}
-
-	// Return up to batch messages
-	size := batch
-	if size > len(m.owner.messages) {
-		size = len(m.owner.messages)
-	}
-
-	result := make([]*nats.Msg, size)
-	copy(result, m.owner.messages[:size])
-
-	// Remove returned messages
-	m.owner.messages = m.owner.messages[size:]
-
-	return result, nil
-}
-
 func newMockClient() *mockClientWrapper {
-	mockJS := &mockJSContext{}
+	mockJS := NewMockJS()
 	c := client.NewClientWithJSContext(mockJS)
 	return &mockClientWrapper{
 		Client: c,
@@ -208,19 +68,27 @@ func newMockClient() *mockClientWrapper {
 // mockClientWrapper wraps the client to provide access to mock methods
 type mockClientWrapper struct {
 	*client.Client
-	mockJS *mockJSContext
+	mockJS *MockJS
 }
 
 func (m *mockClientWrapper) addMessage(msg *message.Message) {
 	m.mockJS.addMessage(msg)
 }
 
-func (m *mockClientWrapper) setPullError(err error) {
-	m.mockJS.setPullError(err)
+func (m *mockClientWrapper) setConsumerError(err error) {
+	m.mockJS.setConsumerError(err)
 }
 
-func (m *mockClientWrapper) setPullErrorBudget(err error, budget int) {
-	m.mockJS.setPullErrorBudget(err, budget)
+func (m *mockClientWrapper) setConsumerErrorBudget(err error, budget int) {
+	m.mockJS.setConsumerErrorBudget(err, budget)
+}
+
+func (m *mockClientWrapper) stopActiveConsumes() int {
+	return m.mockJS.stopActiveConsumes()
+}
+
+func (m *mockClientWrapper) consumeStartCount() int {
+	return m.mockJS.consumeStartCount()
 }
 
 func (m *mockClientWrapper) setReportError(err error) {
@@ -293,13 +161,13 @@ func TestRunnerRunWithSuccessfulProcessor(t *testing.T) {
 
 	// Add test messages
 	testMsg := message.NewMessage().
-		WithPayload( "test data")
+		WithPayload("test data")
 	mockClient.addMessage(testMsg)
 
 	mockProc := &mockProcessor{
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
 			// Simulate successful processing
-			resultMessage := message.NewMessage().WithPayload( `{"status":"success"}`)
+			resultMessage := message.NewMessage().WithPayload(`{"status":"success"}`)
 			if msg.Workflow != nil {
 				resultMessage.Workflow = msg.Workflow
 				resultMessage.WithMetadata("temporal_workflow_id", msg.Workflow.WorkflowID)
@@ -340,7 +208,7 @@ func TestRunnerRunWithFailingProcessor(t *testing.T) {
 
 	// Add test messages
 	testMsg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload( "test data")
+		WithPayload("test data")
 	mockClient.addMessage(testMsg)
 
 	mockProc := &mockProcessor{
@@ -381,7 +249,7 @@ func TestRunnerRunWithMultipleMessages(t *testing.T) {
 	// Add multiple test messages
 	for i := 0; i < 3; i++ {
 		testMsg := message.NewMessage().
-			WithPayload( "test data")
+			WithPayload("test data")
 		mockClient.addMessage(testMsg)
 	}
 
@@ -389,7 +257,7 @@ func TestRunnerRunWithMultipleMessages(t *testing.T) {
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
 			// Simulate successful processing with small delay
 			time.Sleep(10 * time.Millisecond)
-			resultMessage := message.NewMessage().WithPayload( `{"status":"success"}`)
+			resultMessage := message.NewMessage().WithPayload(`{"status":"success"}`)
 			if msg.Workflow != nil {
 				resultMessage.Workflow = msg.Workflow
 				resultMessage.WithMetadata("temporal_workflow_id", msg.Workflow.WorkflowID)
@@ -425,18 +293,20 @@ func TestRunnerRunWithMultipleMessages(t *testing.T) {
 	}
 }
 
-func TestRunner_recoversFromPullFailure(t *testing.T) {
+func TestRunner_recoversFromConsumerFailure(t *testing.T) {
 	mockClient := newMockClient()
-	mockClient.setPullErrorBudget(errors.New("consumer info: nats: connection closed"), 3)
-
-	testMsg := message.NewMessage().WithPayload("test data")
-	mockClient.addMessage(testMsg)
-
+	// NewRunner's EnsureStream/EnsureConsumer must succeed, so inject the error
+	// budget after the runner is constructed.
 	mockProc := &mockProcessor{}
 	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewRunner failed: %v", err)
 	}
+
+	mockClient.setConsumerErrorBudget(errors.New("consumer info: nats: connection closed"), 3)
+
+	testMsg := message.NewMessage().WithPayload("test data")
+	mockClient.addMessage(testMsg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -445,15 +315,69 @@ func TestRunner_recoversFromPullFailure(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	if mockProc.getCallCount() < 1 {
-		t.Fatalf("expected processor to run after transient pull errors, got %d calls", mockProc.getCallCount())
+		t.Fatalf("expected processor to run after transient consumer resolution errors, got %d calls", mockProc.getCallCount())
 	}
 }
 
-func TestRunnerRunWithPullError(t *testing.T) {
+// TestRunner_restartsConsumeOnClosedWithoutErrHandler verifies that when Consume
+// stops and Closed() fires without an ErrHandler callback (as nats.go does for
+// e.g. consumer deleted), the supervision loop starts a new Consume and keeps
+// processing — matching the old pull-loop continuous-retry behaviour.
+func TestRunner_restartsConsumeOnClosedWithoutErrHandler(t *testing.T) {
 	mockClient := newMockClient()
+	mockProc := &mockProcessor{}
+	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
 
-	// Set up pull error
-	mockClient.setPullError(errors.New("pull failed"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	mockClient.addMessage(message.NewMessage().WithPayload("before-stop"))
+	deadline := time.Now().Add(3 * time.Second)
+	for mockProc.getCallCount() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for first message before Consume stop")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	startsBefore := mockClient.consumeStartCount()
+	if startsBefore < 1 {
+		t.Fatalf("expected at least one Consume start, got %d", startsBefore)
+	}
+
+	if n := mockClient.stopActiveConsumes(); n < 1 {
+		t.Fatalf("expected to stop at least one active Consume, stopped %d", n)
+	}
+
+	mockClient.addMessage(message.NewMessage().WithPayload("after-restart"))
+	deadline = time.Now().Add(5 * time.Second)
+	for mockProc.getCallCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for message after Closed()-triggered restart; calls=%d consumeStarts=%d",
+				mockProc.getCallCount(), mockClient.consumeStartCount())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if mockClient.consumeStartCount() <= startsBefore {
+		t.Fatalf("expected a new Consume after Closed(), starts before=%d after=%d",
+			startsBefore, mockClient.consumeStartCount())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runner did not exit after cancel")
+	}
+}
+
+func TestRunnerRunWithConsumerError(t *testing.T) {
+	mockClient := newMockClient()
 
 	mockProc := &mockProcessor{}
 
@@ -462,11 +386,15 @@ func TestRunnerRunWithPullError(t *testing.T) {
 		t.Fatalf("NewRunner failed: %v", err)
 	}
 
+	// Set up a persistent consumer resolution error after runner creation
+	mockClient.setConsumerError(errors.New("consumer resolution failed"))
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// The Run method should not return an error even if PullMessages fails,
-	// it just logs the error and continues, but with timeout it returns context deadline exceeded
+	// The Run method should not return an error even if the consumer cannot be
+	// resolved; it just logs the error and retries, but with timeout it returns
+	// context deadline exceeded
 	runErr := r.Run(ctx)
 	// With timeout context, we expect context deadline exceeded
 	if runErr == nil {
@@ -481,7 +409,7 @@ func TestRunnerRunWithReportError(t *testing.T) {
 
 	// Add test messages
 	testMsg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload( "test data")
+		WithPayload("test data")
 	mockClient.addMessage(testMsg)
 
 	// Set up report error
@@ -527,7 +455,7 @@ func TestRunnerRunContextCancellation(t *testing.T) {
 	// Add multiple messages to ensure processing takes some time
 	for i := 0; i < 10; i++ {
 		testMsg := message.NewMessage().
-			WithPayload( "test data")
+			WithPayload("test data")
 		mockClient.addMessage(testMsg)
 	}
 
@@ -535,7 +463,7 @@ func TestRunnerRunContextCancellation(t *testing.T) {
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
 			// Simulate slow processing
 			time.Sleep(50 * time.Millisecond)
-			resultMessage := message.NewMessage().WithPayload( `{"status":"success"}`)
+			resultMessage := message.NewMessage().WithPayload(`{"status":"success"}`)
 			if msg.Workflow != nil {
 				resultMessage.Workflow = msg.Workflow
 				resultMessage.WithMetadata("temporal_workflow_id", msg.Workflow.WorkflowID)
@@ -575,7 +503,7 @@ func TestRunnerRunContextCancellation(t *testing.T) {
 func TestRunnerRunEmptyMessages(t *testing.T) {
 	mockClient := newMockClient()
 
-	// No messages added, so PullMessages returns empty slice
+	// No messages added, so the consumer delivers nothing
 
 	mockProc := &mockProcessor{}
 
@@ -598,6 +526,29 @@ func TestRunnerRunEmptyMessages(t *testing.T) {
 	// Processor should not be called since there are no messages
 	if mockProc.getCallCount() != 0 {
 		t.Errorf("Expected processor to not be called, got %d calls", mockProc.getCallCount())
+	}
+}
+
+func TestRunnerMalformedMessageIsNakked(t *testing.T) {
+	mockClient := newMockClient()
+	malformed := mockClient.mockJS.addRawMessage("test.subject", []byte("not json"))
+
+	mockProc := &mockProcessor{}
+
+	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	if mockProc.getCallCount() != 0 {
+		t.Errorf("Expected processor not to be called for malformed message, got %d", mockProc.getCallCount())
+	}
+	if !malformed.wasNakked() {
+		t.Error("Expected malformed message to be NAKked for redelivery")
 	}
 }
 

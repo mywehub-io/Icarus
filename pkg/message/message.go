@@ -7,9 +7,10 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Metadata keys for JetStream pull diagnostics (set by MessageService.PullMessages).
+// Metadata keys for JetStream delivery diagnostics (set when a Message is built from a JetStream message).
 // Used by runners and services (e.g. Elysium) for grep-friendly correlation with redelivery / AckWait.
 const (
 	MetaJetStreamDeliverCount = "jetstream_deliver_count"
@@ -155,8 +156,8 @@ type Message struct {
 	// UpdatedAt is the timestamp when the message was last updated
 	UpdatedAt string `json:"updatedAt"`
 
-	// natsMsg holds the original NATS message for acknowledgment (not serialized)
-	natsMsg *nats.Msg `json:"-"`
+	// jsMsg holds the original JetStream message for acknowledgment (not serialized)
+	jsMsg jetstream.Msg `json:"-"`
 }
 
 // NewMessage creates a new message with timestamps
@@ -289,122 +290,67 @@ func FromBytes(data []byte) (*Message, error) {
 	return &msg, nil
 }
 
-// FromNATSMsg converts a NATS message to an SDK Message
+// FromNATSMsg converts a NATS message to an SDK Message.
+// Retained for consumers (e.g. Zeus) that receive messages over the core
+// nats.go subscription APIs. The returned Message carries no JetStream
+// acknowledgment handle; Ack/Nak/Term are no-ops.
 func FromNATSMsg(natsMsg *nats.Msg) (*Message, error) {
 	return FromBytes(natsMsg.Data)
 }
 
-// NATSMsg represents a JetStream message with additional metadata and acknowledgment methods.
-// This wrapper provides access to JetStream-specific operations like Ack/Nak.
-// Handlers MUST call Ack() or Nak() to indicate successful or failed processing.
-type NATSMsg struct {
-	// Message is the SDK message
-	*Message
-
-	// Subject is the JetStream subject the message was received on
-	Subject string
-
-	// Reply is the reply subject (if applicable)
-	Reply string
-
-	// natsMsg is the underlying NATS message for JetStream operations
-	natsMsg *nats.Msg
-}
-
-// Ack acknowledges the message to JetStream, indicating successful processing.
-// The message will not be redelivered after acknowledgment.
-// Handlers should call this after successfully processing a message.
-func (m *NATSMsg) Ack() error {
-	if m.natsMsg == nil || m.natsMsg.Reply == "" {
-		return nil
-	}
-	return m.natsMsg.Ack()
-}
-
-// Nak negatively acknowledges the message to JetStream, indicating processing failure.
-// The message will be redelivered according to the consumer's configuration.
-// Handlers should call this when processing fails and the message should be retried.
-func (m *NATSMsg) Nak() error {
-	if m.natsMsg == nil || m.natsMsg.Reply == "" {
-		return nil
-	}
-	return m.natsMsg.Nak()
-}
-
-// InProgress indicates to JetStream that the message is still being processed.
-// This extends the acknowledgment deadline to prevent redelivery.
-// Use this for long-running message processing to avoid timeout-based redelivery.
-func (m *NATSMsg) InProgress() error {
-	if m.natsMsg == nil || m.natsMsg.Reply == "" {
-		return nil
-	}
-	return m.natsMsg.InProgress()
-}
-
-// Term terminates delivery of the message to JetStream, removing it from the stream.
-// Use this when a message cannot be processed and should not be retried.
-func (m *NATSMsg) Term() error {
-	if m.natsMsg == nil || m.natsMsg.Reply == "" {
-		return nil
-	}
-	return m.natsMsg.Term()
-}
-
-// Respond sends a response message back to the reply subject.
-// This is used in request-reply patterns where the sender expects a response.
-func (m *NATSMsg) Respond(response *Message) error {
-	if m.natsMsg == nil || m.Reply == "" {
-		return nil
-	}
-
-	data, err := response.ToBytes()
+// FromJetStreamMsg converts a JetStream message (new nats.go/jetstream API) to an
+// SDK Message, attaching the acknowledgment handle and delivery metadata
+// (jetstream_deliver_count, sequences, num_pending) to msg.Metadata.
+func FromJetStreamMsg(jsMsg jetstream.Msg) (*Message, error) {
+	msg, err := FromBytes(jsMsg.Data())
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	return m.natsMsg.Respond(data)
+	msg.jsMsg = jsMsg
+	AttachJetStreamMetadata(msg, jsMsg)
+	return msg, nil
 }
 
 // Ack acknowledges the message, indicating successful processing.
 // This tells NATS that the message has been processed and should not be redelivered.
 func (m *Message) Ack() error {
-	if m.natsMsg == nil {
-		return nil // No NATS message to acknowledge
+	if m.jsMsg == nil {
+		return nil // No JetStream message to acknowledge
 	}
-	return m.natsMsg.Ack()
+	return m.jsMsg.Ack()
 }
 
 // Nak negatively acknowledges the message, indicating processing failure.
 // This tells NATS that the message processing failed and it may be redelivered.
 func (m *Message) Nak() error {
-	if m.natsMsg == nil {
-		return nil // No NATS message to nak
+	if m.jsMsg == nil {
+		return nil // No JetStream message to nak
 	}
-	return m.natsMsg.Nak()
+	return m.jsMsg.Nak()
 }
 
 // Term terminates the message, indicating it should not be redelivered.
 // Use this when a message cannot be processed and should not be retried.
 func (m *Message) Term() error {
-	if m.natsMsg == nil {
-		return nil // No NATS message to terminate
+	if m.jsMsg == nil {
+		return nil // No JetStream message to terminate
 	}
-	return m.natsMsg.Term()
+	return m.jsMsg.Term()
 }
 
-// GetNATSMsg returns the underlying NATS message for acknowledgment purposes.
-// Returns nil if this message was not created from a NATS message.
-func (m *Message) GetNATSMsg() *nats.Msg {
-	return m.natsMsg
+// GetJetStreamMsg returns the underlying JetStream message for acknowledgment purposes.
+// Returns nil if this message was not created from a JetStream message.
+func (m *Message) GetJetStreamMsg() jetstream.Msg {
+	return m.jsMsg
 }
 
 // AttachJetStreamMetadata copies JetStream MsgMetadata into msg.Metadata for logging and correlation.
 // Non-JetStream messages are a no-op.
-func AttachJetStreamMetadata(m *Message, natsMsg *nats.Msg) {
-	if m == nil || natsMsg == nil {
+func AttachJetStreamMetadata(m *Message, jsMsg jetstream.Msg) {
+	if m == nil || jsMsg == nil {
 		return
 	}
-	meta, err := natsMsg.Metadata()
+	meta, err := jsMsg.Metadata()
 	if err != nil || meta == nil {
 		return
 	}

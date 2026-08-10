@@ -103,58 +103,24 @@ func TestAppErrorConstructors(t *testing.T) {
 	}
 }
 
-func TestPublishErrors(t *testing.T) {
+func TestPublishResultErrors(t *testing.T) {
 	c := client.NewClientWithJSContext(NewMockJS())
 	ctx := context.Background()
 
-	// Test publishing with invalid subject
-	msg := message.NewWorkflowMessage("workflow-test", uuid.New().String()).
-		WithPayload( "test content")
-	err := c.Messages.Publish(ctx, "", msg) // Empty subject
+	// Test publishing a nil result message
+	err := c.Messages.PublishResult(ctx, nil)
 	if err == nil {
-		t.Error("Expected error for empty subject")
+		t.Error("Expected error for nil result message")
 	}
 	var appErr *sdkerrors.AppError
-	if !errors.As(err, &appErr) || appErr.Type != sdkerrors.ValidationFailed || appErr.Code != "INVALID_SUBJECT" {
-		t.Errorf("Expected ValidationFailed error with code INVALID_SUBJECT, got: %v", err)
-	}
-
-	// Test publishing with nil message
-	err = c.Messages.Publish(ctx, "test.subject", nil)
-	if err == nil {
-		t.Error("Expected error for nil message")
-	}
 	if !errors.As(err, &appErr) || appErr.Type != sdkerrors.ValidationFailed || appErr.Code != "INVALID_MESSAGE" {
 		t.Errorf("Expected ValidationFailed error with code INVALID_MESSAGE, got: %v", err)
 	}
 
-	// In the mock, there is no stream enforcement; publish should succeed
-	err = c.Messages.Publish(ctx, "nonexistent.stream.subject", msg)
-	if err != nil {
-		t.Errorf("Publish should succeed in mock without streams, got: %v", err)
-	}
-}
-
-func TestPullMessagesErrors(t *testing.T) {
-	c := client.NewClientWithJSContext(NewMockJS())
-	ctx := context.Background()
-
-	// Test pull with empty stream name
-	_, err := c.Messages.PullMessages(ctx, "", "consumer", 1)
-	if err == nil {
-		t.Error("Expected error for empty stream name")
-	}
-
-	// Test pull with empty consumer name
-	_, err = c.Messages.PullMessages(ctx, "stream", "", 1)
-	if err == nil {
-		t.Error("Expected error for empty consumer name")
-	}
-
-	// Pull requires an existing durable consumer
-	_, err = c.Messages.PullMessages(ctx, "NONEXISTENT", "nonexistent", 1)
-	if err == nil {
-		t.Error("Expected error when consumer does not exist")
+	// Valid result publishes fine against the mock
+	result := message.NewResultMessage("exec-"+uuid.New().String(), "wf", "run", "node", "success")
+	if err := c.Messages.PublishResult(ctx, result); err != nil {
+		t.Errorf("PublishResult should succeed in mock, got: %v", err)
 	}
 }
 

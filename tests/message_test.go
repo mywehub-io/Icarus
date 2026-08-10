@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/wehubfusion/Icarus/pkg/client"
 	"github.com/wehubfusion/Icarus/pkg/message"
@@ -99,60 +98,48 @@ func TestClientConnection(t *testing.T) {
 	}
 }
 
-func TestMessagePublishing(t *testing.T) {
+func TestEnsureStreamAndConsumer(t *testing.T) {
 	c := client.NewClientWithJSContext(NewMockJS())
 	ctx := context.Background()
 
-	// Test publishing a message
-	msg := message.NewWorkflowMessage("workflow-test", uuid.New().String()).
-		WithPayload( "test message")
+	if err := c.Messages.EnsureStream(ctx, "TEST_EVENTS"); err != nil {
+		t.Fatalf("Failed to ensure stream: %v", err)
+	}
+	// Second call must be a no-op against the existing stream
+	if err := c.Messages.EnsureStream(ctx, "TEST_EVENTS"); err != nil {
+		t.Fatalf("EnsureStream on existing stream failed: %v", err)
+	}
 
-	err := c.Messages.Publish(ctx, "test.events.user.created", msg)
+	if err := c.Messages.EnsureConsumer(ctx, "TEST_EVENTS", "test_consumer", ""); err != nil {
+		t.Fatalf("Failed to ensure consumer: %v", err)
+	}
+	// Second call must be a no-op against the existing durable
+	if err := c.Messages.EnsureConsumer(ctx, "TEST_EVENTS", "test_consumer", ""); err != nil {
+		t.Fatalf("EnsureConsumer on existing durable failed: %v", err)
+	}
+
+	// The consumer must be resolvable for Consume
+	cons, err := c.Messages.GetConsumer(ctx, "TEST_EVENTS", "test_consumer")
 	if err != nil {
-		t.Fatalf("Failed to publish message: %v", err)
+		t.Fatalf("GetConsumer failed: %v", err)
+	}
+	if cons == nil {
+		t.Fatal("GetConsumer returned nil consumer")
 	}
 }
 
-func TestPullMessages(t *testing.T) {
+func TestGetConsumerValidation(t *testing.T) {
 	c := client.NewClientWithJSContext(NewMockJS())
 	ctx := context.Background()
 
-	// Publish a message first
-	msg := message.NewWorkflowMessage("workflow-pull", uuid.New().String()).
-		WithPayload( "pull test message")
-
-	err := c.Messages.Publish(ctx, "test.events.user.created", msg)
-	if err != nil {
-		t.Fatalf("Failed to publish message: %v", err)
+	if _, err := c.Messages.GetConsumer(ctx, "", "consumer"); err == nil {
+		t.Error("Expected error for empty stream name")
 	}
-
-	// Wait for message to be stored
-	time.Sleep(10 * time.Millisecond)
-
-	if err := c.Messages.EnsureStream("TEST_EVENTS"); err != nil {
-		t.Fatalf("Failed to ensure stream: %v", err)
+	if _, err := c.Messages.GetConsumer(ctx, "stream", ""); err == nil {
+		t.Error("Expected error for empty consumer name")
 	}
-	if err := c.Messages.EnsureConsumer("TEST_EVENTS", "test_pull_consumer", ""); err != nil {
-		t.Fatalf("Failed to ensure consumer: %v", err)
-	}
-
-	// Pull messages
-	messages, err := c.Messages.PullMessages(ctx, "TEST_EVENTS", "test_pull_consumer", 10)
-	if err != nil {
-		t.Fatalf("Failed to pull messages: %v", err)
-	}
-
-	if len(messages) != 1 {
-		t.Errorf("Expected 1 message, got %d", len(messages))
-	}
-
-	if len(messages) > 0 {
-		if messages[0].Workflow.WorkflowID != msg.Workflow.WorkflowID {
-			t.Errorf("Workflow ID mismatch: expected %s, got %s", msg.Workflow.WorkflowID, messages[0].Workflow.WorkflowID)
-		}
-		if messages[0].Payload.GetInlineData() != msg.Payload.GetInlineData() {
-			t.Errorf("Payload data mismatch: expected %s, got %s", msg.Payload.GetInlineData(), messages[0].Payload.GetInlineData())
-		}
+	if _, err := c.Messages.GetConsumer(ctx, "NONEXISTENT", "nonexistent"); err == nil {
+		t.Error("Expected error when consumer does not exist")
 	}
 }
 
@@ -218,10 +205,10 @@ func TestMessageAckNakTerm(t *testing.T) {
 		t.Errorf("Term should not error without NATS message, got: %v", err)
 	}
 
-	// Test GetNATSMsg
-	natsMsg := msg.GetNATSMsg()
-	if natsMsg != nil {
-		t.Error("GetNATSMsg should return nil for message without NATS message")
+	// Test GetJetStreamMsg
+	jsMsg := msg.GetJetStreamMsg()
+	if jsMsg != nil {
+		t.Error("GetJetStreamMsg should return nil for message without JetStream message")
 	}
 }
 
@@ -260,60 +247,53 @@ func TestFromNATSMsg(t *testing.T) {
 	}
 }
 
-func TestNATSMsgWrapper(t *testing.T) {
+func TestFromJetStreamMsg(t *testing.T) {
 	// Create a test message
-	msg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload( "test data")
+	originalMsg := message.NewWorkflowMessage("workflow-123", "run-456").
+		WithPayload("test data")
 
-	// Note: We don't need to create a real NATS message for this test
-	// The NATSMsg wrapper is what we're testing
-
-	// Create NATSMsg wrapper
-	wrappedMsg := &message.NATSMsg{
-		Message: msg,
-		Subject: "test.subject",
-		Reply:   "test.reply",
-	}
-
-	// Test that wrapper preserves message data
-	if wrappedMsg.Workflow.WorkflowID != msg.Workflow.WorkflowID {
-		t.Error("NATSMsg wrapper should preserve workflow ID")
-	}
-
-	if wrappedMsg.Subject != "test.subject" {
-		t.Error("NATSMsg wrapper should preserve subject")
-	}
-
-	if wrappedMsg.Reply != "test.reply" {
-		t.Error("NATSMsg wrapper should preserve reply")
-	}
-
-	// Test acknowledgment methods (should not error without real NATS message)
-	err := wrappedMsg.Ack()
+	data, err := originalMsg.ToBytes()
 	if err != nil {
-		t.Errorf("Ack should not error without real NATS message, got: %v", err)
+		t.Fatalf("Failed to serialize message: %v", err)
 	}
 
-	err = wrappedMsg.Nak()
+	jsMsg := newMockMsg("test.subject", data)
+
+	convertedMsg, err := message.FromJetStreamMsg(jsMsg)
 	if err != nil {
-		t.Errorf("Nak should not error without real NATS message, got: %v", err)
+		t.Fatalf("FromJetStreamMsg failed: %v", err)
 	}
 
-	err = wrappedMsg.InProgress()
-	if err != nil {
-		t.Errorf("InProgress should not error without real NATS message, got: %v", err)
+	// Verify the converted message
+	if convertedMsg.Workflow.WorkflowID != originalMsg.Workflow.WorkflowID {
+		t.Errorf("WorkflowID mismatch: expected %s, got %s",
+			originalMsg.Workflow.WorkflowID, convertedMsg.Workflow.WorkflowID)
 	}
 
-	err = wrappedMsg.Term()
-	if err != nil {
-		t.Errorf("Term should not error without real NATS message, got: %v", err)
+	// The acknowledgment handle must be attached
+	if convertedMsg.GetJetStreamMsg() == nil {
+		t.Fatal("Expected JetStream message handle to be attached")
 	}
 
-	// Test Respond method
-	response := message.NewMessage().WithPayload( "test response")
-	err = wrappedMsg.Respond(response)
-	if err != nil {
-		t.Errorf("Respond should not error without real NATS message, got: %v", err)
+	// JetStream delivery metadata must be copied into msg.Metadata
+	if convertedMsg.Metadata[message.MetaJetStreamDeliverCount] != "1" {
+		t.Errorf("Expected jetstream_deliver_count=1, got %q", convertedMsg.Metadata[message.MetaJetStreamDeliverCount])
+	}
+	if convertedMsg.Metadata[message.MetaJetStreamStreamSeq] != "1" {
+		t.Errorf("Expected jetstream_stream_seq=1, got %q", convertedMsg.Metadata[message.MetaJetStreamStreamSeq])
+	}
+
+	// Ack/Nak/Term must map to the underlying JetStream message
+	if err := convertedMsg.Ack(); err != nil {
+		t.Errorf("Ack failed: %v", err)
+	}
+	if !jsMsg.wasAcked() {
+		t.Error("Expected Ack to propagate to the JetStream message")
+	}
+
+	// Malformed payload must fail
+	if _, err := message.FromJetStreamMsg(newMockMsg("test.subject", []byte("not json"))); err == nil {
+		t.Error("Expected error for malformed payload")
 	}
 }
 

@@ -59,7 +59,8 @@ Describes how data flows from a source node to a destination node.
 
 ## Metadata constants
 
-JetStream pull diagnostics populated by `MessageService.PullMessages`:
+JetStream diagnostics populated by `message.FromJetStreamMsg` (called by the runner's
+consume callback):
 
 | Constant | Value | Description |
 |---|---|---|
@@ -69,18 +70,23 @@ JetStream pull diagnostics populated by `MessageService.PullMessages`:
 | `MetaJetStreamNumPending` | `"jetstream_num_pending"` | Messages waiting behind this one |
 | `MetaIcarusEnqueueUnixMs` | `"icarus_enqueue_unix_ms"` | Unix ms when message entered the runner job queue |
 
-`MetaIcarusEnqueueUnixMs` is set by the runner, not by `PullMessages`. Use it to calculate
-queue wait time: `time.Now().UnixMilli() - enqueueMs`.
+`MetaIcarusEnqueueUnixMs` is set by the runner when the message enters the job queue.
+Use it to calculate queue wait time: `time.Now().UnixMilli() - enqueueMs`.
 
 ## `MessageService`
 
-Accessed via `client.Messages`. Key methods:
+Accessed via `client.Messages`. Key methods (all built on the new `nats.go/jetstream` API):
 
 | Method | Description |
 |---|---|
-| `PullMessages(ctx, stream, consumer, batchSize)` | Pull up to `batchSize` messages from a JetStream pull consumer |
-| `ReportSuccess(ctx, result, originalMsg)` | Ack + publish result to the configured result subject |
-| `ReportError(ctx, executionID, workflowID, runID, correlationID, err, originalMsg)` | Ack + publish error result |
-| `EnsureStream(stream)` | Create stream if it does not exist |
-| `EnsureConsumer(stream, consumer, filterSubject)` | Create pull consumer; optional `FilterSubject` for tenant/default routing |
+| `GetConsumer(ctx, stream, consumer)` | Resolve a `jetstream.Consumer` handle for `Consume` |
+| `ReportSuccess(ctx, result, originalMsg)` | Publish result to the configured result subject, then ack (`originalMsg` is a `jetstream.Msg`) |
+| `ReportError(ctx, executionID, workflowID, runID, correlationID, err, originalMsg)` | Publish error result; nak on transient errors, ack on permanent |
+| `PublishResult(ctx, result)` | Publish a result message with retry/backoff |
+| `EnsureStream(ctx, stream)` | Create stream if it does not exist (never updates existing) |
+| `EnsureConsumer(ctx, stream, consumer, filterSubject)` | Create pull consumer if missing; optional `FilterSubject` for tenant/default routing |
 | `SetBlobStorage(client)` | Inject blob client for large result uploads |
+
+Message conversion helpers: `FromJetStreamMsg(jsMsg)` builds a `Message` from a consumed
+`jetstream.Msg` (attaches ack handle + JetStream metadata); `FromNATSMsg` /
+`ResultMessageFromNATSMsg` remain for plain `*nats.Msg` consumers (used by Zeus).

@@ -13,19 +13,59 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
-### Changed
-
-- `internal:` Argus dependency updated to `v0.3.6` (`EnvironmentID` on event structures and emitters).
+## [0.21.0] — 2026-08-10
 
 ### Fixed
 
-- `public:` **Embedded subflow skip logic**: `shouldSkipNode` (non-iteration path) now
-  skips a downstream node when every one of its default-section sources is absent from
-  the output store, matching the per-item behaviour of `shouldSkipNodeForItem`
-  (`f8bf0ae`). Previously, a node whose sole upstream had itself been skipped would
-  run with an empty input map and surface as `status: success` rather than being
-  absent. Affects chains such as `SimpleCondition` → event-gated producer → FIELD-only
-  downstream node. (`pkg/embedded/runtime/subflow.go`)
+- `public:` Runner Consume supervision now restarts when `ConsumeContext.Closed`
+  fires without an ErrHandler callback (e.g. consumer deleted), matching the old
+  pull loop's continuous retry behaviour. Latest consume errors are retained so a
+  fatal error is not dropped after a transient heartbeat miss.
+- `public:` Consume ErrHandler no longer treats `!IsConnected` as fatal — during
+  nats auto-reconnect, heartbeat misses are left to the library; only
+  `isFatalConsumeError` (e.g. connection closed, consumer deleted) tears down Consume.
+- `internal:` `Client.Connect` no longer nils `Messages` mid-reconnect; the new
+  service is swapped in only after it is ready so concurrent `Report*` / `GetConsumer`
+  calls cannot hit a nil pointer (stale service may still return transport errors).
+
+### Changed (breaking)
+
+- `public:` **Migration to the new `nats.go/jetstream` API**: `pkg/client`,
+  `pkg/message`, and `pkg/runner` now use the modern `nats.go/jetstream` package
+  instead of the legacy `nats.JetStreamContext` pull API.
+  - `Client.JetStream()` returns `jetstream.JetStream` (was `nats.JetStreamContext`);
+    derive a legacy context from `Client.Connection().JetStream()` if still needed.
+  - `Message` wraps `jetstream.Msg`; `GetNATSMsg()` → `GetJetStreamMsg()`; new
+    `FromJetStreamMsg` constructor.
+  - `ReportSuccess` / `ReportError` accept `jetstream.Msg` instead of `*nats.Msg`.
+  - `EnsureStream` / `EnsureConsumer` take `context.Context`; still create-only
+    (existing streams/durables are never modified).
+  - New `MessageService.GetConsumer(ctx, stream, consumer)` returning
+    `jetstream.Consumer`.
+  - Runner replaces the per-batch `PullSubscribe`/`Fetch` loop with a supervised
+    `consumer.Consume(cb, jetstream.PullMaxMessages(batchSize))` loop; worker pool,
+    backpressure, ack/nak classification, metadata keys, and shutdown-drain
+    semantics are unchanged. Reconnects during consumption are healed natively by
+    the `jetstream` library.
+  - `NewClientWithJSContext` takes the new `message.JSContext` test-seam interface.
+  - Stream/consumer configurations, result subject composition, and the
+    `Message`/`ResultMessage` JSON contracts are byte-identical to v0.20.x.
+  See [docs/upgrade-guide.md](docs/upgrade-guide.md) for the migration guide.
+
+### Removed (breaking)
+
+- `public:` `MessageService.Publish` and `MessageService.PullMessages` — publishing
+  uses `Client.JetStream().Publish`; consumption uses `GetConsumer` + `Consume` or
+  `pkg/runner`.
+- `public:` `NATSMsg` wrapper and the `pkg/message` middleware framework
+  (`Handler`, `HandlerFunc`, `MiddlewareFunc`, chain helpers).
+- `public:` `Client.Ping`, `Client.Stats`, and `ConnectionStats`.
+- `internal:` `internal/nats.WaitForConnection`.
+
+### Kept for compatibility
+
+- `public:` `FromNATSMsg` and `ResultMessageFromNATSMsg` remain for plain `*nats.Msg`
+  consumers (used by Zeus).
 
 ## [0.10.0] — 2026-05-07
 
