@@ -4,6 +4,7 @@ package tracing
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -13,6 +14,19 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 	"go.uber.org/zap"
+)
+
+// setupOnce guards against building more than one TracerProvider/exporter per process. Runner
+// (pkg/runner) calls SetupTracing once per registered plugin-type runner — without this guard,
+// each call built a brand-new OTLP exporter and clobbered the global TracerProvider
+// (otel.SetTracerProvider), leaking every prior exporter's connection/goroutines and making
+// which runner's Resource attributes end up describing the shared trace stream an accident of
+// registration order. Only the first call's config takes effect; later calls return the same
+// shutdown function.
+var (
+	setupOnce     sync.Once
+	setupShutdown func(context.Context) error
+	setupErr      error
 )
 
 // TracingConfig holds configuration for tracing setup
@@ -46,12 +60,25 @@ func JaegerConfig(serviceName string) TracingConfig {
 	}
 }
 
-// SetupTracing initializes OpenTelemetry tracing with OTLP exporter
-// Returns a shutdown function that should be called when the application exits
+// SetupTracing initializes OpenTelemetry tracing with OTLP exporter.
+// Returns a shutdown function that should be called when the application exits.
+// Idempotent per process: only the first call actually builds an exporter/provider; later calls
+// (e.g. one per registered runner) return the same shutdown function without side effects.
 func SetupTracing(ctx context.Context, config TracingConfig, logger *zap.Logger) (func(context.Context) error, error) {
+	setupOnce.Do(func() {
+		setupShutdown, setupErr = setupTracingOnce(ctx, config, logger)
+	})
+	return setupShutdown, setupErr
+}
+
+func setupTracingOnce(ctx context.Context, config TracingConfig, logger *zap.Logger) (func(context.Context) error, error) {
 	if logger == nil {
 		logger, _ = zap.NewProduction()
 	}
+
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		logger.Warn("OpenTelemetry error", zap.Error(err))
+	}))
 
 	logger.Info("Setting up tracing",
 		zap.String("service_name", config.ServiceName),
@@ -81,18 +108,23 @@ func SetupTracing(ctx context.Context, config TracingConfig, logger *zap.Logger)
 		return nil, fmt.Errorf("failed to create resource: %w", err)
 	}
 
-	// Create trace provider
+	// Create trace provider. ParentBased wraps the ratio sampler: a bare TraceIDRatioBased
+	// re-decides on every hop, so a trace another service already sampled would lose this
+	// process's spans; ParentBased keeps the ratio as a root-span-only decision.
 	tp := trace.NewTracerProvider(
 		trace.WithBatcher(exporter),
 		trace.WithResource(res),
-		trace.WithSampler(trace.TraceIDRatioBased(config.SampleRatio)),
+		trace.WithSampler(trace.ParentBased(trace.TraceIDRatioBased(config.SampleRatio))),
 	)
 
 	// Set global trace provider
 	otel.SetTracerProvider(tp)
 
-	// Set global propagator to tracecontext (W3C Trace Context)
-	otel.SetTextMapPropagator(propagation.TraceContext{})
+	// Set global propagator (W3C TraceContext + Baggage)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
 
 	logger.Info("Tracing setup completed successfully")
 

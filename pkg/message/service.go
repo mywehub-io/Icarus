@@ -9,8 +9,22 @@ import (
 
 	"github.com/nats-io/nats.go"
 	sdkerrors "github.com/wehubfusion/Icarus/pkg/errors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"go.uber.org/zap"
 )
+
+// injectTraceParent extracts the W3C traceparent from ctx (typically carrying the
+// Runner.processMessage span) and stamps it onto resultMsg.TraceParent, so a downstream
+// result consumer (e.g. Zeus's result_consumer.go) can Extract it and continue the same trace
+// instead of starting a disconnected root span.
+func injectTraceParent(ctx context.Context, resultMsg *ResultMessage) {
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	if tp := carrier["traceparent"]; tp != "" {
+		resultMsg.TraceParent = tp
+	}
+}
 
 // JSContext defines the minimal subset of JetStream operations the service depends on.
 // This allows tests to provide a mock without requiring a running NATS server.
@@ -710,6 +724,7 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 
 	// Create result message
 	resultMsg := NewResultMessage(executionID, workflowID, runID, nodeID, "success")
+	injectTraceParent(ctx, resultMsg)
 	if correlationID != "" {
 		resultMsg.WithCorrelationID(correlationID)
 	}
@@ -909,6 +924,7 @@ func (s *MessageService) ReportError(ctx context.Context, executionID, workflowI
 
 	// Build error result message
 	resultMsg := NewResultMessage(executionID, workflowID, runID, nodeID, "failed")
+	injectTraceParent(ctx, resultMsg)
 	if correlationID != "" {
 		resultMsg.WithCorrelationID(correlationID)
 	}

@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
@@ -464,6 +465,14 @@ func (r *Runner) worker(ctx context.Context, id int) {
 	}
 }
 
+// backgroundWithSpan returns a fresh context.Background()-rooted context (so report/observer
+// calls still go through even if the parent ctx is cancelled by a runner shutdown) that carries
+// the given span's SpanContext, so a traceparent can still be Inject-ed from it. Trace linkage
+// without cancellation coupling.
+func backgroundWithSpan(span trace.Span) context.Context {
+	return trace.ContextWithSpanContext(context.Background(), span.SpanContext())
+}
+
 // processMessage handles the actual message processing logic.
 // It returns an error when message processing or result reporting fails.
 func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error {
@@ -509,6 +518,17 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		zap.String("node_id", nodeID),
 		zap.String("jetstream_deliver_count", jetstreamDeliver),
 		zap.Int64("queue_wait_ms", queueWaitMs))
+
+	// Extract the publisher's traceparent (if any) from Metadata before starting our span, so
+	// this becomes a child of the publisher's span instead of a disconnected root. Icarus's NATS
+	// publish path has no header option, so this travels inside the already-serialized Metadata
+	// map (message.MetaTraceParent) rather than a NATS message header — see that constant's doc
+	// comment. A no-op (fresh root span) if absent, e.g. an older publisher.
+	if msg.Metadata != nil {
+		if tp := msg.Metadata[message.MetaTraceParent]; tp != "" {
+			ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier{"traceparent": tp})
+		}
+	}
 
 	// Start tracing span for message processing
 	ctx, span := r.tracer.Start(ctx, "runner.processMessage",
@@ -636,7 +656,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 				executionID = msg.Payload.ExecutionID
 			}
 
-			reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			reportCtx, reportCancel := context.WithTimeout(backgroundWithSpan(span), 10*time.Minute)
 			defer reportCancel()
 
 			if reportErr := r.client.Messages.ReportError(reportCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetNATSMsg()); reportErr != nil {
@@ -654,7 +674,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 
 				// Try one more time with a fresh context after a brief delay
 				time.Sleep(2 * time.Second)
-				retryCtx, retryCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				retryCtx, retryCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
 				if retryErr := r.client.Messages.ReportError(retryCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetNATSMsg()); retryErr != nil {
 					r.logger.Error("CRITICAL: Retry also failed to report error to JetStream",
 						zap.String("workflowID", workflowID),
@@ -682,7 +702,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		}
 
 		if r.processFailureObserver != nil {
-			obsCtx, obsCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			obsCtx, obsCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
 			if obsErr := r.processFailureObserver(obsCtx, msg, processErr); obsErr != nil {
 				r.logger.Error("process failure observer failed after ReportError",
 					zap.String("workflowID", workflowID),
@@ -743,7 +763,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	// Report success if we have workflow information
 	// Use a longer timeout for large blob uploads (10 minutes to handle very large files)
 	if workflowID != "" && runID != "" {
-		reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		reportCtx, reportCancel := context.WithTimeout(backgroundWithSpan(span), 10*time.Minute)
 		defer reportCancel()
 		if reportErr := r.client.Messages.ReportSuccess(reportCtx, resultMessage, msg.GetNATSMsg()); reportErr != nil {
 			r.logger.Error("Error reporting success, will report as error to workflow",
@@ -763,7 +783,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 
 			// Report the failure as an error to Temporal so the workflow knows about it
 			// Use longer timeout (30s) to match ReportError's retry logic
-			errorCtx, errorCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			errorCtx, errorCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
 			defer errorCancel()
 
 			if errorReportErr := r.client.Messages.ReportError(errorCtx, executionID, workflowID, runID, correlationID, reportErr, msg.GetNATSMsg()); errorReportErr != nil {
@@ -781,7 +801,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 
 				// Try one more time with a fresh context
 				time.Sleep(2 * time.Second)
-				retryCtx, retryCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				retryCtx, retryCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
 				if retryErr := r.client.Messages.ReportError(retryCtx, executionID, workflowID, runID, correlationID, reportErr, msg.GetNATSMsg()); retryErr != nil {
 					r.logger.Error("CRITICAL: Retry also failed to report error to JetStream",
 						zap.String("workflowID", workflowID),
