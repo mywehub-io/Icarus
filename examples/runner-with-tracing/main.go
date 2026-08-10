@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/wehubfusion/Icarus/pkg/client"
 	"github.com/wehubfusion/Icarus/pkg/message"
 	"github.com/wehubfusion/Icarus/pkg/runner"
@@ -97,16 +97,16 @@ func (p *SimpleProcessor) Process(ctx context.Context, msg *message.Message) (me
 }
 
 // setupStreams creates the necessary streams and consumers for the example
-func setupStreams(js nats.JetStreamContext, logger *zap.Logger) error {
+func setupStreams(ctx context.Context, js jetstream.JetStream, logger *zap.Logger) error {
 	logger.Info("Setting up JetStream streams and consumers...")
 
 	// Create MESSAGES stream for incoming messages to process
 	logger.Info("Creating MESSAGES stream...")
-	_, err := js.AddStream(&nats.StreamConfig{
+	_, err := js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:        "MESSAGES",
 		Description: "Stream for messages to be processed with tracing",
 		Subjects:    []string{"messages.>"},
-		Storage:     nats.FileStorage,
+		Storage:     jetstream.FileStorage,
 		Replicas:    1,
 		MaxAge:      24 * time.Hour, // Keep messages for 24 hours
 	})
@@ -118,11 +118,11 @@ func setupStreams(js nats.JetStreamContext, logger *zap.Logger) error {
 
 	// Create RESULTS stream for callback reporting
 	logger.Info("Creating RESULTS stream...")
-	_, err = js.AddStream(&nats.StreamConfig{
+	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:        "RESULTS",
 		Description: "Results stream for success/error callback reporting",
 		Subjects:    []string{"result"},
-		Storage:     nats.FileStorage,
+		Storage:     jetstream.FileStorage,
 		Replicas:    1,
 		MaxAge:      24 * time.Hour, // Keep results for 24 hours
 	})
@@ -134,10 +134,10 @@ func setupStreams(js nats.JetStreamContext, logger *zap.Logger) error {
 
 	// Create consumer for the MESSAGES stream
 	logger.Info("Creating processor consumer...")
-	_, err = js.AddConsumer("MESSAGES", &nats.ConsumerConfig{
+	_, err = js.CreateConsumer(ctx, "MESSAGES", jetstream.ConsumerConfig{
 		Durable:       "processor-consumer",
 		Description:   "Consumer for processing messages with tracing",
-		AckPolicy:     nats.AckExplicitPolicy,
+		AckPolicy:     jetstream.AckExplicitPolicy,
 		MaxDeliver:    3,                // Retry failed messages up to 3 times
 		AckWait:       30 * time.Second, // Wait 30 seconds for acknowledgment
 		MaxAckPending: 100,              // Allow up to 100 unacknowledged messages
@@ -190,7 +190,7 @@ func main() {
 	}
 
 	// Setup streams and consumers
-	if err := setupStreams(js, logger); err != nil {
+	if err := setupStreams(ctx, js, logger); err != nil {
 		logger.Fatal("Failed to setup streams", zap.Error(err))
 	}
 
@@ -221,7 +221,7 @@ func main() {
 
 	// Start message producer in a separate goroutine
 	go func() {
-		produceMessages(ctx, icarusClient, logger)
+		produceMessages(ctx, js, logger)
 	}()
 
 	// Create a context that can be cancelled
@@ -269,7 +269,7 @@ func main() {
 }
 
 // produceMessages generates test messages for the runner to process
-func produceMessages(ctx context.Context, client *client.Client, logger *zap.Logger) {
+func produceMessages(ctx context.Context, js jetstream.JetStream, logger *zap.Logger) {
 	for i := 0; i < 10; i++ {
 		select {
 		case <-ctx.Done():
@@ -295,10 +295,14 @@ func produceMessages(ctx context.Context, client *client.Client, logger *zap.Log
 			},
 		)
 
-		// Publish to JetStream using client
+		// Publish to JetStream
 		subject := fmt.Sprintf("messages.test.%d", i)
-		err := client.Messages.Publish(ctx, subject, msg)
+		data, err := msg.ToBytes()
 		if err != nil {
+			logger.Error("Failed to marshal message", zap.Error(err))
+			continue
+		}
+		if _, err := js.Publish(ctx, subject, data); err != nil {
 			logger.Error("Failed to publish message", zap.Error(err))
 		} else {
 			logger.Info("Published message", zap.String("subject", subject), zap.Int("sequence", i))

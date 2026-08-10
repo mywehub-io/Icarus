@@ -38,13 +38,13 @@ Resolution order for worker count: `Config.WorkerCount` (if > 0) → `ICARUS_RUN
 func (c *Client) EnsureConnected(ctx context.Context) error
 ```
 
-Reconnects when the NATS TCP connection is missing or closed. Safe for concurrent use (for example multiple `pkg/runner` instances sharing one client). The Icarus runner calls this automatically after JetStream pull or publish transport errors.
+Reconnects when the NATS TCP connection is missing or closed. Safe for concurrent use (for example multiple `pkg/runner` instances sharing one client). The Icarus runner calls this automatically after fatal consume errors or publish transport errors.
 
 ## `runner.NewRunner` parameters
 
 | Parameter | Type | Description |
 |---|---|---|
-| `batchSize` | `int` | Messages pulled per JetStream fetch; must be > 0 |
+| `batchSize` | `int` | Max messages per pull request (`jetstream.PullMaxMessages`); must be > 0 |
 | `processTimeout` | `time.Duration` | Per-message deadline; must be > 0 |
 | `tracingConfig` | `*TracingConfig` | nil disables OTel tracing |
 | `cfg` | `*Config` | nil uses `DefaultConfig()` (workers = GOMAXPROCS, queue = 4×workers) |

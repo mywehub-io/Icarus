@@ -51,8 +51,6 @@ func TestClientConnectionLifecycle(t *testing.T) {
 	t.Skip("Connection lifecycle relies on real NATS; skipped with mock")
 }
 
-func TestClientPing(t *testing.T) { t.Skip("Ping requires real connection; skipped with mock") }
-
 func TestClientReconnection(t *testing.T) {
 	t.Skip("Reconnection requires real server; skipped with mock")
 }
@@ -82,16 +80,6 @@ func TestClientMultipleConnections(t *testing.T) {
 
 func TestClientServiceInitialization(t *testing.T) {
 	t.Skip("Service init tested via message tests with mock")
-}
-
-func TestClientStats(t *testing.T) {
-	c := client.NewClient("nats://localhost:4222", "RESULTS", "result")
-
-	// Test stats with no connection
-	stats := c.Stats()
-	if stats.InMsgs != 0 || stats.OutMsgs != 0 || stats.InBytes != 0 || stats.OutBytes != 0 || stats.Reconnects != 0 {
-		t.Error("Expected zero stats for unconnected client")
-	}
 }
 
 func TestClientSetLogger(t *testing.T) {

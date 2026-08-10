@@ -2,11 +2,11 @@ package client
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	natsclient "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/wehubfusion/Icarus/internal/nats"
 	sdkerrors "github.com/wehubfusion/Icarus/pkg/errors"
 	"github.com/wehubfusion/Icarus/pkg/message"
@@ -28,18 +28,17 @@ type BlobStorageClient interface {
 //
 // Example usage:
 //
-//	client := client.NewClient("nats://localhost:4222")
+//	client := client.NewClient("nats://localhost:4222", "RESULTS", "result")
 //	if err := client.Connect(ctx); err != nil {
 //	    logger.Fatal("Failed to connect", zap.Error(err))
 //	}
 //	defer client.Close()
 //
-//	// Use the Messages service (JetStream-based)
-//	msg := message.NewMessage("id-123", "Hello World")
-//	client.Messages.Publish(ctx, "events.test", msg)
+//	// Prefer pkg/runner for consume + ReportSuccess/ReportError, or use
+//	// client.JetStream().Publish / client.Messages.GetConsumer for lower-level access.
 type Client struct {
 	conn        *natsclient.Conn
-	js          natsclient.JetStreamContext
+	js          jetstream.JetStream
 	config      *nats.ConnectionConfig
 	logger      *zap.Logger
 	reconnectMu sync.Mutex
@@ -150,10 +149,13 @@ func (c *Client) Connect(ctx context.Context) error {
 		return nil // Already connected
 	}
 
+	// Drop the dead connection/JS handles, but keep c.Messages non-nil until the
+	// new MessageService is ready. Concurrent runners may still call Report*/GetConsumer
+	// during reconnect; a stale service returns transport errors (retried) instead of
+	// panicking on a nil pointer. This is a pointer swap only — no hot-path locking.
 	if c.conn != nil && !c.conn.IsConnected() {
 		c.conn = nil
 		c.js = nil
-		c.Messages = nil
 	}
 
 	if c.config != nil && c.logger != nil {
@@ -168,8 +170,8 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.conn = conn
 
-	// Initialize JetStream context - REQUIRED for this SDK
-	js, err := conn.JetStream()
+	// Initialize JetStream context (new nats.go/jetstream API) - REQUIRED for this SDK
+	js, err := jetstream.New(conn)
 	if err != nil {
 		_ = nats.Close(c.conn)
 		c.conn = nil
@@ -179,7 +181,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	// Initialize message service with JetStream (wrapped to interface for testability)
 	msgService, err := message.NewMessageService(
-		message.WrapNATSJetStream(c.js),
+		message.WrapJetStream(c.js),
 		c.config.MaxDeliver,
 		c.config.PublishMaxRetries,
 		c.config.ResultStream,
@@ -295,13 +297,13 @@ func (c *Client) Connection() *natsclient.Conn {
 	return c.conn
 }
 
-// JetStream returns the underlying JetStream context for advanced operations such as
-// creating streams, inspecting consumer state, or publishing with custom options.
+// JetStream returns the underlying JetStream context (new nats.go/jetstream API)
+// for advanced operations such as creating streams, inspecting consumer state, or
+// publishing with custom options.
 //
-// Returns nil if Connect() has not been called or if JetStream is not enabled on
-// the NATS server (the latter causes Connect() to fail anyway).
+// Returns nil if Connect() has not been called.
 //
-// Prefer the higher-level c.Messages methods for all routine publish/pull/report
+// Prefer the higher-level c.Messages methods for all routine publish/consume/report
 // operations; JetStream() is intended for administrative tasks (stream/consumer
 // management) and for test helpers that need direct JetStream access.
 //
@@ -309,45 +311,13 @@ func (c *Client) Connection() *natsclient.Conn {
 //
 //	js := client.JetStream()
 //	if js != nil {
-//	    js.AddStream(&nats.StreamConfig{
+//	    js.CreateStream(ctx, jetstream.StreamConfig{
 //	        Name:     "EVENTS",
 //	        Subjects: []string{"events.>"},
 //	    })
 //	}
-func (c *Client) JetStream() natsclient.JetStreamContext {
+func (c *Client) JetStream() jetstream.JetStream {
 	return c.js
-}
-
-// Stats returns current connection statistics including message counts and reconnection attempts.
-//
-// Example:
-//
-//	stats := client.Stats()
-//	client.logger.Info("Connection stats",
-//		zap.Uint64("messages_sent", stats.OutMsgs),
-//		zap.Uint64("messages_received", stats.InMsgs))
-func (c *Client) Stats() ConnectionStats {
-	if c.conn == nil {
-		return ConnectionStats{}
-	}
-
-	stats := c.conn.Stats()
-	return ConnectionStats{
-		InMsgs:     stats.InMsgs,
-		OutMsgs:    stats.OutMsgs,
-		InBytes:    stats.InBytes,
-		OutBytes:   stats.OutBytes,
-		Reconnects: stats.Reconnects,
-	}
-}
-
-// ConnectionStats holds connection statistics for monitoring and debugging.
-type ConnectionStats struct {
-	InMsgs     uint64 // Number of messages received
-	OutMsgs    uint64 // Number of messages sent
-	InBytes    uint64 // Number of bytes received
-	OutBytes   uint64 // Number of bytes sent
-	Reconnects uint64 // Number of reconnections performed
 }
 
 // SetBlobStorage injects the blob storage client for large results
@@ -357,40 +327,4 @@ func (c *Client) SetBlobStorage(bs BlobStorageClient) {
 		c.Messages.SetBlobStorage(bs)
 	}
 	c.logger.Info("Azure Blob storage enabled for Icarus client")
-}
-
-// Ping sends a ping to the NATS server to verify connectivity.
-// This can be used as a health check to ensure the connection is alive and responsive.
-//
-// The operation respects the context deadline and can be cancelled via context.
-//
-// Example:
-//
-//	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-//	defer cancel()
-//	if err := client.Ping(ctx); err != nil {
-//	    client.logger.Error("Connection unhealthy", zap.Error(err))
-//	}
-func (c *Client) Ping(ctx context.Context) error {
-	if err := c.EnsureConnected(ctx); err != nil {
-		return err
-	}
-
-	// Create a channel to handle ping result
-	resultCh := make(chan error, 1)
-
-	go func() {
-		err := c.conn.FlushTimeout(c.config.Timeout)
-		resultCh <- err
-	}()
-
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("ping cancelled: %w", ctx.Err())
-	case err := <-resultCh:
-		if err != nil {
-			return sdkerrors.NewInternalError("", "ping failed", "PING_FAILED", err)
-		}
-		return nil
-	}
 }

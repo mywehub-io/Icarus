@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/wehubfusion/Icarus/pkg/client"
 	"github.com/wehubfusion/Icarus/pkg/message"
 	"github.com/wehubfusion/Icarus/pkg/runner"
@@ -129,13 +129,13 @@ func main() {
 	}
 
 	// Setup streams and consumers
-	if err := setupStreams(js, logger); err != nil {
+	if err := setupStreams(ctx, js, logger); err != nil {
 		logger.Fatal("Failed to setup streams", zap.Error(err))
 	}
 
 	// Publish some test messages
 	logger.Info("Publishing test messages...")
-	if err := publishTestMessages(c, ctx); err != nil {
+	if err := publishTestMessages(ctx, js); err != nil {
 		logger.Fatal("Failed to publish test messages", zap.Error(err))
 	}
 
@@ -197,16 +197,16 @@ func main() {
 }
 
 // setupStreams creates the necessary streams and consumers for the example
-func setupStreams(js nats.JetStreamContext, logger *zap.Logger) error {
+func setupStreams(ctx context.Context, js jetstream.JetStream, logger *zap.Logger) error {
 	logger.Info("Setting up JetStream streams and consumers...")
 
 	// Create TASKS stream for incoming messages to process
 	logger.Info("Creating TASKS stream...")
-	_, err := js.AddStream(&nats.StreamConfig{
+	_, err := js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:        "TASKS",
 		Description: "Stream for task messages to be processed",
 		Subjects:    []string{"tasks.>"},
-		Storage:     nats.FileStorage,
+		Storage:     jetstream.FileStorage,
 		Replicas:    1,
 		MaxAge:      24 * time.Hour, // Keep messages for 24 hours
 	})
@@ -218,11 +218,11 @@ func setupStreams(js nats.JetStreamContext, logger *zap.Logger) error {
 
 	// Create RESULTS stream for callback reporting
 	logger.Info("Creating RESULTS stream...")
-	_, err = js.AddStream(&nats.StreamConfig{
+	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:        "RESULTS",
 		Description: "Results stream for success/error callback reporting",
 		Subjects:    []string{"result"},
-		Storage:     nats.FileStorage,
+		Storage:     jetstream.FileStorage,
 		Replicas:    1,
 		MaxAge:      24 * time.Hour, // Keep results for 24 hours
 	})
@@ -234,10 +234,10 @@ func setupStreams(js nats.JetStreamContext, logger *zap.Logger) error {
 
 	// Create consumer for the TASKS stream
 	logger.Info("Creating task processor consumer...")
-	_, err = js.AddConsumer("TASKS", &nats.ConsumerConfig{
+	_, err = js.CreateConsumer(ctx, "TASKS", jetstream.ConsumerConfig{
 		Durable:       "task-processor",
 		Description:   "Consumer for processing task messages",
-		AckPolicy:     nats.AckExplicitPolicy,
+		AckPolicy:     jetstream.AckExplicitPolicy,
 		MaxDeliver:    3,               // Retry failed messages up to 3 times
 		AckWait:       5 * time.Minute, // Wait 5 minutes for acknowledgment (increased from 30s)
 		MaxAckPending: 100,             // Allow up to 100 unacknowledged messages
@@ -253,7 +253,7 @@ func setupStreams(js nats.JetStreamContext, logger *zap.Logger) error {
 }
 
 // publishTestMessages publishes some sample messages to the TASKS stream
-func publishTestMessages(c *client.Client, ctx context.Context) error {
+func publishTestMessages(ctx context.Context, js jetstream.JetStream) error {
 	workflowID := uuid.New().String()
 
 	// Create different types of test messages
@@ -388,7 +388,11 @@ func publishTestMessages(c *client.Client, ctx context.Context) error {
 		msg.WithMetadata("batchId", fmt.Sprintf("batch-%d", (i/2)+1))
 
 		// Publish the message
-		if err := c.Messages.Publish(ctx, msgData.subject, msg); err != nil {
+		payload, err := msg.ToBytes()
+		if err != nil {
+			return fmt.Errorf("failed to marshal message %d: %w", i+1, err)
+		}
+		if _, err := js.Publish(ctx, msgData.subject, payload); err != nil {
 			return fmt.Errorf("failed to publish message %d: %w", i+1, err)
 		}
 

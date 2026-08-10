@@ -5,16 +5,17 @@ A clean, future-proof Go SDK for messaging over NATS JetStream with idiomatic pa
 ## Features
 
 - **JetStream-Only**: Exclusively uses NATS JetStream for all messaging operations with persistence and advanced features
+- **New JetStream API**: Built on the modern `nats.go/jetstream` package (`jetstream.New`, `Consume`) rather than the legacy `nats.JetStreamContext` pull API
 - **Clean Architecture**: Well-organized package structure with clear separation of concerns
 - **Idiomatic Go**: Follows Go best practices and conventions
 - **Context Support**: All operations support `context.Context` for cancellation and timeout control
 - **Structured Messages**: Rich message format with workflow, node, payload, and output information
 - **Central Client**: Single client provides access to all JetStream services with automatic initialization
 - **JetStream Messaging Patterns**:
-  - Message Publishing (JetStream-backed persistence)
-  - Pull-based consumers (batch message processing)
+  - Result publishing (JetStream-backed persistence)
+  - Continuous consumption via `consumer.Consume()` with built-in backpressure
   - Concurrent message processing with worker pools (Runner)
-- **Runner Framework**: Built-in concurrent message processing with configurable worker pools, batch processing, and automatic success/error callback reporting; optional `ProcessFailureObserver` after every successful `ReportError`
+- **Runner Framework**: Built-in concurrent message processing with configurable worker pools and automatic success/error callback reporting; optional `ProcessFailureObserver` after every successful `ReportError`
 - **Distributed Tracing**: Integrated OpenTelemetry tracing support with Jaeger and OTLP exporters for observability
 - **Callback Reporting**: Automatic success and error reporting to result streams with proper message acknowledgment
 - **Robust Error Handling**: SDK-specific errors with proper error wrapping
@@ -73,41 +74,27 @@ See:
 - `pkg/schema/hl7/README.md` for HL7-specific behavior
 - `examples/schema-engine/` for a runnable example
 
-### 2. Publish Messages
+### 2. Publish Messages (raw JetStream)
+
+The SDK's messaging surface is focused on job consumption and result reporting.
+For ad-hoc publishing (e.g. seeding job streams in tests or tools), use the
+JetStream context directly:
 
 ```go
-// Create a message
 msg := message.NewWorkflowMessage("workflow-123", "run-456").
-    WithPayload("api-server", "Hello, NATS!", "msg-123").
+    WithPayload(`{"greeting":"Hello, NATS!"}`).
     WithMetadata("priority", "high")
 
-// Publish using the client's Messages service (automatically initialized)
-if err := c.Messages.Publish(ctx, "events.user.created", msg); err != nil {
+data, _ := msg.ToBytes()
+if _, err := c.JetStream().Publish(ctx, "events.user.created", data); err != nil {
     log.Printf("Failed to publish: %v", err)
 }
 ```
 
-### 3. Pull-Based Message Consumption
+Result messages are published through `c.Messages.PublishResult` /
+`ReportSuccess` / `ReportError`, which handle retries and acknowledgment.
 
-```go
-// Pull messages from a JetStream consumer
-messages, err := c.Messages.PullMessages(ctx, "EVENTS", "my-consumer", 10)
-if err != nil {
-    log.Printf("Failed to pull messages: %v", err)
-    return
-}
-
-for _, msg := range messages {
-    var content string
-    if msg.Payload != nil {
-        content = msg.Payload.GetInlineData()
-    }
-    fmt.Printf("Processing: %s (Workflow: %s)\n", content, msg.Workflow.WorkflowID)
-    msg.Ack() // Acknowledge message processing
-}
-```
-
-### 4. Concurrent Message Processing (Runner)
+### 3. Concurrent Message Processing (Runner)
 
 ```go
 // Define a message processor that implements the Processor interface
@@ -163,11 +150,10 @@ if err := runner.Run(ctx); err != nil {
 
 The Runner provides:
 - Concurrent message processing with a bounded worker pool
-- Batch message pulling from JetStream consumers
+- Continuous consumption via `consumer.Consume()` (new JetStream API) with blocking dispatch for backpressure
 - Automatic success/error reporting to the "result" subject
 - Built-in OpenTelemetry tracing support
 - Graceful shutdown on context cancellation
-- Middleware support for cross-cutting concerns (e.g., blob resolution)
 
 ## Client Architecture
 
@@ -176,12 +162,12 @@ The `Client` struct provides a central hub for all NATS operations with automati
 ```go
 type Client struct {
     conn   *natsclient.Conn
-    js     natsclient.JetStreamContext
+    js     jetstream.JetStream // new nats.go/jetstream API
     config *nats.ConnectionConfig
     logger *zap.Logger
 
     // Messages provides access to all JetStream messaging operations including
-    // publish, pull-based consumers, and callback reporting
+    // stream/consumer management, consumption, and callback reporting
     Messages *message.MessageService
 
     // Reserved for future expansion
@@ -197,7 +183,7 @@ When `Connect()` is called, it:
 
 ### Direct Service Access
 
-Users can now access messaging operations directly through the client:
+Users can access messaging operations directly through the client:
 
 ```go
 c := client.NewClient("nats://localhost:4222")
@@ -208,18 +194,18 @@ c.SetLogger(logger)
 
 c.Connect(ctx)
 // c.Messages is ready to use immediately
-c.Messages.Publish(ctx, "subject", msg)
+c.Messages.PublishResult(ctx, resultMsg)
 ```
 
 ### JetStream Context Access
 
-Direct access to JetStream for advanced operations:
+Direct access to the new JetStream API for advanced operations:
 
 ```go
 js := c.JetStream()
 if js != nil {
     // Create streams, consumers, etc.
-    js.AddStream(&nats.StreamConfig{
+    js.CreateStream(ctx, jetstream.StreamConfig{
         Name:     "EVENTS",
         Subjects: []string{"events.>"},
     })
@@ -236,7 +222,7 @@ The Runner consists of the following components:
 
 - **Processor Interface**: Defines how individual messages are processed
 - **Worker Pool**: Governs how many messages are processed in parallel (config/env driven)
-- **Batch Puller**: Pulls messages in configurable batches from JetStream consumers
+- **Consume Loop**: A supervised `consumer.Consume()` loop (new JetStream API) delivers messages via callback; the callback blocks on the internal job queue, giving natural backpressure (`PullMaxMessages` is set to the configured batch size)
 - **Callback Reporter**: Automatically reports success/error results to the "result" subject
 - **Tracing Integration**: Built-in OpenTelemetry tracing with span propagation
 - **Graceful Shutdown**: Handles context cancellation and proper cleanup
@@ -289,7 +275,7 @@ runner, err := runner.NewRunner(
     &MyProcessor{},   // Processor implementation
     "TASKS",          // Stream name
     "task-consumer",  // Consumer name
-    10,               // Batch size (messages per pull)
+    10,               // Batch size (max in-flight pull request size, PullMaxMessages)
     5*time.Minute,    // Processing timeout per message
     logger,           // Zap logger
     &tracingConfig,   // Tracing configuration (nil to disable)
@@ -314,7 +300,7 @@ if err := runner.Run(ctx); err != nil {
 | `processor` | `Processor` | Message processing implementation |
 | `stream` | `string` | JetStream stream name to consume from |
 | `consumer` | `string` | Durable consumer name |
-| `batchSize` | `int` | Messages to pull per batch (1-1000) |
+| `batchSize` | `int` | Max messages per pull request, passed as `PullMaxMessages` (1-1000) |
 | `numWorkers` | `int` | Concurrent worker goroutines (1-100) |
 | `processTimeout` | `time.Duration` | Max processing time per message |
 | `logger` | `*zap.Logger` | Structured logger (cannot be nil) |
@@ -364,7 +350,7 @@ The Runner automatically reports processing results:
 **Error Callbacks**: Published to the "result" subject when processing fails
 **Message Acknowledgment**: Source messages are properly ack'd/nack'd based on processing outcome
 
-After a successful error-result publish, **INFO** logs `JetStream source message disposition after error result publish` with `jetstream_deliver_count` and `jetstream_source_ack_action` (`nak_transient_redelivery` vs `ack_permanent_suppress_redelivery`) so you can correlate retries with redelivery. Early exits (missing `execution_id` or workflow context) and failed error-result publishes still **NAK** with `jetstream_source_ack_action` values `nak_missing_execution_id`, `nak_missing_workflow_context`, or `nak_error_result_publish_failed`. Successful publishes log `JetStream source message ack after successful result publish` (including `jetstream_deliver_count`) before the source `Ack`. During pull, malformed messages now log `Dropping malformed pulled message; NAK for redelivery` with `stream`, `consumer`, `subject`, and `jetstream_deliver_count` so decode failures are visible in race investigations. On processor failures, the runner now emits explicit timeout/cancel diagnostics: `Process timeout exceeded for message (processCtx deadline exceeded...)` for per-message timeout hits, and `Process cancelled by parent context (runner shutting down?)` when the parent run context is canceled.
+After a successful error-result publish, **INFO** logs `JetStream source message disposition after error result publish` with `jetstream_deliver_count` and `jetstream_source_ack_action` (`nak_transient_redelivery` vs `ack_permanent_suppress_redelivery`) so you can correlate retries with redelivery. Early exits (missing `execution_id` or workflow context) and failed error-result publishes still **NAK** with `jetstream_source_ack_action` values `nak_missing_execution_id`, `nak_missing_workflow_context`, or `nak_error_result_publish_failed`. Successful publishes log `JetStream source message ack after successful result publish` (including `jetstream_deliver_count`) before the source `Ack`. During consumption, malformed messages log `Dropping malformed consumed message; NAK for redelivery` with `stream`, `consumer`, `subject`, and `jetstream_deliver_count` so decode failures are visible in race investigations. On processor failures, the runner now emits explicit timeout/cancel diagnostics: `Process timeout exceeded for message (processCtx deadline exceeded...)` for per-message timeout hits, and `Process cancelled by parent context (runner shutting down?)` when the parent run context is canceled.
 
 ### Process failure observer (optional)
 
@@ -394,68 +380,29 @@ Ensure your streams and consumers are configured for the Runner:
 js := client.JetStream()
 
 // Create stream
-_, err := js.AddStream(&nats.StreamConfig{
+_, err := js.CreateStream(ctx, jetstream.StreamConfig{
     Name:        "TASKS",
     Description: "Task messages for processing",
     Subjects:    []string{"tasks.>"},
-    Storage:     nats.FileStorage,
+    Storage:     jetstream.FileStorage,
     Replicas:    1,
     MaxAge:      24 * time.Hour,
 })
 
 // Create consumer
-_, err = js.AddConsumer("TASKS", &nats.ConsumerConfig{
+_, err = js.CreateConsumer(ctx, "TASKS", jetstream.ConsumerConfig{
     Durable:       "task-consumer",
     Description:   "Consumer for task processing",
-    AckPolicy:     nats.AckExplicitPolicy,
+    AckPolicy:     jetstream.AckExplicitPolicy,
     MaxDeliver:    3,               // Retry failed messages
     AckWait:       5 * time.Minute, // Wait for acknowledgment
     MaxAckPending: 100,             // Allow pending messages
 })
 ```
 
-### Middleware Support
-
-The Runner supports middleware for cross-cutting concerns. Middleware wraps the processor and can modify messages before processing or handle responses after processing.
-
-```go
-// Apply blob resolving middleware to transparently download large payloads
-runner.WithMiddleware(
-    icarusRunner.BlobResolvingMiddleware(blobClient, logger),
-)
-
-// Chain multiple middlewares
-runner.WithMiddleware(middleware1).
-       WithMiddleware(middleware2).
-       WithMiddleware(middleware3)
-```
-
-**Built-in Middleware:**
-
-- **BlobResolvingMiddleware**: Transparently downloads large payloads from Azure Blob Storage when messages contain a `BlobReference`. Plugins receive inline data without knowing about blob storage.
-
-**Creating Custom Middleware:**
-
-```go
-func MyMiddleware(logger *zap.Logger) runner.Middleware {
-    return func(next runner.Processor) runner.Processor {
-        return runner.ProcessorFunc(func(ctx context.Context, msg *message.Message) (message.Message, error) {
-            // Pre-processing logic
-            logger.Info("Processing message", zap.String("id", msg.CorrelationID))
-            
-            // Call next processor in chain
-            result, err := next.Process(ctx, msg)
-            
-            // Post-processing logic
-            if err != nil {
-                logger.Error("Processing failed", zap.Error(err))
-            }
-            
-            return result, err
-        })
-    }
-}
-```
+Note: `runner.NewRunner` calls `Messages.EnsureStream` and `Messages.EnsureConsumer`
+automatically, so manual setup is only needed for custom configurations. Both are
+create-only: existing streams and durables are never modified.
 
 ### BlobReference for Large Payloads
 
@@ -483,20 +430,14 @@ type BlobReference struct {
 }
 ```
 
-When `BlobResolvingMiddleware` is applied:
-1. It checks if the message has a `BlobReference`
-2. If yes, downloads the data from Azure Blob Storage using the shared-key client
-3. Populates `Payload.InlineData` with the downloaded content
-4. Clears the `BlobReference`
-5. Passes the message to the processor with inline data
-
-**Plugins never need to know about blob storage** - they always receive inline data.
+On the result side, `MessageService` (with `SetBlobStorage` configured) uploads
+oversized result payloads to blob storage automatically before publishing.
 
 ### Tracing Integration
 
 The Runner includes comprehensive tracing:
 
-- **Automatic Span Creation**: Spans for message pulling, processing, and reporting
+- **Automatic Span Creation**: Spans for message consumption, processing, and reporting
 - **Context Propagation**: Trace context flows through the entire processing pipeline
 - **Rich Attributes**: Workflow IDs, run IDs, worker information, timing data
 - **Error Recording**: Failed processing is recorded in spans
@@ -561,7 +502,7 @@ defer runner.Close() // Automatically shuts down tracing
 
 The Runner creates spans for:
 
-- **Message Pulling**: Batch message retrieval from JetStream
+- **Message Consumption**: Message delivery from the JetStream consumer
 - **Message Processing**: Individual message processing by workers
 - **Success Reporting**: Callback publication for successful processing
 - **Error Reporting**: Callback publication for failed processing
@@ -673,17 +614,18 @@ func (p *MyProcessor) Process(ctx context.Context, msg *message.Message) (messag
 You can also report callbacks manually using the MessageService:
 
 ```go
-// Report success
+// Report success (originalMsg is the jetstream.Msg the job arrived on,
+// available via msg.GetJetStreamMsg())
 successResult := message.NewWorkflowMessage(workflowID, runID).
-    WithPayload("processor", "Task completed successfully", "success-ref")
+    WithPayload(`{"status":"Task completed successfully"}`)
 
-err := client.Messages.ReportSuccess(ctx, *successResult, originalNATSMsg)
+err := client.Messages.ReportSuccess(ctx, *successResult, originalMsg)
 if err != nil {
     logger.Error("Failed to report success", zap.Error(err))
 }
 
 // Report error
-err := client.Messages.ReportError(ctx, executionID, workflowID, runID, correlationID, fmt.Errorf("Processing failed: timeout"), originalNATSMsg)
+err := client.Messages.ReportError(ctx, executionID, workflowID, runID, correlationID, fmt.Errorf("Processing failed: timeout"), originalMsg)
 if err != nil {
     logger.Error("Failed to report error", zap.Error(err))
 }
@@ -740,11 +682,11 @@ Create a stream to capture callback messages:
 js := client.JetStream()
 
 // Create RESULTS stream for callbacks
-_, err := js.AddStream(&nats.StreamConfig{
+_, err := js.CreateStream(ctx, jetstream.StreamConfig{
     Name:        "RESULTS",
     Description: "Stream for success/error callback reporting",
     Subjects:    []string{"result"},
-    Storage:     nats.FileStorage,
+    Storage:     jetstream.FileStorage,
     Replicas:    1,
     MaxAge:      7 * 24 * time.Hour, // Keep results for 7 days
 })
@@ -752,32 +694,34 @@ _, err := js.AddStream(&nats.StreamConfig{
 
 ### Consuming Callbacks
 
-Pull callbacks for monitoring or further processing:
+Consume callbacks for monitoring or further processing using the JetStream API:
 
 ```go
-// Pull callback messages from the RESULTS stream
-messages, err := client.Messages.PullMessages(ctx, "RESULTS", "callback-consumer", 10)
+consumer, err := client.Messages.GetConsumer(ctx, "RESULTS", "callback-consumer")
 if err != nil {
-    logger.Error("Failed to pull callback messages", zap.Error(err))
+    logger.Error("Failed to get callback consumer", zap.Error(err))
     return
 }
 
-for _, msg := range messages {
-    resultType := msg.Metadata["result_type"]
-
-    if resultType == "success" {
-        logger.Info("Processing succeeded",
-            zap.String("workflow_id", msg.Workflow.WorkflowID),
-            zap.String("run_id", msg.Workflow.RunID))
-    } else if resultType == "error" {
-        logger.Error("Processing failed",
-            zap.String("workflow_id", msg.Workflow.WorkflowID),
-            zap.String("run_id", msg.Workflow.RunID),
-            zap.String("error", msg.Payload.GetInlineData()))
+cc, err := consumer.Consume(func(jsMsg jetstream.Msg) {
+    resultMsg, err := message.ResultMessageFromBytes(jsMsg.Data())
+    if err != nil {
+        jsMsg.Nak()
+        return
     }
 
-    msg.Ack()
-}
+    if resultMsg.Metadata["result_type"] == "success" {
+        logger.Info("Processing succeeded",
+            zap.String("execution_id", resultMsg.ExecutionID))
+    } else {
+        logger.Error("Processing failed",
+            zap.String("execution_id", resultMsg.ExecutionID),
+            zap.String("error", string(resultMsg.Result.InlineResult)))
+    }
+
+    jsMsg.Ack()
+})
+defer cc.Stop()
 ```
 
 ### Message Acknowledgment
@@ -1041,33 +985,33 @@ if err := c.EnsureConnected(ctx); err != nil {
 }
 ```
 
-`pkg/runner` calls `EnsureConnected` automatically on JetStream transport errors during pull
-and result publish. Multiple runners may share one client; `EnsureConnected` is mutex-safe.
+`pkg/runner` calls `EnsureConnected` automatically on fatal consume errors and JetStream
+transport errors during result publish. Multiple runners may share one client;
+`EnsureConnected` is mutex-safe. Transient consume interruptions (e.g. server reconnects)
+are healed by the `jetstream` library itself without runner intervention.
 
-### Pull-Based Consumers (JetStream)
+### Continuous Consumption (JetStream)
 
 ```go
-// Pull messages from a JetStream consumer
-messages, err := c.Messages.PullMessages(ctx, "mystream", "myconsumer", 10)
+consumer, err := c.Messages.GetConsumer(ctx, "mystream", "myconsumer")
 if err != nil {
-    log.Printf("Failed to pull messages: %v", err)
+    log.Printf("Failed to resolve consumer: %v", err)
 }
 
-for _, msg := range messages {
-    var content string
-    if msg.Payload != nil {
-        content = msg.Payload.GetInlineData()
+cc, err := consumer.Consume(func(jsMsg jetstream.Msg) {
+    msg, err := message.FromJetStreamMsg(jsMsg)
+    if err != nil {
+        jsMsg.Nak()
+        return
     }
-    fmt.Printf("Pulled message: %s\n", content)
-}
+    fmt.Printf("Consumed message: %s\n", msg.Payload.GetInlineData())
+    msg.Ack()
+})
+defer cc.Stop()
 ```
 
-This method:
-
-- Connects to a JetStream pull consumer
-- Fetches messages in batches
-- Automatically acknowledges successfully deserialized messages
-- Respects context cancellation/timeout
+The `runner` package wraps this pattern with a worker pool, backpressure, and
+automatic result reporting; prefer it over hand-rolled consume loops.
 
 ### Context-Based Cancellation
 
@@ -1077,7 +1021,7 @@ ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 defer cancel()
 
 // All operations respect the context
-if err := c.Messages.Publish(ctx, "events.test", msg); err != nil {
+if err := c.Messages.PublishResult(ctx, resultMsg); err != nil {
     log.Printf("Publish timed out or was cancelled: %v", err)
 }
 ```
@@ -1097,8 +1041,7 @@ Icarus/
 │   │   └── client.go         # Client with connection management
 │   ├── message/              # Message handling and JetStream operations
 │   │   ├── message.go        # Message struct and serialization
-│   │   ├── handler.go        # Handler types and utilities
-│   │   └── service.go        # Message service with pub/sub operations
+│   │   └── service.go        # Message service (streams, consumers, result reporting)
 │   ├── runner/               # Concurrent message processing
 │   │   └── runner.go         # Worker pool-based message processing
 │   ├── tracing/              # Distributed tracing utilities
@@ -1109,8 +1052,6 @@ Icarus/
 │       └── strings/          # String processing utilities
 │           └── strings.go    # String manipulation functions
 ├── examples/                 # Usage examples
-│   ├── message/              # JetStream messaging patterns
-│   │   └── main.go           # All messaging patterns with the client
 │   ├── runner/               # Concurrent processing examples
 │   │   └── main.go           # Runner usage examples
 │   ├── runner-with-tracing/  # Runner with tracing examples
@@ -1139,7 +1080,7 @@ import (
     "errors"
 )
 
-err := c.Messages.Publish(ctx, "test", msg)
+err := c.Messages.PublishResult(ctx, resultMsg)
 if err != nil {
     // Check for specific error types using errors.As
     var appErr *sdkerrors.AppError
@@ -2012,6 +1953,7 @@ import (
     "log"
     "time"
 
+    "github.com/nats-io/nats.go/jetstream"
     "github.com/wehubfusion/Icarus/pkg/client"
     "github.com/wehubfusion/Icarus/pkg/message"
     "github.com/google/uuid"
@@ -2027,49 +1969,37 @@ func main() {
     }
     defer c.Close()
 
-    // Publish a test message
+    // Publish a test message via the JetStream context
     msg := message.NewWorkflowMessage("test-workflow", uuid.New().String()).
-        WithPayload("example-service", "Hello, World!", "msg-123").
+        WithPayload(`{"greeting":"Hello, World!"}`).
         WithMetadata("test", "true")
-    if err := c.Messages.Publish(ctx, "events.test", msg); err != nil {
+    data, _ := msg.ToBytes()
+    if _, err := c.JetStream().Publish(ctx, "events.test", data); err != nil {
         log.Printf("Failed to publish: %v", err)
     }
 
-    // Simulate consuming the message using pull-based approach
-    // In a real application, you would pull from a consumer
-    messages, err := c.Messages.PullMessages(ctx, "TEST_EVENTS", "test-consumer", 5)
+    // Consume messages via the new JetStream API
+    consumer, err := c.Messages.GetConsumer(ctx, "TEST_EVENTS", "test-consumer")
     if err != nil {
-        log.Printf("Failed to pull messages: %v", err)
-    } else {
-        for _, pulledMsg := range messages {
-            var content string
-            if pulledMsg.Payload != nil {
-                content = pulledMsg.Payload.InlineData
-            }
-            fmt.Printf("Pulled: %s (Workflow: %s)\n", content, pulledMsg.Workflow.WorkflowID)
-            pulledMsg.Ack() // Acknowledge message
+        log.Fatalf("Failed to resolve consumer: %v", err)
+    }
+
+    cc, err := consumer.Consume(func(jsMsg jetstream.Msg) {
+        consumed, err := message.FromJetStreamMsg(jsMsg)
+        if err != nil {
+            jsMsg.Nak()
+            return
         }
+        fmt.Printf("Consumed: %s (Workflow: %s)\n",
+            consumed.Payload.GetInlineData(), consumed.Workflow.WorkflowID)
+        consumed.Ack()
+    })
+    if err != nil {
+        log.Fatalf("Failed to start consuming: %v", err)
     }
-}
-```
+    defer cc.Stop()
 
-### Pull-Based Consumers Example
-
-```go
-// Pull messages from JetStream
-messages, err := c.Messages.PullMessages(ctx, "EVENTS", "pull-consumer", 10)
-if err != nil {
-    log.Printf("Failed to pull messages: %v", err)
-    return
-}
-
-for _, msg := range messages {
-    var content string
-    if msg.Payload != nil {
-        content = msg.Payload.GetInlineData()
-    }
-    fmt.Printf("Processing: %s (Workflow: %s)\n", content, msg.Workflow.WorkflowID)
-    // Messages are automatically acknowledged after successful deserialization
+    time.Sleep(2 * time.Second) // Let the consumer process messages
 }
 ```
 
@@ -2126,8 +2056,9 @@ go func() {
 // Publish messages for processing
 for i := 0; i < 10; i++ {
     msg := message.NewWorkflowMessage("batch-workflow", fmt.Sprintf("run-%d", i)).
-        WithPayload("batch-service", fmt.Sprintf("Message %d", i), fmt.Sprintf("msg-%d", i))
-    if err := c.Messages.Publish(ctx, "events.process", msg); err != nil {
+        WithPayload(fmt.Sprintf(`{"message":"Message %d"}`, i))
+    data, _ := msg.ToBytes()
+    if _, err := c.JetStream().Publish(ctx, "events.process", data); err != nil {
         log.Printf("Failed to publish: %v", err)
     }
 }
@@ -2139,7 +2070,6 @@ time.Sleep(2 * time.Second) // Wait for processing
 
 See the `examples/` directory for complete working examples:
 
-- **examples/message/main.go**: Demonstrates JetStream messaging patterns including message publishing, pull-based consumers, and callback reporting
 - **examples/runner/main.go**: Shows concurrent message processing using the Runner with worker pools and callback reporting
 - **examples/runner-with-tracing/main.go**: Demonstrates the Runner with OpenTelemetry tracing integration using Jaeger
 - **examples/process/strings/main.go**: Comprehensive string processing utilities demo
@@ -2156,9 +2086,6 @@ docker run -d --name jaeger \
   -p 14268:14268 \
   jaegertracing/all-in-one:latest
 
-# Run message example
-go run examples/message/main.go
-
 # Run runner example
 go run examples/runner/main.go
 
@@ -2171,26 +2098,35 @@ go run examples/process/strings/main.go
 
 ## Migration Guide
 
-If you have existing code using the old pattern:
+v0.21.0 migrates from the legacy `nats.JetStreamContext` pull API to the new
+`nats.go/jetstream` package. Key changes for existing code:
 
-**Before:**
-
-```go
-c := client.NewClient(url)
-c.Connect(ctx)
-msgService, _ := message.NewMessageService(c.Connection())
-msgService.Publish(ctx, subject, msg)
-```
-
-**After:**
+**Before (v0.20.x and earlier):**
 
 ```go
-c := client.NewClient(url)
-c.Connect(ctx)
+js := c.JetStream() // nats.JetStreamContext
+js.AddStream(&nats.StreamConfig{...})
+messages, _ := c.Messages.PullMessages(ctx, stream, consumer, batch)
 c.Messages.Publish(ctx, subject, msg)
+c.Messages.ReportSuccess(ctx, result, msg.GetNATSMsg())
 ```
 
-The old pattern still works but the new pattern is more concise.
+**After (v0.21.0):**
+
+```go
+js := c.JetStream() // jetstream.JetStream
+js.CreateStream(ctx, jetstream.StreamConfig{...})
+consumer, _ := c.Messages.GetConsumer(ctx, stream, consumerName)
+cc, _ := consumer.Consume(handler) // or use pkg/runner
+data, _ := msg.ToBytes()
+js.Publish(ctx, subject, data)
+c.Messages.ReportSuccess(ctx, result, msg.GetJetStreamMsg())
+```
+
+Removed APIs: `MessageService.Publish`, `MessageService.PullMessages`, the
+`NATSMsg` wrapper, the message middleware framework (`Handler`, `MiddlewareFunc`),
+`Client.Ping`, and `Client.Stats`. See
+[docs/upgrade-guide.md](docs/upgrade-guide.md) for details.
 
 ## Best Practices
 
@@ -2221,21 +2157,15 @@ NewClientWithConfig(config *nats.ConnectionConfig) *Client
 Connect(ctx context.Context) error
 Close() error
 IsConnected() bool
-Ping(ctx context.Context) error
+EnsureConnected(ctx context.Context) error
 ```
 
 ### Service Access
 
 ```go
 Messages *message.MessageService  // Access to all messaging operations
-JetStream() natsclient.JetStreamContext  // Direct JetStream access
-Connection() *natsclient.Conn  // Low-level connection access
-```
-
-### Monitoring
-
-```go
-Stats() ConnectionStats  // Get connection statistics
+JetStream() jetstream.JetStream   // Direct access to the new JetStream API
+Connection() *natsclient.Conn     // Low-level connection access
 ```
 
 ### Usage Pattern
@@ -2249,8 +2179,9 @@ defer c.Close()
 
 // 2. Use services directly
 msg := message.NewWorkflowMessage("workflow-123", "run-456").
-    WithPayload("service", "Hello World", "msg-789")
-c.Messages.Publish(ctx, "subject", msg)
+    WithPayload(`{"greeting":"Hello World"}`)
+data, _ := msg.ToBytes()
+c.JetStream().Publish(ctx, "subject", data)
 ```
 
 ## Future Roadmap
@@ -2272,13 +2203,14 @@ c.Messages.Publish(ctx, "subject", msg)
 
 Recent entries (last 3):
 
+- **[0.21.0] 2026-08-10** (breaking): Migration to the new `nats.go/jetstream` API.
+  `Consume`-based runner, `jetstream.Msg` in `Message`, removal of
+  `Publish`/`PullMessages`/`NATSMsg`/`Ping`/`Stats`. See the
+  [upgrade guide](docs/upgrade-guide.md).
 - **[0.10.0] 2026-05-07**: Embedded node failures now propagate correctly through
   `ProcessFailureObserver` via the new `NodeFailureError` type carrying `NodeID`,
   `PluginType`, and `Permanent bool`.
 - **[0.9.0] 2026-05-03**: CSV column ordering is now controlled by the `position` field
   in the schema definition.
-- **[0.8.0] 2026-04-23**: New `ProcessOptions.CodeSeverityOverrides` replaces the
-  removed `ValidationMode`/`StrictValidation`. Allows per-code severity override
-  including `SeverityDrop` to suppress a code entirely.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.

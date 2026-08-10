@@ -11,31 +11,22 @@ be run with the services started locally (see below).
 
 ## Unit testing the runner with a mock
 
-`tests/` includes a `MockJetStream` implementing `nats.JetStreamContext`. Use it without
-a live NATS server:
+The SDK's NATS operations go through the `message.JSContext` interface — a minimal
+subset of `jetstream.JetStream` (`Publish`, `Stream`, `CreateStream`, `Consumer`,
+`CreateConsumer`). Implement it with a stub and inject it via `NewClientWithJSContext`,
+no live NATS server needed:
 
 ```go
-import "github.com/wehubfusion/Icarus/tests"
-
-js := tests.NewMockJetStream()
-c := client.NewClientWithJSContext(message.WrapNATSJetStream(js))
+js := &myMockJS{} // implements message.JSContext
+c := client.NewClientWithJSContext(js)
+// c.Messages is ready; no Connect needed
 ```
 
-`MockJetStream` captures all published messages in memory and supports `SetPublishError`
-for fault injection:
-
-```go
-js.SetPublishError(errors.New("broker unavailable"))
-// Emit will now fail
-js.SetPublishError(nil) // reset
-```
-
-Inspect published messages:
-
-```go
-msgs := js.GetPublishedMessages()
-// msgs[i].Subject, msgs[i].Data (raw JSON), msgs[i].MsgID
-```
+Your mock's `Consumer` method must return a `jetstream.Consumer` whose `Consume`
+delivers queued `jetstream.Msg` values to the callback. See
+[`tests/nats_mock_test.go`](../tests/nats_mock_test.go) for a complete reference
+implementation (`MockJS`) with in-memory message queuing, published-message capture,
+and fault injection for publish/stream/consumer errors.
 
 ## Testing a `Processor`
 
@@ -47,8 +38,8 @@ func (p *testProcessor) Process(_ context.Context, msg *message.Message) (messag
     return *msg, nil
 }
 
-js := tests.NewMockJetStream()
-c := client.NewClientWithJSContext(message.WrapNATSJetStream(js))
+js := &myMockJS{} // implements message.JSContext
+c := client.NewClientWithJSContext(js)
 
 r, _ := runner.NewRunner(c, &testProcessor{}, "STREAM", "consumer", 1, time.Second, zap.NewNop(), nil, nil)
 ```
@@ -139,11 +130,10 @@ data, err := svc.ResolveInput(ctx, nil, &message.BlobReference{URL: "https://any
 
 ## Runnable examples
 
-The `examples/` directory contains four self-contained programs you can run to verify your setup:
+The `examples/` directory contains self-contained programs you can run to verify your setup:
 
 | Example | Package | What it demonstrates |
 | --- | --- | --- |
-| [`examples/message/`](../examples/message/main.go) | `pkg/message` | Publish a message to a NATS JetStream stream and pull it back. |
 | [`examples/runner/`](../examples/runner/main.go) | `pkg/runner` | Start a worker-pool runner, process a message, and shut down cleanly. |
 | [`examples/runner-with-tracing/`](../examples/runner-with-tracing/main.go) | `pkg/runner` + OpenTelemetry | Same as above with OTLP tracing enabled. |
 | [`examples/schema-engine/`](../examples/schema-engine/main.go) | `pkg/schema` | Run a JSON schema validation with a custom severity override and CEL rule. |

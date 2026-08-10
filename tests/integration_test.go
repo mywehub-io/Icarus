@@ -30,16 +30,21 @@ func (p *integrationProcessor) Process(ctx context.Context, msg *message.Message
 		return message.Message{}, errors.New("integration test failure")
 	}
 
-	// Create a result message
-	result := message.NewWorkflowMessage(msg.Workflow.WorkflowID, msg.Workflow.RunID).
-		WithPayload( "processed successfully")
+	// Create a result message, carrying the execution context forward so
+	// ReportSuccess can publish the result (mirrors real processors)
+	result := message.NewWorkflowMessage(msg.Workflow.WorkflowID, msg.Workflow.RunID)
+	if execID := msg.Metadata["execution_id"]; execID != "" {
+		result.WithMetadata("execution_id", execID)
+	}
+	result.WithPayload(`{"result":"processed successfully"}`)
 
 	return *result, nil
 }
 
 func TestClientMessageServiceIntegration(t *testing.T) {
 	// Create client with mock JetStream
-	c := client.NewClientWithJSContext(NewMockJS())
+	mockJS := NewMockJS()
+	c := client.NewClientWithJSContext(mockJS)
 
 	if c.Messages == nil {
 		t.Fatal("Messages service should be initialized")
@@ -47,56 +52,60 @@ func TestClientMessageServiceIntegration(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Test end-to-end message flow: publish -> pull -> process
+	// Test end-to-end message flow: seed a job -> consume -> report success
 	workflowID := "integration-workflow-" + uuid.New().String()
 	runID := "integration-run-" + uuid.New().String()
 
-	// 1. Publish a message
+	// 1. Seed a job message as it would arrive from the stream
 	msg := message.NewWorkflowMessage(workflowID, runID).
-		WithPayload( "test message data").
+		WithMetadata("execution_id", workflowID+"-test-node-1700000000000").
 		WithNode("test-node", map[string]interface{}{"type": "integration"}).
+		WithPayload(`{"data":"test message data"}`).
 		WithOutput("stream")
 
-	err := c.Messages.Publish(ctx, "integration.test.events", msg)
+	data, err := msg.ToBytes()
 	if err != nil {
-		t.Fatalf("Failed to publish message: %v", err)
+		t.Fatalf("Failed to serialize message: %v", err)
 	}
+	jsMsg := newMockMsg("integration.test.events", data)
 
-	// 2. Pull the message back
-	time.Sleep(10 * time.Millisecond) // Allow message to be stored
-
-	messages, err := c.Messages.PullMessages(ctx, "INTEGRATION_STREAM", "integration_consumer", 1)
+	// 2. Convert as the runner would
+	consumed, err := message.FromJetStreamMsg(jsMsg)
 	if err != nil {
-		t.Fatalf("Failed to pull messages: %v", err)
+		t.Fatalf("FromJetStreamMsg failed: %v", err)
 	}
-
-	if len(messages) != 1 {
-		t.Fatalf("Expected 1 message, got %d", len(messages))
-	}
-
-	pulledMsg := messages[0]
 
 	// 3. Verify message content
-	if pulledMsg.Workflow.WorkflowID != workflowID {
-		t.Errorf("WorkflowID mismatch: expected %s, got %s", workflowID, pulledMsg.Workflow.WorkflowID)
+	if consumed.Workflow.WorkflowID != workflowID {
+		t.Errorf("WorkflowID mismatch: expected %s, got %s", workflowID, consumed.Workflow.WorkflowID)
+	}
+	if consumed.Workflow.RunID != runID {
+		t.Errorf("RunID mismatch: expected %s, got %s", runID, consumed.Workflow.RunID)
+	}
+	if consumed.Payload.GetInlineData() != `{"data":"test message data"}` {
+		t.Errorf("Payload data mismatch: got %s", consumed.Payload.GetInlineData())
+	}
+	if consumed.Node.NodeID != "test-node" {
+		t.Errorf("Node ID mismatch: expected 'test-node', got %s", consumed.Node.NodeID)
 	}
 
-	if pulledMsg.Workflow.RunID != runID {
-		t.Errorf("RunID mismatch: expected %s, got %s", runID, pulledMsg.Workflow.RunID)
+	// 4. Report success and verify the result is published + source message ACKed
+	if err := c.Messages.ReportSuccess(ctx, *consumed, consumed.GetJetStreamMsg()); err != nil {
+		t.Fatalf("ReportSuccess failed: %v", err)
 	}
-
-	if pulledMsg.Payload.GetInlineData() != "test message data" {
-		t.Errorf("Payload data mismatch: expected 'test message data', got %s", pulledMsg.Payload.GetInlineData())
+	subjects := mockJS.publishedSubjects()
+	if len(subjects) != 1 || subjects[0] != "result" {
+		t.Fatalf("published subjects = %v, want [result]", subjects)
 	}
-
-	if pulledMsg.Node.NodeID != "test-node" {
-		t.Errorf("Node ID mismatch: expected 'test-node', got %s", pulledMsg.Node.NodeID)
+	if !jsMsg.wasAcked() {
+		t.Error("Expected source message to be ACKed after successful result publish")
 	}
 }
 
 func TestRunnerIntegration(t *testing.T) {
 	// Create client with mock JetStream
-	c := client.NewClientWithJSContext(NewMockJS())
+	mockJS := NewMockJS()
+	c := client.NewClientWithJSContext(mockJS)
 
 	// Create integration processor
 	processor := &integrationProcessor{}
@@ -120,16 +129,11 @@ func TestRunnerIntegration(t *testing.T) {
 		t.Fatalf("Failed to create runner: %v", err)
 	}
 
-	// Add test messages to the mock
-	mockJS := c.Messages // Access the underlying mock through the service
+	// Add test messages to the mock queue
 	for i := 0; i < 3; i++ {
 		testMsg := message.NewWorkflowMessage("integration-workflow", "integration-run").
-			WithPayload( "test data")
-
-		// We need to access the mock JS context to add messages
-		// This is a bit hacky but necessary for integration testing with mocks
-		_, _ = testMsg.ToBytes() // Serialize for validation
-		mockJS.Publish(context.Background(), "integration.test", testMsg)
+			WithPayload("test data")
+		mockJS.addMessage(testMsg)
 	}
 
 	// Run the runner for a short time
@@ -153,7 +157,8 @@ func TestRunnerIntegration(t *testing.T) {
 
 func TestRunnerWithFailingProcessor(t *testing.T) {
 	// Create client with mock JetStream
-	c := client.NewClientWithJSContext(NewMockJS())
+	mockJS := NewMockJS()
+	c := client.NewClientWithJSContext(mockJS)
 
 	// Create failing processor
 	processor := &integrationProcessor{shouldFail: true}
@@ -179,10 +184,8 @@ func TestRunnerWithFailingProcessor(t *testing.T) {
 
 	// Add a test message
 	testMsg := message.NewWorkflowMessage("failing-workflow", "failing-run").
-		WithPayload( "test data")
-
-	_, _ = testMsg.ToBytes() // Serialize for validation
-	c.Messages.Publish(context.Background(), "integration.test", testMsg)
+		WithPayload("test data")
+	mockJS.addMessage(testMsg)
 
 	// Run the runner for a short time
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -203,105 +206,51 @@ func TestRunnerWithFailingProcessor(t *testing.T) {
 	}
 }
 
-func TestMessageHandlerIntegration(t *testing.T) {
-	// Test integration of message handlers with middleware
-	logger := zap.NewNop()
-
-	processed := false
-	handler := func(ctx context.Context, msg *message.NATSMsg) error {
-		processed = true
-		if msg.Workflow.WorkflowID != "handler-integration-workflow" {
-			t.Errorf("Expected workflow ID 'handler-integration-workflow', got %s", msg.Workflow.WorkflowID)
-		}
-		return nil
-	}
-
-	// Chain all middlewares
-	chained := message.Chain(
-		message.RecoveryMiddleware(),
-		message.LoggingMiddleware(logger),
-		message.ValidationMiddleware(),
-	)
-
-	finalHandler := chained(handler)
-
-	// Create test message
-	msg := message.NewWorkflowMessage("handler-integration-workflow", "handler-integration-run").
-		WithPayload( "handler test data")
-
-	natsMsg := &message.NATSMsg{
-		Message: msg,
-		Subject: "integration.handler.test",
-		Reply:   "integration.handler.reply",
-	}
-
-	ctx := context.Background()
-	err := finalHandler(ctx, natsMsg)
-	if err != nil {
-		t.Errorf("Handler integration failed: %v", err)
-	}
-
-	if !processed {
-		t.Error("Expected handler to be executed")
-	}
-}
-
 func TestEndToEndWorkflow(t *testing.T) {
-	// Test a complete end-to-end workflow
-	c := client.NewClientWithJSContext(NewMockJS())
-	ctx := context.Background()
+	// Test a complete end-to-end workflow through the runner: seed job message,
+	// process it, and verify the result lands on the flat result subject.
+	mockJS := NewMockJS()
+	c := client.NewClientWithJSContext(mockJS)
 
 	workflowID := "e2e-workflow-" + uuid.New().String()
 	runID := "e2e-run-" + uuid.New().String()
 
-	// 1. Create and publish initial message
 	initialMsg := message.NewWorkflowMessage(workflowID, runID).
-		WithPayload( "initial data").
+		WithMetadata("execution_id", workflowID+"-input-node-1700000000000").
 		WithNode("input-node", map[string]interface{}{"type": "input"}).
+		WithPayload("initial data").
 		WithOutput("stream")
+	mockJS.addMessage(initialMsg)
 
-	err := c.Messages.Publish(ctx, "e2e.workflow.start", initialMsg)
+	processor := &integrationProcessor{}
+	r, err := runner.NewRunner(c, processor, "e2e-stream", "e2e-consumer", 1, 30*time.Second, zap.NewNop(), nil, nil)
 	if err != nil {
-		t.Fatalf("Failed to publish initial message: %v", err)
+		t.Fatalf("Failed to create runner: %v", err)
 	}
 
-	// 2. Simulate processing by pulling and creating result
-	time.Sleep(10 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
 
-	messages, err := c.Messages.PullMessages(ctx, "E2E_STREAM", "e2e_consumer", 1)
-	if err != nil {
-		t.Fatalf("Failed to pull messages: %v", err)
+	if len(processor.processedMessages) != 1 {
+		t.Fatalf("Expected 1 processed message, got %d", len(processor.processedMessages))
 	}
 
-	if len(messages) != 1 {
-		t.Fatalf("Expected 1 message, got %d", len(messages))
-	}
-
-	processedMsg := messages[0]
-
-	// 3. Create result message
-	resultMsg := message.NewWorkflowMessage(workflowID, runID).
-		WithPayload( `{"status":"processed"}`).
-		WithNode("output-node", map[string]interface{}{"type": "output"}).
-		WithOutput("callback").
-		WithMetadata("temporal_workflow_id", workflowID).
-		WithMetadata("temporal_run_id", runID).
-		WithMetadata("temporal_signal_name", "unit-result-"+workflowID)
-
-	// 4. Report success (may fail due to mock NATS message acknowledgment)
-	err = c.Messages.ReportSuccess(ctx, *resultMsg, processedMsg.GetNATSMsg())
-	// Note: This may fail with acknowledgment errors in mock environment, which is expected
-	_ = err // Acknowledge that error may occur
-
-	// 5. Verify the workflow completed successfully
+	processedMsg := processor.processedMessages[0]
 	if processedMsg.Workflow.WorkflowID != workflowID {
 		t.Errorf("Workflow ID mismatch in processed message: expected %s, got %s",
 			workflowID, processedMsg.Workflow.WorkflowID)
 	}
-
 	if processedMsg.Workflow.RunID != runID {
 		t.Errorf("Run ID mismatch in processed message: expected %s, got %s",
 			runID, processedMsg.Workflow.RunID)
+	}
+
+	// The runner reported success for the processed message; the result must be
+	// published to the flat result subject.
+	subjects := mockJS.publishedSubjects()
+	if len(subjects) == 0 || subjects[0] != "result" {
+		t.Errorf("Expected a result publish on 'result', got %v", subjects)
 	}
 }
 

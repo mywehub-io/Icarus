@@ -1,206 +1,343 @@
 package tests
 
 import (
+	"context"
+	"strings"
 	"sync"
 	"time"
 
-	nats "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/wehubfusion/Icarus/pkg/message"
 )
 
-// MockJS is a lightweight in-memory implementation of message.JSContext
-// suitable for unit tests without a running NATS server.
-type MockJS struct {
-	mu          sync.Mutex
-	subscribers map[string][]*mockSubscriber
-	queueSubs   map[string][]*mockSubscriber
-	queueIndex  map[string]int
-	allMessages []*nats.Msg
-	streams     map[string]*nats.StreamInfo
-	consumers   map[string]map[string]*nats.ConsumerInfo // stream -> consumer -> info
+// mockMsg is an in-memory implementation of jetstream.Msg for unit tests.
+// Unimplemented interface methods panic via the embedded nil interface.
+type mockMsg struct {
+	jetstream.Msg
+
+	subject string
+	data    []byte
+
+	mu     sync.Mutex
+	acked  bool
+	nakked bool
+	termed bool
 }
 
-type mockSubscriber struct {
+func newMockMsg(subject string, data []byte) *mockMsg {
+	return &mockMsg{subject: subject, data: data}
+}
+
+func (m *mockMsg) Data() []byte    { return m.data }
+func (m *mockMsg) Subject() string { return m.subject }
+func (m *mockMsg) Reply() string   { return "" }
+
+func (m *mockMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	return &jetstream.MsgMetadata{
+		NumDelivered: 1,
+		NumPending:   0,
+		Sequence:     jetstream.SequencePair{Stream: 1, Consumer: 1},
+	}, nil
+}
+
+func (m *mockMsg) Ack() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.acked = true
+	return nil
+}
+
+func (m *mockMsg) Nak() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nakked = true
+	return nil
+}
+
+func (m *mockMsg) Term() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.termed = true
+	return nil
+}
+
+func (m *mockMsg) InProgress() error { return nil }
+
+func (m *mockMsg) wasAcked() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.acked
+}
+
+func (m *mockMsg) wasNakked() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nakked
+}
+
+// MockJS is a lightweight in-memory implementation of message.JSContext
+// (the new nats.go/jetstream API surface) suitable for unit tests without a
+// running NATS server.
+type MockJS struct {
+	mu        sync.Mutex
+	queue     []jetstream.Msg
+	streams   map[string]jetstream.StreamConfig
+	consumers map[string]map[string]jetstream.ConsumerConfig
+
+	published []publishedRecord
+
+	// reportError, when set, is returned by Publish for result subjects.
+	reportError error
+
+	// consumerError simulates failures resolving the consumer (GetConsumer).
+	// consumerErrorBudget == 0 means fail forever; otherwise fail that many times.
+	consumerError       error
+	consumerErrorBudget int
+	consumerAttempts    int
+
+	// activeConsumes tracks live Consume loops so tests can Stop them without
+	// invoking ConsumeErrHandler (simulates nats.go stopping on consumer deleted).
+	activeConsumes []*mockConsumeContext
+	consumeStarts  int
+}
+
+type publishedRecord struct {
 	subject string
-	queue   string
-	cb      nats.MsgHandler
-	active  bool
+	data    []byte
 }
 
 func NewMockJS() *MockJS {
 	return &MockJS{
-		subscribers: make(map[string][]*mockSubscriber),
-		queueSubs:   make(map[string][]*mockSubscriber),
-		queueIndex:  make(map[string]int),
-		streams:     make(map[string]*nats.StreamInfo),
-		consumers:   make(map[string]map[string]*nats.ConsumerInfo),
+		streams:   make(map[string]jetstream.StreamConfig),
+		consumers: make(map[string]map[string]jetstream.ConsumerConfig),
 	}
 }
 
-// SupportsAcks indicates ack/nak are not supported in the mock; the SDK will no-op.
-func (m *MockJS) SupportsAcks() bool { return false }
-
-func (m *MockJS) Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
-	m.mu.Lock()
-	// Keep a copy for pull-based fetches
-	msg := &nats.Msg{Subject: subj, Data: data}
-	m.allMessages = append(m.allMessages, msg)
-
-	// Deliver to push subscribers
-	if subs := m.subscribers[subj]; len(subs) > 0 {
-		// invoke outside lock to avoid deadlocks
-		callbacks := make([]nats.MsgHandler, 0, len(subs))
-		for _, s := range subs {
-			if s.active {
-				callbacks = append(callbacks, s.cb)
-			}
-		}
-		m.mu.Unlock()
-		for _, cb := range callbacks {
-			cb(&nats.Msg{Subject: subj, Data: data})
-		}
-		m.mu.Lock()
-	}
-
-	// Deliver to one of the queue subscribers (round-robin)
-	if subs := m.queueSubs[subj]; len(subs) > 0 {
-		idx := m.queueIndex[subj] % len(subs)
-		sel := subs[idx]
-		m.queueIndex[subj] = (idx + 1) % len(subs)
-		if sel.active {
-			// Ensure queue field is properly set for queue subscribers
-			_ = sel.queue // mark field as used
-			cb := sel.cb
-			m.mu.Unlock()
-			cb(&nats.Msg{Subject: subj, Data: data})
-			m.mu.Lock()
-		}
-	}
-
-	m.mu.Unlock()
-	return &nats.PubAck{Stream: "MOCK", Sequence: uint64(len(m.allMessages))}, nil
-}
-
-func (m *MockJS) Subscribe(subj string, cb nats.MsgHandler, opts ...nats.SubOpt) (message.JSSubscription, error) {
-	m.mu.Lock()
-	sub := &mockSubscriber{subject: subj, cb: cb, active: true, queue: ""} // empty queue for regular subscribers
-	m.subscribers[subj] = append(m.subscribers[subj], sub)
-	m.mu.Unlock()
-	return &mockSubscription{owner: m, subscriber: sub}, nil
-}
-
-func (m *MockJS) PullSubscribe(subj, durable string, opts ...nats.SubOpt) (message.JSSubscription, error) {
-	m.mu.Lock()
-	sub := &mockSubscriber{subject: subj, cb: nil, active: true, queue: durable}
-	m.queueSubs[subj] = append(m.queueSubs[subj], sub)
-	m.mu.Unlock()
-	// For simplicity, return a subscription that fetches from the shared buffer
-	return &mockPullSubscription{owner: m, durable: durable}, nil
-}
-
-func (m *MockJS) StreamInfo(stream string) (*nats.StreamInfo, error) {
+// addMessage queues a message for delivery to consumers created from this mock.
+func (m *MockJS) addMessage(msg *message.Message) {
+	data, _ := msg.ToBytes()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if info, exists := m.streams[stream]; exists {
-		return info, nil
-	}
-	return nil, nats.ErrStreamNotFound
+	m.queue = append(m.queue, newMockMsg("test.subject", data))
 }
 
-func (m *MockJS) AddStream(cfg *nats.StreamConfig) (*nats.StreamInfo, error) {
+// addRawMessage queues a raw payload (e.g. malformed JSON) for delivery.
+func (m *MockJS) addRawMessage(subject string, data []byte) *mockMsg {
+	msg := newMockMsg(subject, data)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	info := &nats.StreamInfo{
-		Config: *cfg,
-		State: nats.StreamState{
-			Msgs:      0,
-			Bytes:     0,
-			FirstSeq:  1,
-			LastSeq:   0,
-			Consumers: 0,
-		},
-	}
-	m.streams[cfg.Name] = info
-	return info, nil
+	m.queue = append(m.queue, msg)
+	return msg
 }
 
-func (m *MockJS) ConsumerInfo(stream, consumer string) (*nats.ConsumerInfo, error) {
+func (m *MockJS) setReportError(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if streamConsumers, exists := m.consumers[stream]; exists {
-		if info, exists := streamConsumers[consumer]; exists {
-			return info, nil
+	m.reportError = err
+}
+
+func (m *MockJS) setConsumerError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.consumerError = err
+	m.consumerErrorBudget = 0
+}
+
+func (m *MockJS) setConsumerErrorBudget(err error, budget int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.consumerError = err
+	m.consumerErrorBudget = budget
+}
+
+// stopActiveConsumes stops all in-flight Consume loops without delivering an
+// ErrHandler callback. Closed() fires so the runner supervision loop can restart.
+func (m *MockJS) stopActiveConsumes() int {
+	m.mu.Lock()
+	cons := append([]*mockConsumeContext(nil), m.activeConsumes...)
+	m.activeConsumes = nil
+	m.mu.Unlock()
+	for _, c := range cons {
+		c.Stop()
+	}
+	return len(cons)
+}
+
+func (m *MockJS) consumeStartCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.consumeStarts
+}
+
+func (m *MockJS) publishedSubjects() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	subjects := make([]string, 0, len(m.published))
+	for _, p := range m.published {
+		subjects = append(subjects, p.subject)
+	}
+	return subjects
+}
+
+// Publish implements message.JSContext.
+func (m *MockJS) Publish(ctx context.Context, subject string, payload []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.reportError != nil && (subject == "result" || strings.HasPrefix(subject, "result")) {
+		return nil, m.reportError
+	}
+	m.published = append(m.published, publishedRecord{subject: subject, data: payload})
+	return &jetstream.PubAck{Stream: "MOCK", Sequence: uint64(len(m.published))}, nil
+}
+
+// Stream implements message.JSContext.
+func (m *MockJS) Stream(ctx context.Context, name string) (jetstream.Stream, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cfg, ok := m.streams[name]; ok {
+		return &mockStream{name: name, cfg: cfg}, nil
+	}
+	return nil, jetstream.ErrStreamNotFound
+}
+
+// CreateStream implements message.JSContext.
+func (m *MockJS) CreateStream(ctx context.Context, cfg jetstream.StreamConfig) (jetstream.Stream, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.streams[cfg.Name] = cfg
+	return &mockStream{name: cfg.Name, cfg: cfg}, nil
+}
+
+// Consumer implements message.JSContext.
+func (m *MockJS) Consumer(ctx context.Context, stream, consumer string) (jetstream.Consumer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.consumerError != nil {
+		m.consumerAttempts++
+		if m.consumerErrorBudget == 0 || m.consumerAttempts <= m.consumerErrorBudget {
+			return nil, m.consumerError
 		}
 	}
-	return nil, nats.ErrConsumerNotFound
+	if streamConsumers, ok := m.consumers[stream]; ok {
+		if cfg, ok := streamConsumers[consumer]; ok {
+			return &mockConsumer{owner: m, stream: stream, cfg: cfg}, nil
+		}
+	}
+	return nil, jetstream.ErrConsumerNotFound
 }
 
-func (m *MockJS) AddConsumer(stream string, cfg *nats.ConsumerConfig) (*nats.ConsumerInfo, error) {
+// CreateConsumer implements message.JSContext.
+func (m *MockJS) CreateConsumer(ctx context.Context, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.consumers[stream] == nil {
-		m.consumers[stream] = make(map[string]*nats.ConsumerInfo)
+		m.consumers[stream] = make(map[string]jetstream.ConsumerConfig)
 	}
-	info := &nats.ConsumerInfo{
-		Stream: stream,
-		Name:   cfg.Durable,
-		Config: *cfg,
+	m.consumers[stream][cfg.Durable] = cfg
+	return &mockConsumer{owner: m, stream: stream, cfg: cfg}, nil
+}
+
+// popMessages removes and returns up to max queued messages.
+func (m *MockJS) popMessages(max int) []jetstream.Msg {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.queue) == 0 {
+		return nil
 	}
-	m.consumers[stream][cfg.Durable] = info
-	return info, nil
-}
-
-type mockSubscription struct {
-	owner      *MockJS
-	subscriber *mockSubscriber
-	drained    bool
-}
-
-func (s *mockSubscription) Unsubscribe() error {
-	s.owner.mu.Lock()
-	s.subscriber.active = false
-	s.owner.mu.Unlock()
-	return nil
-}
-
-func (s *mockSubscription) Drain() error {
-	s.drained = true
-	// simulate drain wait
-	time.Sleep(1 * time.Millisecond)
-	return s.Unsubscribe()
-}
-
-func (s *mockSubscription) IsValid() bool { return s.subscriber.active }
-
-func (s *mockSubscription) Pending() (int, int, error) { return 0, 0, nil }
-
-func (s *mockSubscription) Fetch(batch int, opts ...nats.PullOpt) ([]*nats.Msg, error) {
-	return nil, nil
-}
-
-type mockPullSubscription struct {
-	owner   *MockJS
-	durable string
-}
-
-func (s *mockPullSubscription) Unsubscribe() error         { return nil }
-func (s *mockPullSubscription) Drain() error               { return nil }
-func (s *mockPullSubscription) IsValid() bool              { return true }
-func (s *mockPullSubscription) Pending() (int, int, error) { return 0, 0, nil }
-
-func (s *mockPullSubscription) Fetch(batch int, opts ...nats.PullOpt) ([]*nats.Msg, error) {
-	s.owner.mu.Lock()
-	defer s.owner.mu.Unlock()
-	if batch <= 0 {
-		batch = 10
+	n := max
+	if n <= 0 || n > len(m.queue) {
+		n = len(m.queue)
 	}
-	n := batch
-	if n > len(s.owner.allMessages) {
-		n = len(s.owner.allMessages)
-	}
-	msgs := make([]*nats.Msg, n)
-	copy(msgs, s.owner.allMessages[:n])
-	// pop from buffer
-	s.owner.allMessages = s.owner.allMessages[n:]
-	return msgs, nil
+	msgs := make([]jetstream.Msg, n)
+	copy(msgs, m.queue[:n])
+	m.queue = m.queue[n:]
+	return msgs
 }
+
+// mockStream implements jetstream.Stream via embedding; only CachedInfo is used.
+type mockStream struct {
+	jetstream.Stream
+
+	name string
+	cfg  jetstream.StreamConfig
+}
+
+func (s *mockStream) CachedInfo() *jetstream.StreamInfo {
+	return &jetstream.StreamInfo{Config: s.cfg}
+}
+
+// mockConsumer implements jetstream.Consumer via embedding; the runner uses
+// Consume and CachedInfo.
+type mockConsumer struct {
+	jetstream.Consumer
+
+	owner  *MockJS
+	stream string
+	cfg    jetstream.ConsumerConfig
+}
+
+func (c *mockConsumer) CachedInfo() *jetstream.ConsumerInfo {
+	return &jetstream.ConsumerInfo{
+		Stream: c.stream,
+		Name:   c.cfg.Durable,
+		Config: c.cfg,
+	}
+}
+
+func (c *mockConsumer) Consume(handler jetstream.MessageHandler, opts ...jetstream.PullConsumeOpt) (jetstream.ConsumeContext, error) {
+	cc := &mockConsumeContext{
+		stopCh:   make(chan struct{}),
+		closedCh: make(chan struct{}),
+	}
+	c.owner.mu.Lock()
+	c.owner.consumeStarts++
+	c.owner.activeConsumes = append(c.owner.activeConsumes, cc)
+	c.owner.mu.Unlock()
+
+	go func() {
+		defer close(cc.closedCh)
+		for {
+			select {
+			case <-cc.stopCh:
+				return
+			default:
+			}
+			msgs := c.owner.popMessages(10)
+			if len(msgs) == 0 {
+				select {
+				case <-cc.stopCh:
+					return
+				case <-time.After(5 * time.Millisecond):
+				}
+				continue
+			}
+			for _, msg := range msgs {
+				select {
+				case <-cc.stopCh:
+					return
+				default:
+					handler(msg)
+				}
+			}
+		}
+	}()
+	return cc, nil
+}
+
+// mockConsumeContext implements jetstream.ConsumeContext.
+type mockConsumeContext struct {
+	stopCh   chan struct{}
+	closedCh chan struct{}
+	stopOnce sync.Once
+}
+
+func (c *mockConsumeContext) Stop() {
+	c.stopOnce.Do(func() { close(c.stopCh) })
+}
+
+func (c *mockConsumeContext) Drain() { c.Stop() }
+
+func (c *mockConsumeContext) Closed() <-chan struct{} { return c.closedCh }

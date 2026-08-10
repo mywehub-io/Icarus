@@ -1,5 +1,62 @@
 # Upgrade guide
 
+## Upgrading to v0.21.0
+
+### Migration to the new `nats.go/jetstream` API (breaking)
+
+v0.21.0 replaces the legacy `nats.JetStreamContext` pull API with the new
+`nats.go/jetstream` package throughout `pkg/client`, `pkg/message`, and `pkg/runner`.
+Stream/consumer configurations, result subject composition, metadata keys, and
+ack/nak semantics are unchanged; only the API surface changes.
+
+**`pkg/client`:**
+
+- `Client.JetStream()` now returns `jetstream.JetStream` (was `nats.JetStreamContext`).
+  For code that still needs the legacy context (e.g. Argus `NewObserver`), derive it
+  from the raw connection: `client.Connection().JetStream()`.
+- `NewClientWithJSContext` now takes a `message.JSContext` built around the new API.
+- Removed: `Client.Ping`, `Client.Stats`, `ConnectionStats`.
+
+**`pkg/message`:**
+
+- `Message` now wraps a `jetstream.Msg`; `GetNATSMsg()` is replaced by
+  `GetJetStreamMsg()`. New constructor: `FromJetStreamMsg(jsMsg)`.
+- `ReportSuccess` / `ReportError` take `jetstream.Msg` instead of `*nats.Msg`.
+- `EnsureStream` / `EnsureConsumer` now take a `context.Context` as first argument.
+  Both remain create-only: existing streams and durables are never modified.
+- New: `GetConsumer(ctx, stream, consumer)` returns a `jetstream.Consumer` for use
+  with `Consume`.
+- Removed: `MessageService.Publish`, `MessageService.PullMessages`, the `NATSMsg`
+  wrapper, and the message middleware framework (`Handler`, `MiddlewareFunc`, etc.).
+- Kept for Zeus and other plain-NATS consumers: `FromNATSMsg`, `ResultMessageFromNATSMsg`,
+  and the `Message`/`ResultMessage` JSON contracts.
+
+**`pkg/runner`:**
+
+- The internal pull loop (`PullMessages` + idle backoff) is replaced by a supervised
+  `consumer.Consume(cb, jetstream.PullMaxMessages(batchSize))` loop. The callback
+  dispatches into the same bounded worker pool, so effective concurrency and
+  backpressure are unchanged.
+- `NewRunner` signature, worker pool config, `processTimeout`, functional options,
+  metadata keys, and shutdown-drain semantics are unchanged.
+- Reconnection during consumption is handled natively by the `jetstream` library;
+  `EnsureConnected` is still used on fatal consume errors and result-publish failures.
+
+**Migration example:**
+
+```go
+// Before
+js := c.JetStream()                       // nats.JetStreamContext
+msgs, _ := c.Messages.PullMessages(ctx, stream, consumer, 10)
+c.Messages.ReportSuccess(ctx, result, msg.GetNATSMsg())
+
+// After
+js := c.JetStream()                       // jetstream.JetStream
+consumer, _ := c.Messages.GetConsumer(ctx, stream, consumerName)
+cc, _ := consumer.Consume(handler)        // or use pkg/runner
+c.Messages.ReportSuccess(ctx, result, msg.GetJetStreamMsg())
+```
+
 ## Upgrading to v0.8.0
 
 ### `ValidationMode` / `StrictValidation` removed
