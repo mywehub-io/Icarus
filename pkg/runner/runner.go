@@ -586,6 +586,74 @@ func backgroundWithSpan(span trace.Span) context.Context {
 
 // processMessage handles the actual message processing logic.
 // It returns an error when message processing or result reporting fails.
+// ackHeartbeatInterval is how often an in-flight message extends its ack deadline.
+//
+// EnsureConsumer creates durables without an explicit AckWait, so the NATS server default of
+// 30s applies; 10s gives three chances to extend before that expires. It is deliberately not
+// derived from consumer config: existing durables are never modified, so a deployed consumer's
+// real AckWait cannot be assumed to match anything we would compute locally. A fixed interval
+// comfortably under the smallest plausible AckWait is the safe choice.
+//
+// A var rather than a const so tests can shorten it; nothing outside this package writes it.
+var ackHeartbeatInterval = 10 * time.Second
+
+// startAckHeartbeat extends the message's ack deadline every ackHeartbeatInterval until the
+// returned stop function is called. Stop is idempotent and waits for the goroutine to exit.
+//
+// Handlers routinely run far longer than the ack deadline (Elysium's plugin timeouts range
+// from 2 to 30 minutes against a 30s AckWait). Without heartbeating, JetStream redelivers
+// while the original is still running, and after MaxDeliver attempts the message is exhausted
+// mid-flight. With more than one consumer replica the redelivery lands on a *different* pod,
+// so the same unit executes twice concurrently.
+//
+// Failures are logged, not propagated: a missed extension costs a redelivery, whereas failing
+// the message would discard work that is still in progress.
+func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, workflowID, runID, nodeID string) func() {
+	if msg == nil || msg.GetJetStreamMsg() == nil {
+		return func() {} // Core NATS or a synthesised message: nothing to extend.
+	}
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(ackHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := msg.InProgress(); err != nil {
+					r.logger.Warn("Failed to extend ack deadline for in-flight message; it may be redelivered while still running",
+						zap.String("stream", r.stream),
+						zap.String("consumer", r.consumer),
+						zap.String("workflow_id", workflowID),
+						zap.String("run_id", runID),
+						zap.String("node_id", nodeID),
+						zap.Error(err))
+					continue
+				}
+				r.logger.Debug("Extended ack deadline for in-flight message",
+					zap.String("stream", r.stream),
+					zap.String("consumer", r.consumer),
+					zap.String("workflow_id", workflowID),
+					zap.String("run_id", runID),
+					zap.String("node_id", nodeID))
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-stopped
+	}
+}
+
 func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error {
 	// Extract workflow information for reporting
 	var workflowID, runID, correlationID string
@@ -708,8 +776,14 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	processSpan.SetAttributes(attribute.String("message.created_at", msg.CreatedAt))
 	defer processSpan.End()
 
+	// Hold the JetStream ack deadline open for as long as Process runs. Without this, any
+	// handler slower than the server's AckWait is redelivered while it is still executing —
+	// see startAckHeartbeat.
+	stopHeartbeat := r.startAckHeartbeat(processCtx, msg, workflowID, runID, nodeID)
+
 	// Process the message
 	resultMessage, processErr := r.processor.Process(processCtx, msg)
+	stopHeartbeat()
 	processingTime := time.Since(start)
 
 	// Add processing time to spans
