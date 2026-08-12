@@ -329,6 +329,20 @@ func (m *Message) Nak() error {
 	return m.jsMsg.Nak()
 }
 
+// InProgress extends the ack deadline, telling NATS the message is still being worked on.
+//
+// Durables are created without an explicit AckWait (see EnsureConsumer), so the server default
+// of 30 seconds applies. Any handler that runs longer than that is redelivered while it is
+// still executing, and after MaxDeliver attempts the message is exhausted mid-flight. Calling
+// this periodically is the only way to hold the deadline open, because existing durables are
+// never modified and so cannot be given a longer AckWait retroactively.
+func (m *Message) InProgress() error {
+	if m.jsMsg == nil {
+		return nil // No JetStream message to extend
+	}
+	return m.jsMsg.InProgress()
+}
+
 // Term terminates the message, indicating it should not be redelivered.
 // Use this when a message cannot be processed and should not be retried.
 func (m *Message) Term() error {
