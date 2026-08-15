@@ -5,6 +5,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -122,6 +123,11 @@ type Runner struct {
 	config                 Config
 	jobChan                chan *message.Message
 	processFailureObserver ProcessFailureObserver
+	// heartbeatKV is the EXECUTION_HEARTBEATS bucket used for the liveness heartbeat and the
+	// claim-per-execution-unit idempotency check (see startAckHeartbeat and claimExecutionUnit).
+	// nil when the bucket could not be created/reached at startup; both mechanisms degrade to
+	// no-ops (heartbeat) or fail-open (claim) when nil rather than blocking processing.
+	heartbeatKV jetstream.KeyValue
 }
 
 // Config controls runner worker pool behavior.
@@ -259,6 +265,39 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 
 	if err := client.Messages.EnsureConsumer(ensureCtx, stream, consumer, runner.consumerFilterSubject); err != nil {
 		return nil, fmt.Errorf("failed to ensure consumer '%s' exists: %w", consumer, err)
+	}
+
+	// Ensure the EXECUTION_HEARTBEATS KV bucket exists. Multiple runners (multiple plugins,
+	// multiple replicas) race this at startup; treat "already exists" as success, the same way
+	// EnsureConsumer above tolerates an existing durable. A missing bucket must not stop the
+	// runner from processing messages — heartbeatKV stays nil and both the heartbeat write and
+	// the claim check degrade gracefully (see startAckHeartbeat and claimExecutionUnit).
+	//
+	// client.JetStream() can be a nil jetstream.JetStream (e.g. client.NewClientWithJSContext,
+	// a test-only constructor that never sets the underlying js handle); calling a method on a
+	// nil interface panics, so guard it the same way a real KV-unreachable error is handled.
+	if client.JetStream() == nil {
+		logger.Warn("JetStream handle not available; EXECUTION_HEARTBEATS heartbeat and claim disabled for this runner")
+	} else if kv, err := client.JetStream().KeyValue(ensureCtx, executionHeartbeatBucket); err == nil {
+		runner.heartbeatKV = kv
+	} else if errors.Is(err, jetstream.ErrBucketNotFound) {
+		kv, createErr := client.JetStream().CreateKeyValue(ensureCtx, jetstream.KeyValueConfig{
+			Bucket: executionHeartbeatBucket,
+			TTL:    executionHeartbeatTTL,
+		})
+		if createErr == nil {
+			runner.heartbeatKV = kv
+		} else if errors.Is(createErr, jetstream.ErrBucketExists) {
+			if kv, getErr := client.JetStream().KeyValue(ensureCtx, executionHeartbeatBucket); getErr == nil {
+				runner.heartbeatKV = kv
+			} else {
+				logger.Warn("EXECUTION_HEARTBEATS bucket exists but could not be opened; heartbeat and claim disabled for this runner", zap.Error(getErr))
+			}
+		} else {
+			logger.Warn("Failed to create EXECUTION_HEARTBEATS bucket; heartbeat and claim disabled for this runner", zap.Error(createErr))
+		}
+	} else {
+		logger.Warn("Failed to reach EXECUTION_HEARTBEATS bucket; heartbeat and claim disabled for this runner", zap.Error(err))
 	}
 
 	// Setup tracing if configuration is provided
@@ -597,6 +636,120 @@ func backgroundWithSpan(span trace.Span) context.Context {
 // A var rather than a const so tests can shorten it; nothing outside this package writes it.
 var ackHeartbeatInterval = 10 * time.Second
 
+// executionHeartbeatBucket is the NATS KV bucket used for the liveness heartbeat Zeus's sweeper
+// polls (see the temporal-removal plan's phase-2) and for the claim-per-execution-unit idempotency
+// check in processMessage. New as of this change; nothing else in Icarus reads or writes it.
+const executionHeartbeatBucket = "EXECUTION_HEARTBEATS"
+
+// executionHeartbeatTTL is how long a heartbeat entry survives with no refresh. Three missed
+// writes (executionHeartbeatEveryNTicks x ackHeartbeatInterval x 3 = 90s) before expiry, so a
+// single missed KV write does not read as a dead pod.
+const executionHeartbeatTTL = 90 * time.Second
+
+// executionHeartbeatEveryNTicks makes the KV write fire every 3rd ack-extension tick (10s x 3 =
+// 30s), per the design doc: one ticker, two cadences, rather than a second time.Ticker.
+const executionHeartbeatEveryNTicks = 3
+
+// executionHeartbeat is the JSON payload written to executionHeartbeatBucket.
+type executionHeartbeat struct {
+	WorkflowID  string `json:"workflow_id"`
+	RunID       string `json:"run_id"`
+	NodeID      string `json:"node_id"`
+	ExecutionID string `json:"execution_id"`
+	Attempt     int    `json:"attempt"`
+	Pod         string `json:"pod"`
+	StartedAt   string `json:"started_at"` // RFC3339, set once per delivery, not per tick
+}
+
+// executionHeartbeatKey builds the EXECUTION_HEARTBEATS key for one execution unit. Dots, not
+// colons, since KV keys become NATS subject tokens internally and ':' is not a valid one.
+func executionHeartbeatKey(workflowID, runID, nodeID string) string {
+	return fmt.Sprintf("%s.%s.%s", workflowID, runID, nodeID)
+}
+
+// deliverAttempt returns msg's JetStream NumDelivered, or 0 if msg has no JetStream handle or the
+// metadata call fails (Core NATS / synthesised messages, or a transient metadata-fetch error).
+func deliverAttempt(msg *message.Message) int {
+	jsMsg := msg.GetJetStreamMsg()
+	if jsMsg == nil {
+		return 0
+	}
+	md, err := jsMsg.Metadata()
+	if err != nil || md == nil {
+		return 0
+	}
+	return int(md.NumDelivered)
+}
+
+// claimExecutionUnit attempts to claim key in kv via Create (not Put), so a second pod racing the
+// same execution unit (a redelivery landing on a different pod while the first pod is still alive
+// and heartbeating) fails the claim instead of running the plugin twice. Returns (true, nil) when
+// this call won the claim, (false, nil) when jetstream.ErrKeyExists (someone else already holds
+// it), and (false, err) for any other error — callers must fail OPEN on that last case: a KV
+// outage must not stop all processing platform-wide.
+func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, hb executionHeartbeat) (bool, error) {
+	payload, err := json.Marshal(hb)
+	if err != nil {
+		return false, err
+	}
+	if _, err := kv.Create(ctx, key, payload); err != nil {
+		if errors.Is(err, jetstream.ErrKeyExists) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// claimOrNak is processMessage's entry-point wrapper around claimExecutionUnit. It returns true
+// when processing should proceed (the claim was won, heartbeatKV is nil, or the claim attempt
+// failed for a reason other than losing the race — fail-open), and false when the message has
+// already been nak'd and processMessage must return without calling Process.
+//
+// Isolated as its own method (rather than inlined in processMessage) so the fail-open and
+// lost-race paths are testable without a real *client.Client — both would otherwise be
+// unreachable in a unit test, since a won claim falls through into Process and the real
+// ReportSuccess/ReportError machinery.
+func (r *Runner) claimOrNak(ctx context.Context, msg *message.Message, workflowID, runID, nodeID, executionID string) bool {
+	if r.heartbeatKV == nil {
+		return true
+	}
+	key := executionHeartbeatKey(workflowID, runID, nodeID)
+	hb := executionHeartbeat{
+		WorkflowID:  workflowID,
+		RunID:       runID,
+		NodeID:      nodeID,
+		ExecutionID: executionID,
+		Attempt:     deliverAttempt(msg),
+		Pod:         os.Getenv("HOSTNAME"),
+		StartedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	claimed, claimErr := claimExecutionUnit(ctx, r.heartbeatKV, key, hb)
+	if claimErr == nil && !claimed {
+		r.logger.Info("Execution unit already claimed by another pod; nak-ing without processing",
+			zap.String("stream", r.stream),
+			zap.String("consumer", r.consumer),
+			zap.String("workflow_id", workflowID),
+			zap.String("run_id", runID),
+			zap.String("node_id", nodeID))
+		if nakErr := msg.Nak(); nakErr != nil {
+			r.logger.Warn("Failed to nak message after losing claim race", zap.Error(nakErr))
+		}
+		return false
+	}
+	if claimErr != nil {
+		// KV unreachable, not ErrKeyExists: fail OPEN. A KV outage must not halt all
+		// processing platform-wide — a broken heartbeat/claim mechanism already looks
+		// identical to "every pod is dead" from Zeus's side, an accepted degradation.
+		r.logger.Warn("Failed to claim execution unit (KV unreachable); processing anyway",
+			zap.String("workflow_id", workflowID),
+			zap.String("run_id", runID),
+			zap.String("node_id", nodeID),
+			zap.Error(claimErr))
+	}
+	return true
+}
+
 // startAckHeartbeat extends the message's ack deadline every ackHeartbeatInterval until the
 // returned stop function is called. Stop is idempotent and waits for the goroutine to exit.
 //
@@ -616,10 +769,19 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 	done := make(chan struct{})
 	stopped := make(chan struct{})
 
+	executionID := ""
+	if msg.Payload != nil {
+		executionID = msg.Payload.ExecutionID
+	}
+	pod := os.Getenv("HOSTNAME")
+	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	key := executionHeartbeatKey(workflowID, runID, nodeID)
+
 	go func() {
 		defer close(stopped)
 		ticker := time.NewTicker(ackHeartbeatInterval)
 		defer ticker.Stop()
+		tick := 0
 		for {
 			select {
 			case <-done:
@@ -643,6 +805,34 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 					zap.String("workflow_id", workflowID),
 					zap.String("run_id", runID),
 					zap.String("node_id", nodeID))
+
+				tick++
+				if r.heartbeatKV == nil || tick%executionHeartbeatEveryNTicks != 0 {
+					continue
+				}
+				hb := executionHeartbeat{
+					WorkflowID:  workflowID,
+					RunID:       runID,
+					NodeID:      nodeID,
+					ExecutionID: executionID,
+					Attempt:     deliverAttempt(msg),
+					Pod:         pod,
+					StartedAt:   startedAt,
+				}
+				payload, marshalErr := json.Marshal(hb)
+				if marshalErr != nil {
+					r.logger.Warn("Failed to marshal execution heartbeat", zap.Error(marshalErr))
+					continue
+				}
+				// Put, not Create: the claim in processMessage already Created this key before
+				// this ticker started, so this pod owns it. Every write here is a refresh.
+				if _, err := r.heartbeatKV.Put(ctx, key, payload); err != nil {
+					r.logger.Warn("Failed to write execution heartbeat; Zeus's sweeper may see this unit as stalled while it is actually running",
+						zap.String("workflow_id", workflowID),
+						zap.String("run_id", runID),
+						zap.String("node_id", nodeID),
+						zap.Error(err))
+				}
 			}
 		}
 	}()
@@ -775,6 +965,14 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	}
 	processSpan.SetAttributes(attribute.String("message.created_at", msg.CreatedAt))
 	defer processSpan.End()
+
+	// Claim this execution unit before doing any work, so a second pod racing the same unit
+	// (a redelivery landing on a different pod while the first pod is still alive and
+	// heartbeating) backs off instead of running the plugin twice. This is the idempotency
+	// replacement for Temporal's deterministic-workflow-ID dedup.
+	if !r.claimOrNak(processCtx, msg, workflowID, runID, nodeID, executionID) {
+		return nil
+	}
 
 	// Hold the JetStream ack deadline open for as long as Process runs. Without this, any
 	// handler slower than the server's AckWait is redelivered while it is still executing —

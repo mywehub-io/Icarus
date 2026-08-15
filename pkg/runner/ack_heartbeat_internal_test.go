@@ -21,6 +21,7 @@ type heartbeatMsg struct {
 
 	data       []byte
 	inProgress atomic.Int64
+	naks       atomic.Int64
 	err        error
 }
 
@@ -37,6 +38,11 @@ func (m *heartbeatMsg) Metadata() (*jetstream.MsgMetadata, error) {
 func (m *heartbeatMsg) InProgress() error {
 	m.inProgress.Add(1)
 	return m.err
+}
+
+func (m *heartbeatMsg) Nak() error {
+	m.naks.Add(1)
+	return nil
 }
 
 // buildMessageFor wraps a jetstream.Msg in an SDK Message so the ack handle is attached,
@@ -64,6 +70,49 @@ func withShortHeartbeat(t *testing.T, d time.Duration) {
 
 func newHeartbeatRunner() *Runner {
 	return &Runner{logger: zap.NewNop(), stream: "TEST", consumer: "test-consumer"}
+}
+
+// fakeHeartbeatKV is a jetstream.KeyValue that only implements Create and Put — everything this
+// package's heartbeat/claim code calls. Unimplemented methods panic via the embedded nil
+// interface, same rationale as heartbeatMsg above.
+type fakeHeartbeatKV struct {
+	jetstream.KeyValue
+
+	mu        sync.Mutex
+	puts      int
+	createErr error // returned by every Create call when set
+	putErr    error // returned by every Put call when set
+}
+
+func (kv *fakeHeartbeatKV) Create(ctx context.Context, key string, value []byte, opts ...jetstream.KVCreateOpt) (uint64, error) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.createErr != nil {
+		return 0, kv.createErr
+	}
+	return 1, nil
+}
+
+func (kv *fakeHeartbeatKV) Put(ctx context.Context, key string, value []byte) (uint64, error) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.puts++
+	if kv.putErr != nil {
+		return 0, kv.putErr
+	}
+	return uint64(kv.puts + 1), nil
+}
+
+func (kv *fakeHeartbeatKV) putCount() int {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	return kv.puts
+}
+
+func newHeartbeatRunnerWithKV(kv jetstream.KeyValue) *Runner {
+	r := newHeartbeatRunner()
+	r.heartbeatKV = kv
+	return r
 }
 
 // TestStartAckHeartbeat_ExtendsUntilStopped is the guard for the redelivery-while-running bug.
@@ -159,4 +208,113 @@ func TestStartAckHeartbeat_StopIsIdempotent(t *testing.T) {
 		go func() { defer wg.Done(); stop() }()
 	}
 	wg.Wait()
+}
+
+// TestStartAckHeartbeat_WritesExecutionHeartbeat asserts the KV write fires on the 3rd
+// ack-extension tick, not every tick, per executionHeartbeatEveryNTicks.
+func TestStartAckHeartbeat_WritesExecutionHeartbeat(t *testing.T) {
+	withShortHeartbeat(t, 5*time.Millisecond)
+
+	jsMsg := &heartbeatMsg{}
+	msg := buildMessageFor(t, jsMsg)
+	kv := &fakeHeartbeatKV{}
+
+	stop := newHeartbeatRunnerWithKV(kv).startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
+	time.Sleep(60 * time.Millisecond) // ~12 ticks at 5ms, so ~4 KV writes expected
+	stop()
+
+	extensions := jsMsg.inProgress.Load()
+	puts := kv.putCount()
+	if puts == 0 {
+		t.Fatalf("expected at least one KV heartbeat write, got none (extensions=%d)", extensions)
+	}
+	// Every write is on a tick that also called msg.InProgress(); the ratio must be roughly
+	// executionHeartbeatEveryNTicks (extensions per put), not 1 (every tick).
+	if extensions > 0 && int(extensions)/puts < executionHeartbeatEveryNTicks-1 {
+		t.Fatalf("KV write fired too often: %d extensions produced %d puts, expected roughly 1 per %d",
+			extensions, puts, executionHeartbeatEveryNTicks)
+	}
+}
+
+// TestStartAckHeartbeat_SurvivesKVWriteFailure mirrors
+// TestStartAckHeartbeat_SurvivesExtensionFailure: a failing KV write must be logged and retried,
+// not stop the heartbeat goroutine (which would also stop the ack-extension half of the tick).
+func TestStartAckHeartbeat_SurvivesKVWriteFailure(t *testing.T) {
+	withShortHeartbeat(t, 5*time.Millisecond)
+
+	jsMsg := &heartbeatMsg{}
+	msg := buildMessageFor(t, jsMsg)
+	kv := &fakeHeartbeatKV{putErr: context.DeadlineExceeded}
+
+	stop := newHeartbeatRunnerWithKV(kv).startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
+	time.Sleep(60 * time.Millisecond)
+	stop()
+
+	if got := jsMsg.inProgress.Load(); got < 2 {
+		t.Fatalf("expected ack-extension to keep running despite KV write failures, got %d extensions", got)
+	}
+	if kv.putCount() == 0 {
+		t.Fatal("expected the heartbeat to keep attempting KV writes despite failures")
+	}
+}
+
+// TestClaimOrNak_LosesClaimRace_NaksWithoutProcessing asserts that when another pod already
+// holds the execution unit's heartbeat key (Create returns ErrKeyExists), claimOrNak naks the
+// message and reports that processing must not proceed.
+func TestClaimOrNak_LosesClaimRace_NaksWithoutProcessing(t *testing.T) {
+	jsMsg := &heartbeatMsg{}
+	msg := buildMessageFor(t, jsMsg)
+	kv := &fakeHeartbeatKV{createErr: jetstream.ErrKeyExists}
+
+	proceed := newHeartbeatRunnerWithKV(kv).claimOrNak(context.Background(), msg, "wf1", "run1", "node1", "exec1")
+
+	if proceed {
+		t.Fatal("expected claimOrNak to report false (do not process) when the claim is already held")
+	}
+	if got := jsMsg.naks.Load(); got != 1 {
+		t.Fatalf("expected exactly one Nak() call, got %d", got)
+	}
+}
+
+// TestClaimOrNak_KVUnreachable_ProcessesAnyway asserts that a KV error other than ErrKeyExists
+// (bucket unreachable, etc.) fails OPEN: processing proceeds rather than being blocked by an
+// unrelated KV outage.
+func TestClaimOrNak_KVUnreachable_ProcessesAnyway(t *testing.T) {
+	jsMsg := &heartbeatMsg{}
+	msg := buildMessageFor(t, jsMsg)
+	kv := &fakeHeartbeatKV{createErr: context.DeadlineExceeded}
+
+	proceed := newHeartbeatRunnerWithKV(kv).claimOrNak(context.Background(), msg, "wf1", "run1", "node1", "exec1")
+
+	if !proceed {
+		t.Fatal("expected claimOrNak to fail open (proceed=true) when the KV is unreachable, not ErrKeyExists")
+	}
+}
+
+// TestClaimOrNak_WinsClaim_Processes is the baseline: a fresh key claims cleanly and processing
+// proceeds.
+func TestClaimOrNak_WinsClaim_Processes(t *testing.T) {
+	jsMsg := &heartbeatMsg{}
+	msg := buildMessageFor(t, jsMsg)
+	kv := &fakeHeartbeatKV{}
+
+	proceed := newHeartbeatRunnerWithKV(kv).claimOrNak(context.Background(), msg, "wf1", "run1", "node1", "exec1")
+
+	if !proceed {
+		t.Fatal("expected claimOrNak to report true (proceed) when the claim is won")
+	}
+}
+
+// TestClaimOrNak_NoHeartbeatKV_ProcessesAnyway guards the nil-bucket degradation: if the
+// EXECUTION_HEARTBEATS bucket could not be reached at startup, claimOrNak must not block
+// processing.
+func TestClaimOrNak_NoHeartbeatKV_ProcessesAnyway(t *testing.T) {
+	jsMsg := &heartbeatMsg{}
+	msg := buildMessageFor(t, jsMsg)
+
+	proceed := newHeartbeatRunner().claimOrNak(context.Background(), msg, "wf1", "run1", "node1", "exec1")
+
+	if !proceed {
+		t.Fatal("expected claimOrNak to proceed when heartbeatKV is nil")
+	}
 }
