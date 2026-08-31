@@ -33,6 +33,83 @@ type SubflowProcessor struct {
 	iterIOAccumulator *iterationIOAccumulator
 	endedMu           sync.Mutex
 	endedEmitted      map[string]bool
+
+	// Accounting for the residual check: which embedded nodes actually ran, and which were
+	// deliberately not run and why. A node in neither set never ran and nobody decided it should not
+	// — see unexecutedNodes. Accumulated across every item of a parent-level iteration, because one
+	// SubflowProcessor is shared by the worker pool.
+	accountMu    sync.Mutex
+	executedNode map[string]bool
+	skippedNode  map[string]string
+}
+
+// Reasons recorded by recordSkipped. A node skipped for one of these was considered and deliberately
+// not run; that is normal control flow, not a fault.
+const (
+	skipReasonGate            = "gate: an event mapping evaluated false, or every source produced error-only output"
+	skipReasonDeeperIteration = "deferred: every mapping belongs to a deeper iteration level"
+)
+
+func (sp *SubflowProcessor) recordExecuted(nodeID string) {
+	sp.accountMu.Lock()
+	defer sp.accountMu.Unlock()
+	if sp.executedNode == nil {
+		sp.executedNode = map[string]bool{}
+	}
+	sp.executedNode[nodeID] = true
+}
+
+func (sp *SubflowProcessor) recordSkipped(nodeID, reason string) {
+	sp.accountMu.Lock()
+	defer sp.accountMu.Unlock()
+	if sp.skippedNode == nil {
+		sp.skippedNode = map[string]string{}
+	}
+	// First reason wins: across a fan-out the first decision is the representative one, and a node
+	// that later runs is covered by executedNode taking precedence in unexecutedNodes.
+	if _, seen := sp.skippedNode[nodeID]; !seen {
+		sp.skippedNode[nodeID] = reason
+	}
+}
+
+// UnexecutedNode is an embedded node that never ran and was never deliberately skipped.
+type UnexecutedNode struct {
+	NodeID          string
+	Label           string
+	PluginType      string
+	SourceEndpoints []string
+}
+
+// unexecutedNodes returns the embedded nodes that neither ran nor were deliberately skipped.
+//
+// A node reaching this list is a contract violation, not a branch that was not taken: something
+// caused it to be filtered out at every iteration depth, so it produced no output, no error and no
+// lifecycle event. That is how an authored array-element path the runtime could not parse removed a
+// node from a run while the run still reported success.
+func (sp *SubflowProcessor) unexecutedNodes() []UnexecutedNode {
+	sp.accountMu.Lock()
+	defer sp.accountMu.Unlock()
+
+	var out []UnexecutedNode
+	for _, config := range sp.nodeConfigs {
+		if sp.executedNode[config.NodeId] {
+			continue
+		}
+		if _, deliberate := sp.skippedNode[config.NodeId]; deliberate {
+			continue
+		}
+		endpoints := make([]string, 0, len(config.FieldMappings))
+		for _, m := range config.FieldMappings {
+			endpoints = append(endpoints, m.SourceNodeId+m.SourceEndpoint)
+		}
+		out = append(out, UnexecutedNode{
+			NodeID:          config.NodeId,
+			Label:           config.Label,
+			PluginType:      config.PluginType,
+			SourceEndpoints: endpoints,
+		})
+	}
+	return out
 }
 
 // NewSubflowProcessor creates a new subflow processor.
@@ -961,10 +1038,21 @@ func (sp *SubflowProcessor) processIterationConcurrent(
 
 // extractItemDataAsMap converts an item to map[string]interface{}
 func (sp *SubflowProcessor) extractItemDataAsMap(item interface{}) map[string]interface{} {
+	return itemAsMap(item)
+}
+
+// itemAsMap is the one place an array element becomes the map shape the node store and the field
+// mapping extractors work in. An element of a primitive array (a string, a number) is not a map, so
+// it is wrapped under "$value" — consistent with the "$items" root-array key, and unwrapped again by
+// buildItemInput's last-segment-is-array branch.
+//
+// Both iteration paths must agree on this: mid-flow iteration has always wrapped, while parent-level
+// iteration used to drop non-map elements instead, which made a fan-out over ["mona", "amir"]
+// silently produce nothing at all.
+func itemAsMap(item interface{}) map[string]interface{} {
 	if m, ok := item.(map[string]interface{}); ok {
 		return m
 	}
-	// Wrap non-map items with $value key (consistent with $items naming)
 	return map[string]interface{}{"$value": item}
 }
 
@@ -1088,6 +1176,7 @@ func (sp *SubflowProcessor) processDepthLevelParallel(
 					Field{Key: "node_id", Value: config.NodeId},
 					Field{Key: "depth", Value: depth},
 				)
+				sp.recordSkipped(config.NodeId, skipReasonGate)
 				result.skipped = true
 				resultChan <- result
 				return
@@ -1100,6 +1189,7 @@ func (sp *SubflowProcessor) processDepthLevelParallel(
 				input, skipDueToDepth = sp.buildItemInput(config, store, *iter, itemIndex)
 				// If all mappings were skipped because they need deeper iteration, skip this execution
 				if skipDueToDepth {
+					sp.recordSkipped(config.NodeId, skipReasonDeeperIteration)
 					result.output = make(map[string]interface{})
 					result.skipped = true
 					resultChan <- result
@@ -1147,6 +1237,7 @@ func (sp *SubflowProcessor) processDepthLevelParallel(
 			go func() {
 				defer close(processDone)
 				startTime := time.Now()
+				sp.recordExecuted(config.NodeId)
 				out = node.Process(procInput)
 				dur = time.Since(startTime).Nanoseconds()
 			}()
@@ -1279,6 +1370,7 @@ func (sp *SubflowProcessor) processSingleNodeAtDepth(
 		sp.logger.Debug("skipping single node at depth",
 			Field{Key: "node_id", Value: config.NodeId},
 		)
+		sp.recordSkipped(config.NodeId, skipReasonGate)
 		return nil
 	}
 
@@ -1289,6 +1381,7 @@ func (sp *SubflowProcessor) processSingleNodeAtDepth(
 		input, skipDueToDepth = sp.buildItemInput(config, store, *iter, itemIndex)
 		// If all mappings were skipped because they need deeper iteration, skip this execution
 		if skipDueToDepth {
+			sp.recordSkipped(config.NodeId, skipReasonDeeperIteration)
 			return nil
 		}
 	} else {
@@ -1327,6 +1420,7 @@ func (sp *SubflowProcessor) processSingleNodeAtDepth(
 	}
 
 	startTime := time.Now()
+	sp.recordExecuted(config.NodeId)
 	out := node.Process(procInput)
 	dur := time.Since(startTime).Nanoseconds()
 
@@ -1459,6 +1553,41 @@ func (sp *SubflowProcessor) emitEmbeddedNodeEndedOnce(_ context.Context, config 
 	}
 	sp.endedEmitted[config.NodeId] = true
 	sp.endedMu.Unlock()
+}
+
+// ReportUnexecutedNodes surfaces every embedded node that never ran and was never deliberately
+// skipped. Call it once, after all of a unit's items have been processed.
+//
+// It does not fail the unit. The run stays whatever its executed nodes made it; what changes is that
+// the node stops being invisible — it gets a warning naming the mappings that failed to resolve, a
+// skipped metric, and a terminal lifecycle event carrying the reason, so it appears in the run's node
+// list rather than being absent from it. Athena's sync manifest treats an absent node as satisfied,
+// which is what let a dropped node finalise a run as completed.
+//
+// Escalating this to an error is a one-line change here, and should wait until the estate is known to
+// be free of workflows that are silently dropping a node today.
+func (sp *SubflowProcessor) ReportUnexecutedNodes(ctx context.Context) []UnexecutedNode {
+	unexecuted := sp.unexecutedNodes()
+	for _, n := range unexecuted {
+		const reason = "node never ran: it was filtered out at every iteration depth and no gate " +
+			"decided to skip it, so none of its field mappings resolved against any source output"
+
+		sp.logger.Warn("embedded node never executed",
+			Field{Key: "parent_node_id", Value: sp.parentNodeId},
+			Field{Key: "node_id", Value: n.NodeID},
+			Field{Key: "label", Value: n.Label},
+			Field{Key: "plugin", Value: n.PluginType},
+			Field{Key: "source_endpoints", Value: n.SourceEndpoints},
+			Field{Key: "workflow_id", Value: sp.workflowID},
+			Field{Key: "run_id", Value: sp.runID},
+			Field{Key: "reason", Value: reason},
+		)
+		if sp.metrics != nil {
+			sp.metrics.RecordSkipped()
+		}
+		sp.emitEmbeddedNodeEnd(ctx, sp.findNodeConfig(n.NodeID), nil, true, reason)
+	}
+	return unexecuted
 }
 
 func (sp *SubflowProcessor) flushAggregatedIterationIO(ctx context.Context) {
