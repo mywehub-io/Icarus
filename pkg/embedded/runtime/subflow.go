@@ -426,7 +426,13 @@ func (sp *SubflowProcessor) nodeConsumesFrom(config EmbeddedNodeConfig, sourceNo
 }
 
 // getNodeIterationDepth determines the iteration depth for a node based on its mappings
-// by counting the number of array markers (//) in source endpoints
+// by counting the number of array markers (//) in source endpoints.
+//
+// Kept as path-shape parsing, not converted to FieldMapping.Iterate (graph-authored-cut phases/
+// 05-elysium-icarus-cutover.md item 7's classification pass): Iterate is a single boolean — it can
+// say a mapping crosses an array boundary, but not how many nested levels deep, which array each
+// level belongs to, or where the boundaries sit relative to each other. Multi-level mid-flow
+// iteration genuinely needs that structure, and "//" in the source endpoint is where it lives.
 func (sp *SubflowProcessor) getNodeIterationDepth(config EmbeddedNodeConfig) int {
 	maxDepth := 0
 
@@ -1518,6 +1524,14 @@ func (sp *SubflowProcessor) mergeIndexedOutputToResult(
 // 4. Source is pre-iteration without array notation -> pass full value (shared)
 // Returns the input map and a boolean indicating if this execution should be skipped
 // (true if all mappings were skipped because they need deeper iteration level)
+//
+// This function only runs for a node already inside an active iteration (iter is established by
+// the caller); both `strings.Contains(m.SourceEndpoint, "//")` checks below choose HOW to extract
+// — single-level field access vs. walking multiple nested array boundaries via
+// ParseNestedArrayPath — not WHETHER to iterate. Kept as path-shape parsing, not converted to
+// FieldMapping.Iterate, for the same reason as getNodeIterationDepth above: a boolean cannot carry
+// which array each nesting level belongs to (graph-authored-cut phases/
+// 05-elysium-icarus-cutover.md item 7's classification pass).
 func (sp *SubflowProcessor) buildItemInput(
 	config EmbeddedNodeConfig,
 	itemStore *NodeOutputStore,

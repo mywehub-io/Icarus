@@ -65,6 +65,24 @@ type Processor interface {
 // does not change the NATS ack outcome based on the observer's return value.
 type ProcessFailureObserver func(ctx context.Context, msg *message.Message, processErr error) error
 
+// Metadata keys the runner sets on msg.Metadata when processErr carries EmbeddedFailureDetail,
+// so a registered ProcessFailureObserver (e.g. pkg/runner/argus's) can tell a structured
+// embedded-node failure apart from a plugin failing before its embedded subflow ever ran.
+const (
+	MetaEmbedFailedNodeID = "embed_failed_node_id"
+	MetaEmbedRootCause    = "embed_root_cause"
+)
+
+// EmbeddedFailureDetail is implemented by an error that names which embedded node inside an
+// execution unit actually failed. A plugin's embedded-node runtime (e.g. Icarus's own
+// pkg/embedded/runtime, wrapped by a plugin's error type) already emits its own node.ended for
+// every embedded node it processed before returning such an error; the runner reads this
+// interface via errors.As so a ProcessFailureObserver can skip re-emitting (and so overwriting)
+// those nodes' real statuses, rather than blanket-marking the whole unit failed.
+type EmbeddedFailureDetail interface {
+	EmbeddedFailureDetail() (failedNodeID, rootCause string)
+}
+
 // RunnerOption configures a Runner at construction time.
 // Options are applied after the Runner struct is initialised and after stream/consumer
 // existence is verified, so option closures may safely reference the resolved config.
@@ -994,6 +1012,22 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		span.SetStatus(codes.Error, processErr.Error())
 		processSpan.RecordError(processErr)
 		processSpan.SetStatus(codes.Error, processErr.Error())
+
+		// Surface which embedded node actually failed (if any) onto msg.Metadata before
+		// ReportError/the failure observer run, so a registered ProcessFailureObserver can
+		// take its safe, no-re-emit path instead of blanket-marking every embedded node in
+		// the unit as failed — which would overwrite nodes that already reported their own,
+		// real "success".
+		var failureDetail EmbeddedFailureDetail
+		if errors.As(processErr, &failureDetail) {
+			if failedNodeID, rootCause := failureDetail.EmbeddedFailureDetail(); failedNodeID != "" {
+				if msg.Metadata == nil {
+					msg.Metadata = make(map[string]string)
+				}
+				msg.Metadata[MetaEmbedFailedNodeID] = failedNodeID
+				msg.Metadata[MetaEmbedRootCause] = rootCause
+			}
+		}
 
 		// Explicitly detect process-timeout vs parent-shutdown vs regular errors so callers
 		// can distinguish "Icarus processTimeout hit" from a genuine plugin error.

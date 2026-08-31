@@ -176,7 +176,15 @@ func mapActionToValue(action string) string {
 // If action is empty or has no mapping, returns normalizedRaw unchanged.
 // When config is empty (nil or []) but action has a mapping, returns minimal {"action": "<value>"}
 // so action-based nodes still work when config was not persisted.
-func InjectActionFromAction(normalizedRaw json.RawMessage, pluginType, action string) json.RawMessage {
+//
+// plugin is the authored plugin identity (EmbeddedNodeConfig.PluginType — the plan's own field
+// name is not renamed, but as of the authored-graph cut it carries the authored `plugin` value).
+// Dispatch stays on the display action string per
+// decisions/action-identity-dispatch.md ("Elysium / Icarus dispatch continues to use the display
+// action string... not as the plugin dispatch key in this cut") — plugin is accepted so a future
+// per-plugin extension of this function does not need a signature change, but it plays no role in
+// today's logic.
+func InjectActionFromAction(normalizedRaw json.RawMessage, plugin, action string) json.RawMessage {
 	if action == "" {
 		return normalizedRaw
 	}

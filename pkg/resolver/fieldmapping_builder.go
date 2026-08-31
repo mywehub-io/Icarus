@@ -712,36 +712,51 @@ func buildInputFromMappings(params BuildInputParams) ([]byte, error) {
 			continue
 		}
 
-		// Check if source has array traversal (//)
-		if strings.Contains(mapping.SourceEndpoint, "//") {
+		// sourceCollectionPath/fieldPath split the source endpoint into "the array" and "the
+		// field inside each element to extract". "//" in the path still names that split
+		// precisely when present — path shape, kept. But a mapping can have Iterate:true with a
+		// source endpoint that carries no "//" at all (the whole endpoint IS the array, e.g. a
+		// STATIC "entries" port with no per-item field drilling): the resolved endpoint's own
+		// iterate flag is the actual authority on whether this fans out, not the path's notation
+		// (graph-authored-cut phases/05-elysium-icarus-cutover.md item 8's acceptance test). In
+		// that case the whole endpoint is the collection and fieldPath is empty — navigateMap("")
+		// returns each element unchanged, so the destination gets the element itself.
+		var sourceCollectionPath, fieldPath string
+		switch {
+		case strings.Contains(mapping.SourceEndpoint, "//"):
 			parts := strings.SplitN(mapping.SourceEndpoint, "//", 2)
-			if len(parts) == 2 {
-				sourceCollectionPath := strings.Trim(parts[0], "/")
-				fieldPath := strings.Trim(parts[1], "/")
+			if len(parts) != 2 {
+				continue
+			}
+			sourceCollectionPath = strings.Trim(parts[0], "/")
+			fieldPath = strings.Trim(parts[1], "/")
+		case mapping.Iterate:
+			sourceCollectionPath = strings.Trim(mapping.SourceEndpoint, "/")
+		default:
+			continue
+		}
 
-				// Check if ALL destination endpoints are simple paths (no //)
-				allSimple := true
-				for _, destEndpoint := range mapping.DestinationEndpoints {
-					if strings.Contains(destEndpoint, "//") {
-						allSimple = false
-						break
-					}
-				}
+		// Check if ALL destination endpoints are simple paths (no //)
+		allSimple := true
+		for _, destEndpoint := range mapping.DestinationEndpoints {
+			if strings.Contains(destEndpoint, "//") {
+				allSimple = false
+				break
+			}
+		}
 
-				if allSimple && len(mapping.DestinationEndpoints) > 0 {
-					key := simpleDestKey{
-						sourceNodeID:     mapping.SourceNodeID,
-						sourceCollection: sourceCollectionPath,
-					}
-					// Add all destination endpoints
-					for _, destEndpoint := range mapping.DestinationEndpoints {
-						simpleDestGroups[key] = append(simpleDestGroups[key], struct {
-							mapping   message.FieldMapping
-							fieldPath string
-							destPath  string
-						}{mapping, fieldPath, destEndpoint})
-					}
-				}
+		if allSimple && len(mapping.DestinationEndpoints) > 0 {
+			key := simpleDestKey{
+				sourceNodeID:     mapping.SourceNodeID,
+				sourceCollection: sourceCollectionPath,
+			}
+			// Add all destination endpoints
+			for _, destEndpoint := range mapping.DestinationEndpoints {
+				simpleDestGroups[key] = append(simpleDestGroups[key], struct {
+					mapping   message.FieldMapping
+					fieldPath string
+					destPath  string
+				}{mapping, fieldPath, destEndpoint})
 			}
 		}
 	}
@@ -876,6 +891,17 @@ func buildInputFromMappings(params BuildInputParams) ([]byte, error) {
 					destKey := strings.TrimPrefix(g.destPath, "/")
 					arrayOfObjectsResult[i][destKey] = fieldValue
 				}
+				continue
+			}
+			// A primitive array element (not an object) with no field path to drill into:
+			// the whole element is the value — the case a plain scalar array port produces
+			// (e.g. iterate:true on a source with no "//" of its own, see the switch above).
+			for _, g := range group {
+				if g.fieldPath != "" {
+					continue
+				}
+				destKey := strings.TrimPrefix(g.destPath, "/")
+				arrayOfObjectsResult[i][destKey] = item
 			}
 		}
 

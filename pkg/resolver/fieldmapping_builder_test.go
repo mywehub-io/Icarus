@@ -6464,3 +6464,161 @@ func TestDeepCopyValue_Scalar(t *testing.T) {
 		t.Error("expected same scalar")
 	}
 }
+
+// =============================================================================
+// Iterate:true with no "//" in the source endpoint — graph-authored-cut phases/
+// 05-elysium-icarus-cutover.md item 8's acceptance test: "the phase's real acceptance test — it
+// is exactly what does not work today." The source endpoint carries no array notation of its own
+// (a STATIC "entries" port, one flat field whose resolved value happens to be an array), but the
+// resolved endpoint's own Iterate flag says it crosses an array boundary. The runtime must still
+// fan out into an array-of-objects, matching a real SFTP-list-style source.
+// =============================================================================
+
+func TestBuildInputFromMappings_IterateTrueNoSlashSlash_ObjectItems_FansOut(t *testing.T) {
+	sourceData := map[string]interface{}{
+		"entries": []interface{}{
+			map[string]interface{}{"name": "fo-a.txt", "size": float64(11)},
+			map[string]interface{}{"name": "fo-b.txt", "size": float64(22)},
+		},
+	}
+
+	params := BuildInputParams{
+		FieldMappings: []message.FieldMapping{
+			{
+				SourceNodeID:         "node-fo-list",
+				SourceEndpoint:       "/entries",
+				DestinationEndpoints: []string{"/path"},
+				DataType:             "FIELD",
+				Iterate:              true,
+			},
+		},
+		SourceResults: map[string]*SourceResult{
+			"node-fo-list": {
+				Status: "success",
+				ProjectedFields: map[string]map[string]interface{}{
+					"node-fo-list": sourceData,
+				},
+			},
+		},
+		UnitNodeID: "node-fo-download",
+	}
+
+	result, err := buildInputFromMappings(params)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var rows []map[string]interface{}
+	if err := json.Unmarshal(result, &rows); err != nil {
+		t.Fatalf("expected a root JSON array, got %s: %v", result, err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %v", len(rows), rows)
+	}
+	// fieldPath is empty for a no-"//" Iterate:true mapping — the whole element is the value.
+	wantFirst := map[string]interface{}{"name": "fo-a.txt", "size": float64(11)}
+	gotFirst, ok := rows[0]["path"].(map[string]interface{})
+	if !ok || gotFirst["name"] != wantFirst["name"] || gotFirst["size"] != wantFirst["size"] {
+		t.Fatalf("row 0 path = %#v, want the whole first entry %#v", rows[0]["path"], wantFirst)
+	}
+	gotSecond, ok := rows[1]["path"].(map[string]interface{})
+	if !ok || gotSecond["name"] != "fo-b.txt" {
+		t.Fatalf("row 1 path = %#v, want entry named fo-b.txt", rows[1]["path"])
+	}
+}
+
+// TestBuildInputFromMappings_IterateTrueNoSlashSlash_PrimitiveItems_FansOut is the same shape but
+// with a plain array of scalars (e.g. a list of filenames) rather than objects — pins the
+// primitive-element fallback added alongside the object-element case.
+func TestBuildInputFromMappings_IterateTrueNoSlashSlash_PrimitiveItems_FansOut(t *testing.T) {
+	sourceData := map[string]interface{}{
+		"names": []interface{}{"fo-a.txt", "fo-b.txt", "fo-c.txt"},
+	}
+
+	params := BuildInputParams{
+		FieldMappings: []message.FieldMapping{
+			{
+				SourceNodeID:         "node-list",
+				SourceEndpoint:       "/names",
+				DestinationEndpoints: []string{"/filename"},
+				DataType:             "FIELD",
+				Iterate:              true,
+			},
+		},
+		SourceResults: map[string]*SourceResult{
+			"node-list": {
+				Status: "success",
+				ProjectedFields: map[string]map[string]interface{}{
+					"node-list": sourceData,
+				},
+			},
+		},
+		UnitNodeID: "node-download",
+	}
+
+	result, err := buildInputFromMappings(params)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var rows []map[string]interface{}
+	if err := json.Unmarshal(result, &rows); err != nil {
+		t.Fatalf("expected a root JSON array, got %s: %v", result, err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d: %v", len(rows), rows)
+	}
+	want := []string{"fo-a.txt", "fo-b.txt", "fo-c.txt"}
+	for i, w := range want {
+		if rows[i]["filename"] != w {
+			t.Fatalf("row %d filename = %v, want %q", i, rows[i]["filename"], w)
+		}
+	}
+}
+
+// TestBuildInputFromMappings_IterateFalseNoSlashSlash_DoesNotFanOut pins "absent means false":
+// the same shape but Iterate:false must produce a single object, not fan out — the array value
+// passes through as one field, exactly as a non-iterating mapping always has.
+func TestBuildInputFromMappings_IterateFalseNoSlashSlash_DoesNotFanOut(t *testing.T) {
+	sourceData := map[string]interface{}{
+		"entries": []interface{}{
+			map[string]interface{}{"name": "fo-a.txt"},
+			map[string]interface{}{"name": "fo-b.txt"},
+		},
+	}
+
+	params := BuildInputParams{
+		FieldMappings: []message.FieldMapping{
+			{
+				SourceNodeID:         "node-fo-list",
+				SourceEndpoint:       "/entries",
+				DestinationEndpoints: []string{"/entries"},
+				DataType:             "FIELD",
+				Iterate:              false,
+			},
+		},
+		SourceResults: map[string]*SourceResult{
+			"node-fo-list": {
+				Status: "success",
+				ProjectedFields: map[string]map[string]interface{}{
+					"node-fo-list": sourceData,
+				},
+			},
+		},
+		UnitNodeID: "node-fo-js",
+	}
+
+	result, err := buildInputFromMappings(params)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var obj map[string]interface{}
+	if err := json.Unmarshal(result, &obj); err != nil {
+		t.Fatalf("expected a single JSON object (no fan-out), got %s: %v", result, err)
+	}
+	arr, ok := obj["entries"].([]interface{})
+	if !ok || len(arr) != 2 {
+		t.Fatalf("expected entries to carry the whole 2-element array as one field, got %#v", obj["entries"])
+	}
+}
