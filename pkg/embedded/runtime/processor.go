@@ -348,9 +348,14 @@ func (p *EmbeddedProcessor) processSingleObject(
 		Data:  enrichedParentOutput,
 	})
 
+	// Account for every embedded node before returning, so one that never ran cannot leave the unit
+	// silently — see SubflowProcessor.ReportUnexecutedNodes. Deliberately after ProcessItem and
+	// before the error check is not an option: a failed item tells us nothing about the rest, so the
+	// report only runs when the item completed.
 	if result.Error != nil {
 		return nil, result.Error
 	}
+	subflow.ReportUnexecutedNodes(ctx)
 
 	// Merge output and items into flat map.
 	// If there are Items, their keys already include path-level indices; do not append [i] again.
@@ -398,12 +403,13 @@ func (p *EmbeddedProcessor) processWithConcurrency(
 		return nil, fmt.Errorf("%w: path '%s' is not an array", ErrNotAnArray, iterCtx.ArrayPath)
 	}
 
-	// Convert to map items
+	// Convert to map items. A primitive array's elements are not maps, so they are wrapped rather
+	// than dropped — see itemAsMap. Dropping them meant len(items) == 0 for ["mona", "amir"], which
+	// took the empty-array branch below and returned the parent's non-array fields with no fan-out
+	// and no error.
 	items := make([]map[string]interface{}, 0, len(rawItems))
 	for _, item := range rawItems {
-		if m, ok := item.(map[string]interface{}); ok {
-			items = append(items, m)
-		}
+		items = append(items, itemAsMap(item))
 	}
 
 	if len(items) == 0 {
@@ -715,6 +721,10 @@ func (p *EmbeddedProcessor) processWithConcurrency(
 	// Flatten array-valued keys into indexed scalar keys (nodeId-/auth[0], nodeId-/auth[1], ...)
 	// so every row can be field-mapped; keep the main array key (parentId-/arrayPath) as-is.
 	flattenArrayKeysInOutput(output, unit.NodeId, iterCtx.ArrayPath)
+
+	// Every item has been processed by now, so the accounting is complete for the unit: a node that
+	// ran for no item at all never ran. See SubflowProcessor.ReportUnexecutedNodes.
+	subflow.ReportUnexecutedNodes(ctx)
 
 	return output, nil
 }

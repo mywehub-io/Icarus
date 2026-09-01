@@ -38,11 +38,6 @@ func (f FieldMapping) IsEvent() bool {
 	return f.DataType == "EVENT"
 }
 
-// HasArrayNotation returns true if the source endpoint contains //
-func (f FieldMapping) HasArrayNotation() bool {
-	return strings.Contains(f.SourceEndpoint, "//")
-}
-
 // Output section names and error-output keys (aligned with execution plan sourceSectionId / endpoints).
 const (
 	SectionDefault            = "default"          // success output section

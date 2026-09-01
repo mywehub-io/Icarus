@@ -13,11 +13,6 @@ import (
 	"go.uber.org/zap"
 )
 
-const (
-	metaEmbedFailedNodeID = "embed_failed_node_id"
-	metaEmbedRootCause    = "embed_root_cause"
-)
-
 // parentLabelFromMessage returns the parent node's label from message metadata (e.g. set by Zeus from unit.Label).
 // Falls back to msg.Node.NodeID when metadata "label" is missing or empty.
 func parentLabelFromMessage(msg *message.Message) string {
@@ -136,8 +131,8 @@ func NewProcessFailureObserver(emitter argusemitter.NodeEndEmitter, logger *zap.
 
 		var failedEmbeddedID, rootCause string
 		if msg.Metadata != nil {
-			failedEmbeddedID = strings.TrimSpace(msg.Metadata[metaEmbedFailedNodeID])
-			rootCause = strings.TrimSpace(msg.Metadata[metaEmbedRootCause])
+			failedEmbeddedID = strings.TrimSpace(msg.Metadata[runner.MetaEmbedFailedNodeID])
+			rootCause = strings.TrimSpace(msg.Metadata[runner.MetaEmbedRootCause])
 		}
 		if rootCause == "" {
 			rootCause = errText

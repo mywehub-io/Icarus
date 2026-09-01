@@ -60,7 +60,14 @@ func (r *DefaultOutputResolver) BuildInputForUnit(
 	return r.buildSingleInput(previousOutput, unit)
 }
 
-// analyzeDestinationStructure determines if destination expects array format.
+// analyzeDestinationStructure determines if the unit's input should be built as an array.
+//
+// A destination path's own "//" is still read as path shape when present — it names the array
+// boundary precisely, so ArrayPath comes from it. But a mapping's resolved iterate flag is the
+// actual authority on whether this unit fans out at all: a mapping can have Iterate:true with a
+// destination path that carries no "//" of its own (graph-authored-cut phases/
+// 05-elysium-icarus-cutover.md item 8's acceptance test), and that must still trigger the array
+// path here — ArrayPath is left empty in that case; buildArrayInput's own "data" default applies.
 func (r *DefaultOutputResolver) analyzeDestinationStructure(mappings []FieldMapping) DestinationStructure {
 	ds := DestinationStructure{}
 
@@ -79,6 +86,10 @@ func (r *DefaultOutputResolver) analyzeDestinationStructure(mappings []FieldMapp
 				}
 				return ds
 			}
+		}
+		if mapping.Iterate && !mapping.IsEvent() {
+			ds.HasArrayDest = true
+			return ds
 		}
 	}
 
@@ -181,8 +192,12 @@ func (r *DefaultOutputResolver) buildArrayInput(
 		if err != nil {
 			return nil, err
 		}
+		arrayPath := destStructure.ArrayPath
+		if arrayPath == "" {
+			arrayPath = "data"
+		}
 		return map[string]interface{}{
-			destStructure.ArrayPath: []interface{}{single},
+			arrayPath: []interface{}{single},
 		}, nil
 	}
 
