@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,17 +15,31 @@ import (
 	"go.uber.org/zap"
 )
 
-// integrationProcessor implements the Processor interface for integration testing
+// integrationProcessor implements the Processor interface for integration testing.
+//
+// Process is invoked from every runner worker goroutine at once, so the recorded
+// messages need a lock. Without one the race detector fails this test on any -race
+// run, which is why the whole package could not be run under -race.
 type integrationProcessor struct {
+	mu                sync.Mutex
 	processedMessages []*message.Message
 	shouldFail        bool
+}
+
+// processed returns a snapshot of what has been recorded so far.
+func (p *integrationProcessor) processed() []*message.Message {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]*message.Message(nil), p.processedMessages...)
 }
 
 func (p *integrationProcessor) Process(ctx context.Context, msg *message.Message) (message.Message, error) {
 	if p == nil {
 		return message.Message{}, errors.New("integration processor is nil")
 	}
+	p.mu.Lock()
 	p.processedMessages = append(p.processedMessages, msg)
+	p.mu.Unlock()
 
 	if p.shouldFail {
 		return message.Message{}, errors.New("integration test failure")
@@ -150,7 +165,7 @@ func TestRunnerIntegration(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify messages were processed
-	if len(processor.processedMessages) == 0 {
+	if len(processor.processed()) == 0 {
 		t.Error("Expected at least one message to be processed")
 	}
 }
@@ -201,7 +216,7 @@ func TestRunnerWithFailingProcessor(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify message was processed (even though it failed)
-	if len(processor.processedMessages) == 0 {
+	if len(processor.processed()) == 0 {
 		t.Error("Expected message to be processed (even if it failed)")
 	}
 }
@@ -232,11 +247,12 @@ func TestEndToEndWorkflow(t *testing.T) {
 	defer cancel()
 	_ = r.Run(ctx)
 
-	if len(processor.processedMessages) != 1 {
-		t.Fatalf("Expected 1 processed message, got %d", len(processor.processedMessages))
+	recorded := processor.processed()
+	if len(recorded) != 1 {
+		t.Fatalf("Expected 1 processed message, got %d", len(recorded))
 	}
 
-	processedMsg := processor.processedMessages[0]
+	processedMsg := recorded[0]
 	if processedMsg.Workflow.WorkflowID != workflowID {
 		t.Errorf("Workflow ID mismatch in processed message: expected %s, got %s",
 			workflowID, processedMsg.Workflow.WorkflowID)

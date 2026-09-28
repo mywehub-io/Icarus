@@ -409,7 +409,8 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 }
 
 // ReportSuccess publishes unit execution result to JetStream result stream.
-// For results <1.5MB, includes full payload inline. For larger results, stores in
+// For results below the resolver's inline threshold (resolver.DefaultMaxInlineBytes,
+// 500KB), includes full payload inline. For larger results, stores in
 // blob storage and includes blob reference.
 func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Message, msg jetstream.Msg) error {
 	startTime := time.Now()
