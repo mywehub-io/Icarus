@@ -40,7 +40,8 @@ type Node struct {
 }
 
 // BlobReference contains information for fetching data from blob storage.
-// When a payload is too large to send inline (>1.5MB), it is uploaded to Azure Blob Storage
+// When a payload exceeds the resolver's inline threshold (resolver.DefaultMaxInlineBytes,
+// 500KB by default and configurable per service), it is uploaded to Azure Blob Storage
 // and a BlobReference is included instead of the raw data.
 type BlobReference struct {
 	URL       string `json:"url"`       // Direct blob URL (for metadata/logging)
@@ -489,8 +490,8 @@ type ResultMessage struct {
 	Status string `json:"status"` // "success", "failed", "skipped"
 
 	// Result data - one of these will be populated based on result size
-	InlineResult  json.RawMessage `json:"inline_result,omitempty"`  // Full result data for small results (<1.5MB)
-	BlobReference *BlobReference  `json:"blob_reference,omitempty"` // Blob reference for large results (>1.5MB)
+	InlineResult  json.RawMessage `json:"inline_result,omitempty"`  // Full result data for results under the inline threshold
+	BlobReference *BlobReference  `json:"blob_reference,omitempty"` // Blob reference for results over the inline threshold
 	Events        json.RawMessage `json:"events,omitempty"`         // Lightweight event outputs used for trigger evaluation
 
 	// Error information (only present when status is "failed")

@@ -7,6 +7,9 @@ import (
 	"strings"
 	"sync"
 
+	"go.uber.org/zap"
+
+	"github.com/wehubfusion/Icarus/pkg/archive"
 	"github.com/wehubfusion/Icarus/pkg/message"
 	"github.com/wehubfusion/Icarus/pkg/storage"
 )
@@ -14,6 +17,16 @@ import (
 // DefaultMaxInlineBytes defines the default threshold (500KB) for inline payloads.
 // This is set below NATS 1MB limit to leave room for message metadata and headers.
 const DefaultMaxInlineBytes = 500 * 1024 // 500KB
+
+// DefaultMaxConcurrentBlobDownloads bounds how many source blobs a single resolve
+// pulls at once.
+//
+// Resolution previously started one goroutine per required file with no limit, so a
+// unit fanning in from many blob-backed sources downloaded all of them simultaneously
+// and held every raw payload until the last one landed. Peak memory was therefore the
+// sum of every source payload, which is a live contributor to the OOM behaviour on the
+// Elysium runner regardless of any format change.
+const DefaultMaxConcurrentBlobDownloads = 4
 
 // ResultMeta contains metadata required to build deterministic blob paths.
 type ResultMeta struct {
@@ -32,8 +45,10 @@ type Result struct {
 
 // Service wraps blob-related helpers so plugins stay blob-agnostic.
 type Service struct {
-	blobClient     storage.BlobStorageClient
-	maxInlineBytes int
+	blobClient         storage.BlobStorageClient
+	maxInlineBytes     int
+	maxConcurrentBlobs int
+	logger             *zap.Logger
 }
 
 // NewService builds a resolver service. If blobClient is nil, only inline resolution works.
@@ -42,9 +57,34 @@ func NewService(blobClient storage.BlobStorageClient, maxInlineBytes int) *Servi
 		maxInlineBytes = DefaultMaxInlineBytes
 	}
 	return &Service{
-		blobClient:     blobClient,
-		maxInlineBytes: maxInlineBytes,
+		blobClient:         blobClient,
+		maxInlineBytes:     maxInlineBytes,
+		maxConcurrentBlobs: DefaultMaxConcurrentBlobDownloads,
 	}
+}
+
+// WithMaxConcurrentBlobDownloads bounds parallel source-blob downloads during one
+// resolve. A non-positive value restores the default.
+func (s *Service) WithMaxConcurrentBlobDownloads(n int) *Service {
+	if n <= 0 {
+		n = DefaultMaxConcurrentBlobDownloads
+	}
+	s.maxConcurrentBlobs = n
+	return s
+}
+
+// WithLogger attaches a logger. Without one the resolver stays silent, which is what
+// existing callers get.
+func (s *Service) WithLogger(l *zap.Logger) *Service {
+	s.logger = l
+	return s
+}
+
+func (s *Service) blobDownloadLimit() int {
+	if s.maxConcurrentBlobs <= 0 {
+		return DefaultMaxConcurrentBlobDownloads
+	}
+	return s.maxConcurrentBlobs
 }
 
 // ResolveInput returns inline data or downloads it from blob storage when a reference is provided.
@@ -61,11 +101,7 @@ func (s *Service) ResolveInput(ctx context.Context, inline []byte, blobRef *mess
 		return nil, fmt.Errorf("resolver: blob client not configured for blob reference resolution")
 	}
 
-	data, err := s.blobClient.DownloadResult(ctx, blobRef.URL)
-	if err != nil {
-		return nil, fmt.Errorf("resolver: failed to download input from blob: %w", err)
-	}
-	return data, nil
+	return s.downloadPayload(ctx, blobRef.URL)
 }
 
 // FieldMappingParams describes how resolver should apply field mappings.
@@ -152,7 +188,7 @@ func (s *Service) ResolveMappedInputWithConsumerGraph(
 						return nil, fmt.Errorf("resolver: blob client not configured")
 					}
 
-					data, err := s.blobClient.DownloadResult(ctx, requiredFile.BlobURL)
+					data, err := s.downloadPayload(ctx, requiredFile.BlobURL)
 					if err != nil {
 						return nil, fmt.Errorf("resolver: failed to download blob file from consumer graph: %w", err)
 					}
@@ -281,41 +317,54 @@ func (s *Service) downloadAndParseBlobFiles(
 		}
 	}
 
-	// Download all files in parallel
+	// Download with bounded concurrency, and parse inside each worker so the raw
+	// payload becomes garbage as soon as its source results are extracted. Holding
+	// every raw blob until the last download finished doubled peak memory for no
+	// benefit: the parsed form is what the caller needs, and the raw bytes were only
+	// ever an intermediate.
 	type downloadResult struct {
-		file *RequiredBlobFile
-		data []byte
-		err  error
+		file   *RequiredBlobFile
+		parsed map[string]*SourceResult
+		err    error
 	}
 
 	var wg sync.WaitGroup
 	results := make([]downloadResult, len(requiredFiles))
+	sem := make(chan struct{}, s.blobDownloadLimit())
 
 	for i, file := range requiredFiles {
 		wg.Add(1)
 		go func(idx int, f *RequiredBlobFile) {
 			defer wg.Done()
-			data, err := s.blobClient.DownloadResult(ctx, f.BlobURL)
-			results[idx] = downloadResult{
-				file: f,
-				data: data,
-				err:  err,
+
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results[idx] = downloadResult{file: f, err: ctx.Err()}
+				return
 			}
+
+			parsed, err := s.fetchSourceResults(ctx, f, sourceNodeIDs, fieldMappings)
+			if err != nil {
+				results[idx] = downloadResult{file: f, err: err}
+				return
+			}
+			results[idx] = downloadResult{file: f, parsed: parsed}
 		}(i, file)
 	}
 
-	// Wait for all downloads to complete
 	wg.Wait()
 
+	// Merge in requiredFiles order. Where two files carry the same node, the later
+	// file wins, which is what the previous sequential loop did — concurrency must not
+	// be allowed to make that outcome depend on completion order.
 	allSourceResults := make(map[string]*SourceResult)
 	for _, result := range results {
 		if result.err != nil {
 			return nil, fmt.Errorf("resolver: failed to download blob file %s: %w", result.file.BlobURL, result.err)
 		}
-
-		// Parse blob to extract source results
-		parsedResults := sourceResultsFromBlob(result.data, sourceNodeIDs, result.file.ContainsNodes)
-		for nodeID, sourceResult := range parsedResults {
+		for nodeID, sourceResult := range result.parsed {
 			allSourceResults[nodeID] = sourceResult
 		}
 	}
@@ -353,18 +402,18 @@ func (s *Service) buildInputFromFieldMappings(
 	return buildInputFromMappings(buildParams)
 }
 
-// sourceResultsFromBlob parses blob data and creates SourceResults for nodes in the file.
-// The blob file contains JSON data for one or more nodes (identified by containsNodes).
-// For each node ID in containsNodes that matches sourceNodeIDs, creates a SourceResult
-// with the blob data in ProjectedFields.
-func sourceResultsFromBlob(blobData []byte, sourceNodeIDs map[string]bool, containsNodes []string) map[string]*SourceResult {
-	if len(blobData) == 0 || len(sourceNodeIDs) == 0 || len(containsNodes) == 0 {
-		return nil
-	}
-
-	// Parse blob as generic JSON object
-	var blobContent map[string]interface{}
-	if err := json.Unmarshal(blobData, &blobContent); err != nil {
+// sourceResultsFromContent builds SourceResults from a flat map.
+//
+// One file can hold several nodes, because embedded nodes are merged into the parent's
+// output before the result is written; containsNodes names them, and a SourceResult is
+// built for each that a mapping actually reads.
+//
+// The map arrives from the archive read path, assembled out of whatever entries the fetch
+// planner selected rather than parsed from one document. That is precisely why the planner
+// has to be conservative: extractNodeDataFromStandardOutputFlat below reconstructs a node
+// from every key carrying its prefix, and silently produces less when given fewer.
+func sourceResultsFromContent(blobContent map[string]interface{}, sourceNodeIDs map[string]bool, containsNodes []string) map[string]*SourceResult {
+	if len(blobContent) == 0 || len(sourceNodeIDs) == 0 || len(containsNodes) == 0 {
 		return nil
 	}
 
@@ -780,13 +829,30 @@ func (s *Service) CreateResult(ctx context.Context, data []byte, meta ResultMeta
 		execID = nodeID
 	}
 
-	blobPath := fmt.Sprintf("results/%s/%s/%s.json",
+	// The inline decision above was made on the payload as given, before any format
+	// choice, so an archive is only ever built on the blob branch. A payload sitting near
+	// the threshold can never be pushed over it by the container's framing.
+	//
+	// Everything written here is an archive, and there is no branch left at this call
+	// site. CreateResult is not only a node-output writer — Artemis's MLLP ingest offloads
+	// a raw HL7 message through it and an HTTP trigger offloads whatever body arrived —
+	// so BuildPayload decides between an addressable document archive and an opaque one
+	// from the payload's own shape. Neither can fail on shape, which matters because the
+	// trigger upload completes before the acknowledgement is written: a refusal here would
+	// cost a message rather than a field.
+	payload, stats, err := archive.BuildPayload(data)
+	if err != nil {
+		return nil, fmt.Errorf("resolver: failed to build result archive: %w", err)
+	}
+
+	blobPath := fmt.Sprintf("results/%s/%s/%s%s",
 		sanitizeBlobPathPart(meta.WorkflowID, "workflow"),
 		sanitizeBlobPathPart(meta.RunID, "run"),
 		sanitizeBlobPathPart(execID, "execution"),
+		archive.Extension,
 	)
 
-	blobURL, err := s.blobClient.UploadResult(ctx, blobPath, data, map[string]string{
+	blobURL, err := s.blobClient.UploadResult(ctx, blobPath, payload, map[string]string{
 		"workflow_id":  meta.WorkflowID,
 		"run_id":       meta.RunID,
 		"execution_id": execID,
@@ -796,10 +862,32 @@ func (s *Service) CreateResult(ctx context.Context, data []byte, meta ResultMeta
 		return nil, fmt.Errorf("resolver: failed to upload result to blob: %w", err)
 	}
 
+	if s.logger != nil {
+		s.logger.Info("result written to blob",
+			zap.String("blob_url", blobURL),
+			zap.Int("total_bytes", len(payload)),
+			zap.Int("document_bytes", len(data)),
+			zap.Bool("used_blob", true),
+			// entry_count is what says whether the high-key-count shape is real in this
+			// deployment. That shape costs heap on open and makes the archive larger than
+			// the document it replaced; both are accepted rather than designed around, on
+			// the basis that this number decides whether a remedy is ever needed.
+			zap.Int("entry_count", stats.EntryCount),
+			zap.Int("array_entry_count", stats.ArrayEntryCount),
+			// An opaque write on a node-output path would mean the document failed the
+			// flat-key shape test and silently lost selective fetch, so it is worth being
+			// able to see the two apart in the logs.
+			zap.Bool("opaque", stats.Opaque),
+		)
+	}
+
 	return &Result{
 		BlobReference: &message.BlobReference{
-			URL:       blobURL,
-			SizeBytes: len(data),
+			URL: blobURL,
+			// The size of what was actually written. Opening an archive over ranged reads
+			// needs the blob's exact length, and a stale or wrong value here surfaces as a
+			// hard 416 rather than a short read.
+			SizeBytes: len(payload),
 		},
 		UsedBlob: true,
 	}, nil

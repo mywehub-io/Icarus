@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	stdstrings "strings"
 	"unicode"
 	"unicode/utf8"
@@ -434,12 +435,27 @@ func getStringMap(m map[string]interface{}, key string, defaultValue map[string]
 	return defaultValue
 }
 
+// extractStringValues returns the string values of m ordered by key.
+//
+// Ordering is not cosmetic here. This feeds concatenate and join whenever no explicit
+// "parts"/"items" list is configured, so ranging over the map directly meant a String
+// Concatenate node produced a differently ordered result on each execution of the same
+// workflow — {"first":"hello","second":"world"} yielded "hello world" or "world hello"
+// at random, which failed TestProcessConcatenate roughly one run in ten. Sorting by key
+// makes the output a function of the input alone, and field order is the only ordering
+// the caller has expressed.
 func extractStringValues(m map[string]interface{}) []string {
-	result := make([]string, 0)
-	for _, v := range m {
-		if s, ok := v.(string); ok {
-			result = append(result, s)
+	keys := make([]string, 0, len(m))
+	for k, v := range m {
+		if _, ok := v.(string); ok {
+			keys = append(keys, k)
 		}
+	}
+	sort.Strings(keys)
+
+	result := make([]string, 0, len(keys))
+	for _, k := range keys {
+		result = append(result, m[k].(string))
 	}
 	return result
 }
