@@ -101,6 +101,13 @@ func (s *Service) readArchive(
 	sourceNodeIDs map[string]bool,
 	mappings []message.FieldMapping,
 ) (map[string]*SourceResult, error) {
+	// Decided before anything is fetched. When every node in the file is read whole, the
+	// planner can only arrive at "every key", so reading the size, the directory and the
+	// manifest first buys nothing: one GET of the blob is the whole cost.
+	if everyNodeReadWhole(f.ContainsNodes, mappings) {
+		return s.readWholeArchive(ctx, f, sourceNodeIDs)
+	}
+
 	size, err := s.blobClient.BlobSize(ctx, f.BlobURL)
 	if err != nil {
 		return nil, fmt.Errorf("resolver: archive size for %s: %w", f.BlobURL, err)
@@ -125,7 +132,7 @@ func (s *Service) readArchive(
 
 	plan := planArchiveFetch(reader, f.ContainsNodes, mappings)
 
-	flat, err := s.materialise(ctx, f, reader, plan, size)
+	flat, err := s.materialise(ctx, f, ra, reader, plan, size)
 	if err != nil {
 		return nil, err
 	}
@@ -137,14 +144,22 @@ func (s *Service) readArchive(
 }
 
 // materialise turns a fetch plan into the flat map, choosing between many ranged reads and
-// one whole-object download.
+// one large one.
 //
-// The whole-file branch is not a fallback for something going wrong; it is the right answer
+// The large-read branch is not a fallback for something going wrong; it is the right answer
 // when the selection approaches the entire payload, where one large request beats a
 // thousand small ones both in latency and in cost.
+//
+// It reads only what opening the archive has not already moved. The directory and manifest
+// are in hand by now, so the branch fetches the entry region, [0, start of the directory),
+// in one ranged GET and serves every entry from it. Downloading the whole blob here, as this
+// once did, moved the directory a second time: about a third of the blob for an archive of
+// many small keys. When the region cannot be located the whole blob is fetched instead,
+// which is what this replaced and always correct.
 func (s *Service) materialise(
 	ctx context.Context,
 	f *RequiredBlobFile,
+	ra *storage.BlobReaderAt,
 	reader *archive.Reader,
 	plan fetchPlan,
 	size int64,
@@ -157,19 +172,48 @@ func (s *Service) materialise(
 		return flat, nil
 	}
 
-	data, err := s.blobClient.DownloadFromURL(ctx, f.BlobURL)
-	if err != nil {
+	end, ok := reader.EntryRegionEnd()
+	if !ok {
+		end = size
+	}
+	if err := ra.Preload(0, end); err != nil {
 		return nil, fmt.Errorf("resolver: download archive %s: %w", f.BlobURL, err)
 	}
-	whole, err := archive.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		return nil, fmt.Errorf("resolver: reopen archive %s: %w", f.BlobURL, err)
-	}
-	flat, err := whole.FlatAll()
+	flat, err := reader.FlatAll()
 	if err != nil {
 		return nil, fmt.Errorf("resolver: read archive %s: %w", f.BlobURL, err)
 	}
 	return flat, nil
+}
+
+// readWholeArchive serves a file whose every node is read whole: one GET, no directory
+// fetched beforehand, every entry read from memory.
+func (s *Service) readWholeArchive(
+	ctx context.Context,
+	f *RequiredBlobFile,
+	sourceNodeIDs map[string]bool,
+) (map[string]*SourceResult, error) {
+	data, err := s.blobClient.DownloadFromURL(ctx, f.BlobURL)
+	if err != nil {
+		return nil, fmt.Errorf("resolver: download archive %s: %w", f.BlobURL, err)
+	}
+	reader, err := archive.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("resolver: read archive %s: %w", f.BlobURL, err)
+	}
+	if reader.IsRaw() {
+		return nil, fmt.Errorf("resolver: %s holds an opaque payload and cannot be read by field mapping; "+
+			"a trigger payload is read whole, not by key", f.BlobURL)
+	}
+	flat, err := reader.FlatAll()
+	if err != nil {
+		return nil, fmt.Errorf("resolver: read archive %s: %w", f.BlobURL, err)
+	}
+
+	size := int64(len(data))
+	s.logArchiveRead(f, size, size, 1, len(flat), fetchPlan{wholeFile: true})
+
+	return sourceResultsFromContent(flat, sourceNodeIDs, f.ContainsNodes), nil
 }
 
 // logArchiveRead records the ratio this whole change exists to move: fields requested

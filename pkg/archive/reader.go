@@ -29,6 +29,11 @@ type Reader struct {
 	// entryOf maps a flat key to the entry name holding it. Identity for every ordinary
 	// key; it differs only for the keys a ZIP name cannot express verbatim.
 	entryOf map[string]string
+
+	// regionEnd is where the entries end and the central directory begins; regionOK
+	// is false when it could not be read. See EntryRegionEnd.
+	regionEnd int64
+	regionOK  bool
 }
 
 // NewReader opens an archive. size must be the blob's exact length, which
@@ -49,6 +54,11 @@ func NewReader(r io.ReaderAt, size int64) (*Reader, error) {
 	for _, f := range zr.File {
 		a.byName[f.Name] = f
 	}
+
+	// Read now, while the directory scan has just left the blob's tail in a ranged
+	// reader's window. Asked later, after the manifest read has moved the window to the
+	// head of the blob, the same 22 bytes would cost a request and evict that window.
+	a.regionEnd, a.regionOK = EntryRegionEnd(r, size)
 
 	// The manifest has to be read before the key set is built, because it is what says
 	// which reserved entries are really payload keys under a generated name.
@@ -108,6 +118,10 @@ func (a *Reader) loadManifest() error {
 	}
 	return nil
 }
+
+// EntryRegionEnd returns where this archive's entries end, read when it was opened.
+// false means unknown; the caller then treats the whole blob as the region.
+func (a *Reader) EntryRegionEnd() (int64, bool) { return a.regionEnd, a.regionOK }
 
 // Names returns every payload entry name — that is, every flat key in the file — in
 // sorted order, with format-internal entries excluded. Answered from the central

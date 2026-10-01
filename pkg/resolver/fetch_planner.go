@@ -101,6 +101,34 @@ func planArchiveFetch(a *archive.Reader, containsNodes []string, mappings []mess
 	return fetchPlan{keys: keys}
 }
 
+// everyNodeReadWhole reports, from the mappings alone, that planArchiveFetch would select
+// every key of every node in the file.
+//
+// It applies only the two tests classifyMapping makes before it looks at the archive, an
+// Iterate mapping and the root endpoint, so it can run before the archive is opened. Each
+// node in containsNodes needs at least one such mapping: a node with none, or with only
+// exact-key mappings, may need a fraction of its keys, and the archive must be planned.
+func everyNodeReadWhole(containsNodes []string, mappings []message.FieldMapping) bool {
+	if len(containsNodes) == 0 {
+		return false
+	}
+	whole := make(map[string]bool, len(containsNodes))
+	for _, m := range mappings {
+		if m.IsEventTrigger || m.SourceNodeID == "" {
+			continue
+		}
+		if m.Iterate || m.SourceEndpoint == "" || m.SourceEndpoint == "/" {
+			whole[m.SourceNodeID] = true
+		}
+	}
+	for _, n := range containsNodes {
+		if !whole[n] {
+			return false
+		}
+	}
+	return true
+}
+
 // classifyMapping decides whether one mapping can be served by a single named entry.
 //
 // It returns (key, true) for an exact-key lookup, and ("", false) when the extraction this

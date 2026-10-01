@@ -27,7 +27,12 @@ type fakeBlobClient struct {
 	hold     time.Duration
 }
 
-func (f *fakeBlobClient) DownloadResult(ctx context.Context, blobURL string) ([]byte, error) {
+// enter records one in-flight read and applies the configured hold. Every read method
+// goes through it, so concurrency and cancellation are measured whichever read the
+// resolver chooses: the archive path reaches a blob through DownloadRange as well as
+// DownloadResult, and a fake that held only one of them would test the route, not the
+// bound.
+func (f *fakeBlobClient) enter(ctx context.Context) (func(), error) {
 	cur := f.inFlight.Add(1)
 	for {
 		peak := f.peak.Load()
@@ -35,15 +40,25 @@ func (f *fakeBlobClient) DownloadResult(ctx context.Context, blobURL string) ([]
 			break
 		}
 	}
-	defer f.inFlight.Add(-1)
+	leave := func() { f.inFlight.Add(-1) }
 
 	if f.hold > 0 {
 		select {
 		case <-time.After(f.hold):
 		case <-ctx.Done():
+			leave()
 			return nil, ctx.Err()
 		}
 	}
+	return leave, nil
+}
+
+func (f *fakeBlobClient) DownloadResult(ctx context.Context, blobURL string) ([]byte, error) {
+	leave, err := f.enter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer leave()
 
 	if err, ok := f.errs[blobURL]; ok {
 		return nil, err
@@ -70,7 +85,13 @@ func (f *fakeBlobClient) UploadResult(_ context.Context, blobPath string, data [
 func (f *fakeBlobClient) DownloadFromURL(ctx context.Context, blobURL string) ([]byte, error) {
 	return f.DownloadResult(ctx, blobURL)
 }
-func (f *fakeBlobClient) DownloadRange(_ context.Context, blobURL string, offset, count int64) ([]byte, error) {
+func (f *fakeBlobClient) DownloadRange(ctx context.Context, blobURL string, offset, count int64) ([]byte, error) {
+	leave, err := f.enter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer leave()
+
 	// Injected failures apply to every read method, not just the whole-object one. The
 	// archive path reaches a blob through BlobSize and DownloadRange, so a fake that only
 	// failed DownloadResult would report a "missing body" error instead of the one the

@@ -140,7 +140,11 @@ func (r *BlobReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		n   int
 		err error
 	)
-	if want >= r.chunkSize {
+	if r.windowCoversRangeLocked(off, want) {
+		// Already held, typically because Preload fetched the span in one request.
+		// Checked before the large-read branch, which would otherwise fetch it again.
+		n = copy(p[:want], r.window[off-r.windowAt:])
+	} else if want >= r.chunkSize {
 		// Large read: go straight to storage. Buffering it would double the memory
 		// for no benefit, since read-ahead cannot help a request this size.
 		var b []byte
@@ -193,6 +197,62 @@ func (r *BlobReaderAt) readCachedLocked(p []byte, off int64) (int, error) {
 		total += copy(p[total:], r.window[inWindow:])
 	}
 	return total, nil
+}
+
+// Preload fetches [off, off+count) in one ranged GET and holds it as the read-ahead
+// window, so every later read inside that span is served from memory.
+//
+// It exists for a caller that knows it is about to read most of a span: one request
+// replaces many anchored windows. The span is clamped to the end of the blob. Bytes the
+// current window already holds at the start of the span are kept rather than fetched
+// again; archive/zip reads the manifest from offset 0 while opening, so for an archive
+// that is the first 64 KiB. A read outside the span re-anchors the window as usual,
+// which drops the preloaded bytes.
+func (r *BlobReaderAt) Preload(off, count int64) error {
+	if off < 0 {
+		return fmt.Errorf("storage: negative offset %d", off)
+	}
+	if count <= 0 || off >= r.size {
+		return nil
+	}
+	if off+count > r.size {
+		count = r.size - off
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var held []byte
+	if r.windowCoversLocked(off) {
+		held = r.window[off-r.windowAt:]
+		if int64(len(held)) >= count {
+			r.window = held[:count]
+			r.windowAt = off
+			return nil
+		}
+	}
+
+	rest := count - int64(len(held))
+	b, err := r.fetchLocked(off+int64(len(held)), rest)
+	if err != nil {
+		return err
+	}
+	if int64(len(b)) < rest {
+		return io.ErrUnexpectedEOF
+	}
+
+	window := make([]byte, 0, count)
+	window = append(window, held...)
+	r.window = append(window, b...)
+	r.windowAt = off
+	return nil
+}
+
+// windowCoversRangeLocked reports whether the whole of [off, off+n) is in the window.
+func (r *BlobReaderAt) windowCoversRangeLocked(off, n int64) bool {
+	return r.windowAt >= 0 &&
+		off >= r.windowAt &&
+		off+n <= r.windowAt+int64(len(r.window))
 }
 
 func (r *BlobReaderAt) windowCoversLocked(off int64) bool {
