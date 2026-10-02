@@ -1,5 +1,13 @@
 # Upgrade guide
 
+## Upgrading to v0.27.0
+
+No action required. v0.27.0 only adds streaming primitives (`archive.Reader.EntryRange`,
+`archive.WriteDocument`, `storage.NewRangeReader`, `resolver.Service.CreateResultStream`,
+`resolver.Service.LocateEntry`). The archive format is unchanged: archives written by
+`CreateResultStream` are byte-identical to those written by `CreateResult`, so readers on
+v0.26.0 read them without change and services can upgrade in any order.
+
 ## Upgrading to v0.21.0
 
 ### Migration to the new `nats.go/jetstream` API (breaking)

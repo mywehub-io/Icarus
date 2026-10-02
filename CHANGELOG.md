@@ -13,6 +13,29 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Added
+
+- `public:` `archive.Reader.EntryRange(key)` returns a STORED entry's byte offset and
+  length within the blob, so a consumer can stream one value with ranged GETs.
+- `public:` `archive.WriteDocument(w, flat, streamed)` writes a document archive to an
+  `io.Writer`, encoding `StreamedValue` byte values to base64 JSON strings while copying.
+  The output is byte-identical to `Build` for the same data; `Build` now delegates to it.
+- `public:` `storage.NewRangeReader` streams a blob byte range as an `io.Reader` in
+  sequential chunks (default 8 MiB) with one chunk of read-ahead. A short or failed range,
+  or a cancelled context, is an error, never a clean EOF.
+- `public:` `resolver.Service.CreateResultStream` is `CreateResult` for documents whose
+  large values are on disk: same inline-or-blob decision, path and archive bytes, with the
+  blob branch encoded straight into `UploadStream`.
+- `public:` `resolver.Service.LocateEntry` reports when a unit's resolved input would be a
+  single archive entry placed at `/payload`, and where that entry is, so the unit can
+  stream it instead of receiving it resolved. It declines every other mapping shape.
+- `public:` `resolver.Service.MaxInlineBytes` and `RangeSource` accessors.
+
+### Changed
+
+- `internal:` `CreateResult`'s blob path and metadata construction moved into a helper
+  shared with `CreateResultStream`. The path and metadata are unchanged.
+
 ## [0.21.0] — 2026-08-10
 
 ### Fixed

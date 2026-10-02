@@ -21,6 +21,8 @@ type fakeBlobClient struct {
 	// uploads records what UploadResult was given, so a test can assert on the bytes that
 	// actually reached storage rather than on what the caller intended to write.
 	uploads map[string][]byte
+	// streamFailAfter makes UploadStream abandon the body after this many bytes.
+	streamFailAfter int64
 
 	inFlight atomic.Int32
 	peak     atomic.Int32
@@ -102,8 +104,17 @@ func (f *fakeBlobClient) BlobSize(_ context.Context, blobURL string) (int64, err
 	}
 	return int64(len(body)), nil
 }
-func (f *fakeBlobClient) UploadStream(context.Context, string, io.Reader, string, map[string]string) (string, error) {
-	return "", errors.New("not used")
+func (f *fakeBlobClient) UploadStream(ctx context.Context, blobPath string, body io.Reader, _ string, metadata map[string]string) (string, error) {
+	if f.streamFailAfter > 0 {
+		// Read part of the body and then give up, the way a failed upload stops reading.
+		_, _ = io.CopyN(io.Discard, body, f.streamFailAfter)
+		return "", errors.New("upload interrupted")
+	}
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return "", err
+	}
+	return f.UploadResult(ctx, blobPath, data, metadata)
 }
 
 func mappingsFor(nodeIDs ...string) []message.FieldMapping {

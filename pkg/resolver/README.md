@@ -49,6 +49,36 @@ Tracks which source nodes supply each consumer node and how to merge their outpu
 Build it with `NewConsumerGraph`, then pass it into `FieldMappingParams` for multi-source
 resolution. (`pkg/resolver/consumer_graph.go`)
 
+## `CreateResultStream`
+
+```go
+func (s *Service) CreateResultStream(ctx context.Context, small map[string]json.RawMessage,
+    streamed map[string]archive.StreamedValue, meta ResultMeta) (*Result, error)
+```
+
+`CreateResult` for a document whose large values are files on disk. `small` holds values
+already in JSON form; each `StreamedValue` is raw bytes, written as a base64 JSON string.
+If the streamed values fit within the inline threshold, the document is built in memory and
+passed to `CreateResult`. Otherwise the archive is encoded straight into `UploadStream`, so
+the value is never held whole. Either way, path, outcome and stored bytes match `CreateResult`
+for the equivalent document. Every key must be a flat node-output key (`<nodeId>-/<path>`).
+(`pkg/resolver/stream.go`)
+
+## `LocateEntry`
+
+```go
+func (s *Service) LocateEntry(ctx context.Context, mappings []message.FieldMapping,
+    cg *ConsumerGraph) (*EntryLocator, bool, error)
+```
+
+Reports whether a unit's resolved input would be exactly `{"payload": V}`, with `V` one
+archive entry (or `{RelPath: entry}` when the mapping names the entry's parent), and where
+that entry sits in its blob. It succeeds only for one data mapping (event mappings are
+ignored) to the single destination `/payload`, with no `//`, no `Iterate`, not a plugin-error
+section, and a source in a consumer-graph blob file. Anything else returns `false` and the
+caller resolves the ordinary way. Stream the entry with `EntryLocator.Open`.
+(`pkg/resolver/stream.go`)
+
 ## `ResultMeta`
 
 ```go

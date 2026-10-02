@@ -137,6 +137,29 @@ func (a *Reader) Size(key string) (int64, bool) {
 	return int64(f.UncompressedSize64), true
 }
 
+// EntryRange returns where a key's value sits within the blob: its first byte's offset
+// and its length. Answered from the central directory plus one local-header read.
+//
+// This is what lets a consumer stream one large value with ranged GETs of its own choosing
+// rather than through Get, which holds the whole value in memory. It relies on the entry
+// being STORED, so the range within the blob is the value byte for byte; any other method
+// is refused rather than handed back as a range of compressed bytes.
+func (a *Reader) EntryRange(key string) (offset, length int64, err error) {
+	entry, ok := a.entryOf[key]
+	if !ok {
+		return 0, 0, fmt.Errorf("archive: entry %q not found", key)
+	}
+	f := a.byName[entry]
+	if f.Method != zip.Store {
+		return 0, 0, fmt.Errorf("archive: entry %q uses method %d, not STORED", key, f.Method)
+	}
+	offset, err = f.DataOffset()
+	if err != nil {
+		return 0, 0, fmt.Errorf("archive: locate entry %q: %w", key, err)
+	}
+	return offset, int64(f.UncompressedSize64), nil
+}
+
 // IsArray reports whether a key's value is a JSON array, from the manifest.
 //
 // This is the fact the "//" classification turns on and that an entry name cannot carry:
