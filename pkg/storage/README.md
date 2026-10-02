@@ -31,6 +31,19 @@ func NewAzureBlobClient(connectionString, containerName string, logger *zap.Logg
 Shared-key credential client. Supports `http://` endpoints (Azurite) for local development.
 The container is created lazily on the first upload.
 
+## `RangeReader`
+
+```go
+func NewRangeReader(ctx context.Context, src RangeDownloader, blobURL string, offset, length, chunk int64) (*RangeReader, error)
+```
+
+Streams `[offset, offset+length)` of a blob as an `io.Reader` through sequential ranged
+GETs of `chunk` bytes (default `DefaultRangeChunkBytes`, 8 MiB), fetching one chunk ahead.
+Memory is bounded at about three chunks. A short range, a failed GET or a cancelled context
+surfaces as an error, never as a clean EOF. Always call `Close`. Use it for one long
+sequential read; `BlobReaderAt` suits archive/zip's scattered small reads.
+(`pkg/storage/range_reader.go`)
+
 ## Blob path convention
 
 Icarus stores results under:

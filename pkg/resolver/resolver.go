@@ -815,18 +815,9 @@ func (s *Service) CreateResult(ctx context.Context, data []byte, meta ResultMeta
 		}, nil
 	}
 
-	if meta.WorkflowID == "" || meta.RunID == "" {
-		return nil, fmt.Errorf("resolver: workflow metadata required for blob result")
-	}
-
-	nodeID := meta.NodeID
-	if nodeID == "" {
-		nodeID = "unknown-node"
-	}
-
-	execID := meta.ExecutionID
-	if execID == "" {
-		execID = nodeID
+	blobPath, metadata, err := resultBlobLocation(meta)
+	if err != nil {
+		return nil, err
 	}
 
 	// The inline decision above was made on the payload as given, before any format
@@ -845,19 +836,7 @@ func (s *Service) CreateResult(ctx context.Context, data []byte, meta ResultMeta
 		return nil, fmt.Errorf("resolver: failed to build result archive: %w", err)
 	}
 
-	blobPath := fmt.Sprintf("results/%s/%s/%s%s",
-		sanitizeBlobPathPart(meta.WorkflowID, "workflow"),
-		sanitizeBlobPathPart(meta.RunID, "run"),
-		sanitizeBlobPathPart(execID, "execution"),
-		archive.Extension,
-	)
-
-	blobURL, err := s.blobClient.UploadResult(ctx, blobPath, payload, map[string]string{
-		"workflow_id":  meta.WorkflowID,
-		"run_id":       meta.RunID,
-		"execution_id": execID,
-		"node_id":      nodeID,
-	})
+	blobURL, err := s.blobClient.UploadResult(ctx, blobPath, payload, metadata)
 	if err != nil {
 		return nil, fmt.Errorf("resolver: failed to upload result to blob: %w", err)
 	}
@@ -890,6 +869,37 @@ func (s *Service) CreateResult(ctx context.Context, data []byte, meta ResultMeta
 			SizeBytes: len(payload),
 		},
 		UsedBlob: true,
+	}, nil
+}
+
+// resultBlobLocation is where a unit's result blob goes and the metadata it carries. Shared
+// by CreateResult and CreateResultStream so both write to the same path for the same unit.
+func resultBlobLocation(meta ResultMeta) (string, map[string]string, error) {
+	if meta.WorkflowID == "" || meta.RunID == "" {
+		return "", nil, fmt.Errorf("resolver: workflow metadata required for blob result")
+	}
+
+	nodeID := meta.NodeID
+	if nodeID == "" {
+		nodeID = "unknown-node"
+	}
+
+	execID := meta.ExecutionID
+	if execID == "" {
+		execID = nodeID
+	}
+
+	blobPath := fmt.Sprintf("results/%s/%s/%s%s",
+		sanitizeBlobPathPart(meta.WorkflowID, "workflow"),
+		sanitizeBlobPathPart(meta.RunID, "run"),
+		sanitizeBlobPathPart(execID, "execution"),
+		archive.Extension,
+	)
+	return blobPath, map[string]string{
+		"workflow_id":  meta.WorkflowID,
+		"run_id":       meta.RunID,
+		"execution_id": execID,
+		"node_id":      nodeID,
 	}, nil
 }
 
