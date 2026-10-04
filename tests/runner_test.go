@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/wehubfusion/Icarus/pkg/client"
 	sdkerrors "github.com/wehubfusion/Icarus/pkg/errors"
 	"github.com/wehubfusion/Icarus/pkg/message"
@@ -83,13 +84,6 @@ func (m *mockClientWrapper) setConsumerErrorBudget(err error, budget int) {
 	m.mockJS.setConsumerErrorBudget(err, budget)
 }
 
-func (m *mockClientWrapper) stopActiveConsumes() int {
-	return m.mockJS.stopActiveConsumes()
-}
-
-func (m *mockClientWrapper) consumeStartCount() int {
-	return m.mockJS.consumeStartCount()
-}
 
 func (m *mockClientWrapper) setReportError(err error) {
 	m.mockJS.setReportError(err)
@@ -319,53 +313,32 @@ func TestRunner_recoversFromConsumerFailure(t *testing.T) {
 	}
 }
 
-// TestRunner_restartsConsumeOnClosedWithoutErrHandler verifies that when Consume
-// stops and Closed() fires without an ErrHandler callback (as nats.go does for
-// e.g. consumer deleted), the supervision loop starts a new Consume and keeps
-// processing — matching the old pull-loop continuous-retry behaviour.
-func TestRunner_restartsConsumeOnClosedWithoutErrHandler(t *testing.T) {
+// TestRunner_resolvesConsumerAgainAfterFetchFailure verifies that when a fetch fails because
+// the consumer was deleted, the runner looks the consumer up again and keeps processing.
+func TestRunner_resolvesConsumerAgainAfterFetchFailure(t *testing.T) {
 	mockClient := newMockClient()
 	mockProc := &mockProcessor{}
 	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewRunner failed: %v", err)
 	}
+	mockClient.mockJS.failNextFetches(jetstream.ErrConsumerDeleted)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	done := make(chan error, 1)
 	go func() { done <- r.Run(ctx) }()
 
-	mockClient.addMessage(message.NewMessage().WithPayload("before-stop"))
-	deadline := time.Now().Add(3 * time.Second)
+	mockClient.addMessage(message.NewMessage().WithPayload("after-failure"))
+	deadline := time.Now().Add(5 * time.Second)
 	for mockProc.getCallCount() < 1 {
 		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for first message before Consume stop")
+			t.Fatalf("timed out waiting for a message after the fetch failure; lookups=%d", mockClient.mockJS.consumerResolutions())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	startsBefore := mockClient.consumeStartCount()
-	if startsBefore < 1 {
-		t.Fatalf("expected at least one Consume start, got %d", startsBefore)
-	}
-
-	if n := mockClient.stopActiveConsumes(); n < 1 {
-		t.Fatalf("expected to stop at least one active Consume, stopped %d", n)
-	}
-
-	mockClient.addMessage(message.NewMessage().WithPayload("after-restart"))
-	deadline = time.Now().Add(5 * time.Second)
-	for mockProc.getCallCount() < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for message after Closed()-triggered restart; calls=%d consumeStarts=%d",
-				mockProc.getCallCount(), mockClient.consumeStartCount())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if mockClient.consumeStartCount() <= startsBefore {
-		t.Fatalf("expected a new Consume after Closed(), starts before=%d after=%d",
-			startsBefore, mockClient.consumeStartCount())
+	if got := mockClient.mockJS.consumerResolutions(); got < 2 {
+		t.Fatalf("consumer lookups = %d, want a second lookup after ErrConsumerDeleted", got)
 	}
 
 	cancel()
@@ -374,6 +347,80 @@ func TestRunner_restartsConsumeOnClosedWithoutErrHandler(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("runner did not exit after cancel")
 	}
+}
+
+// TestRunner_fetchesOnlyForIdleWorkers is the guard for prefetching. Messages the runner cannot
+// start yet must stay undelivered in the stream: delivered ones have an ack deadline running and
+// use a delivery attempt while they wait, and no other replica can take them.
+func TestRunner_fetchesOnlyForIdleWorkers(t *testing.T) {
+	mockClient := newMockClient()
+	release := make(chan struct{})
+	proc := &blockingProcessor{release: release}
+	r, err := runner.NewRunner(mockClient.Client, proc, "test-stream", "test-consumer", 10, 30*time.Second, createTestLogger(), nil, &runner.Config{WorkerCount: 2, QueueSize: 50})
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		mockClient.addMessage(message.NewMessage().WithPayload("job"))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for proc.started() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for both workers to start; started=%d", proc.started())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond) // give a prefetching runner the chance to over-fetch
+
+	if got := mockClient.mockJS.queued(); got != 4 {
+		t.Fatalf("undelivered messages while both workers are busy = %d, want 4", got)
+	}
+	for _, n := range mockClient.mockJS.fetchBatchSizes() {
+		if n > 2 {
+			t.Fatalf("a fetch asked for %d messages with 2 workers", n)
+		}
+	}
+
+	close(release)
+	deadline = time.Now().Add(5 * time.Second)
+	for proc.started() < 6 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the remaining messages; started=%d", proc.started())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+}
+
+// blockingProcessor holds every Process call until release is closed.
+type blockingProcessor struct {
+	release <-chan struct{}
+	mu      sync.Mutex
+	n       int
+}
+
+func (p *blockingProcessor) Process(ctx context.Context, msg *message.Message) (message.Message, error) {
+	p.mu.Lock()
+	p.n++
+	p.mu.Unlock()
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+	}
+	return *msg, nil
+}
+
+func (p *blockingProcessor) started() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.n
 }
 
 func TestRunnerRunWithConsumerError(t *testing.T) {
@@ -598,7 +645,7 @@ func TestRunnerProcessFailureObserverInternalError(t *testing.T) {
 		WithMetadata("client_id", "client-1").
 		WithNode("parent-node", map[string]interface{}{}).
 		WithPayload(`{}`)
-	mockClient.addMessage(testMsg)
+	mockClient.mockJS.addMessageOnAttempt(testMsg, 5) // the last attempt reports
 
 	mockProc := &mockProcessor{
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
@@ -625,6 +672,133 @@ func TestRunnerProcessFailureObserverInternalError(t *testing.T) {
 	}
 }
 
+// A transient failure with attempts left is retried: nothing is published to Zeus, the observer
+// is not told, and the message is nak'd with the first backoff delay. Zeus records the first
+// failed result it receives as final, so publishing one here would end the node before the
+// retry could succeed.
+func TestRunnerTransientFailureRetriesWithoutReporting(t *testing.T) {
+	var observerCalls atomic.Int32
+	mockClient := newMockClient()
+	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
+		WithMetadata("execution_id", "wf-1-node-1-123").
+		WithNode("parent-node", map[string]interface{}{}).
+		WithPayload(`{}`)
+	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 1)
+
+	mockProc := &mockProcessor{
+		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
+			return message.Message{}, errors.New("secret store briefly unavailable")
+		},
+	}
+	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil,
+		runner.WithProcessFailureObserver(func(ctx context.Context, msg *message.Message, processErr error) error {
+			observerCalls.Add(1)
+			return nil
+		}))
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	if got := mockClient.mockJS.publishedResults(t); len(got) != 0 {
+		t.Fatalf("published %d results for a retried failure, want 0", len(got))
+	}
+	if got := jsMsg.delayedNaks(); len(got) != 1 || got[0] != 5*time.Second {
+		t.Fatalf("NakWithDelay calls = %v, want [5s]", got)
+	}
+	if jsMsg.wasNakked() || jsMsg.wasAcked() || jsMsg.wasTermed() {
+		t.Fatal("a retried message must only be nak'd with a delay")
+	}
+	if observerCalls.Load() != 0 {
+		t.Fatalf("observer calls = %d, want 0 until the final attempt", observerCalls.Load())
+	}
+}
+
+// The last attempt reports the transient failure once, as final: not retryable, with its attempt
+// number, and the message is terminated rather than nak'd.
+func TestRunnerTransientFailureOnLastAttemptReportsFinal(t *testing.T) {
+	mockClient := newMockClient()
+	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
+		WithMetadata("execution_id", "wf-1-node-1-123").
+		WithNode("parent-node", map[string]interface{}{}).
+		WithPayload(`{}`)
+	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 5)
+
+	mockProc := &mockProcessor{
+		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
+			return message.Message{}, errors.New("secret store still unavailable")
+		},
+	}
+	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	results := mockClient.mockJS.publishedResults(t)
+	if len(results) != 1 {
+		t.Fatalf("published %d results, want 1", len(results))
+	}
+	res := results[0]
+	if res.Status != "failed" || res.Error == nil || res.Error.Retryable || res.Attempt != 5 {
+		t.Fatalf("result = status %q, error %+v, attempt %d; want failed, not retryable, attempt 5", res.Status, res.Error, res.Attempt)
+	}
+	if !jsMsg.wasTermed() || jsMsg.wasNakked() {
+		t.Fatalf("final transient failure: termed=%v nakked=%v, want termed only", jsMsg.wasTermed(), jsMsg.wasNakked())
+	}
+}
+
+// A plugin that succeeded but whose result could not be published is retried like a transient
+// failure: no failed result reaches Zeus while attempts remain, so the retry can still deliver
+// the real result.
+func TestRunnerResultPublishFailureRetriesWithoutReporting(t *testing.T) {
+	mockClient := newMockClient()
+	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
+		WithMetadata("execution_id", "wf-1-node-1-123").
+		WithNode("parent-node", map[string]interface{}{}).
+		WithPayload(`{}`)
+	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 1)
+	mockClient.setReportError(errors.New("results stream unavailable"))
+
+	mockProc := &mockProcessor{
+		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
+			out := message.NewWorkflowMessage("wf-1", "run-1").WithPayload(`{"ok":true}`)
+			out.Payload.ExecutionID = "wf-1-node-1-123"
+			return *out, nil
+		},
+	}
+	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil && len(jsMsg.delayedNaks()) == 0 && !jsMsg.wasNakked() && !jsMsg.wasTermed() {
+			time.Sleep(50 * time.Millisecond)
+		}
+		cancel()
+	}()
+	_ = r.Run(ctx)
+
+	if got := mockClient.mockJS.publishedResults(t); len(got) != 0 {
+		t.Fatalf("published %d results, want 0 while attempts remain", len(got))
+	}
+	if got := jsMsg.delayedNaks(); len(got) != 1 || got[0] != 5*time.Second {
+		t.Fatalf("NakWithDelay calls = %v, want [5s]", got)
+	}
+	if jsMsg.wasNakked() || jsMsg.wasAcked() || jsMsg.wasTermed() {
+		t.Fatal("an unpublished result must only be retried with a delay")
+	}
+}
+
 func TestRunnerProcessFailureObserverPlainError(t *testing.T) {
 	var observerCalls atomic.Int32
 	mockClient := newMockClient()
@@ -633,7 +807,7 @@ func TestRunnerProcessFailureObserverPlainError(t *testing.T) {
 		WithMetadata("client_id", "client-1").
 		WithNode("parent-node", map[string]interface{}{}).
 		WithPayload(`{}`)
-	mockClient.addMessage(testMsg)
+	mockClient.mockJS.addMessageOnAttempt(testMsg, 5) // the last attempt reports
 
 	mockProc := &mockProcessor{
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {

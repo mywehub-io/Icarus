@@ -13,6 +13,45 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Changed
+
+- `public:` The runner fetches only as many messages as it has idle workers (capped at
+  `batchSize`) instead of consuming into a buffered job queue. `Config.QueueSize` is ignored.
+  Messages waiting for a worker stay undelivered, so they no longer use delivery attempts or
+  ack deadlines, and other replicas can take them.
+- `public:` A transient processing error with delivery attempts left is retried with backoff
+  (`NakWithDelay` 5 s, 15 s, 30 s, 60 s) and not reported. The last attempt reports it once,
+  not retryable, and terminates the message. `ProcessFailureObserver` runs only for a reported
+  failure.
+- `public:` `EXECUTION_HEARTBEATS` entries carry a `state` (`running`, `retrying`, `done`) and
+  `retry_at`. A retry, a dead pod's unit (no write for 60 s) or a new dispatch takes the claim
+  over with a revision-checked update; a delivery that finds the unit running elsewhere is nak'd
+  with a 30 s delay; a duplicate of a completed execution is terminated.
+- `public:` `ReportSuccess` no longer publishes a failed result or naks when the result cannot
+  be published. It returns an error wrapping `message.ErrResultNotPublished` and leaves the
+  message unsettled; if the result was published but the ack failed, the error wraps
+  `message.ErrAckAfterPublish`. The runner retries an unpublished result like a transient
+  failure and marks a published one done.
+- `public:` A unit cancelled by runner shutdown is nak'd for immediate redelivery and not
+  reported, unless it was on its last attempt. A message picked up after shutdown began is
+  nak'd instead of waiting out its ack deadline.
+
+### Added
+
+- `public:` `message.ErrResultNotPublished`, `message.ErrAckAfterPublish`,
+  `message.ReportErrorOption`, `message.WithAttempt`, `message.FinalAttempt`,
+  `message.IsTransientError`, `Message.NakWithDelay` and `ResultMessage.Attempt`.
+
+### Fixed
+
+- `public:` Transient failures were never retried: the failed result reached the result
+  consumer on the first attempt, and every redelivery found the unit's claim still held and was
+  nak'd at once, using up `MaxDeliver` within milliseconds.
+
+## [0.27.0] — 2026-10-02
+
+Releases 0.22.0 to 0.26.0 have no entries here; see their tags.
+
 ### Added
 
 - `public:` `archive.Reader.EntryRange(key)` returns a STORED entry's byte offset and

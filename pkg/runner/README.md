@@ -54,7 +54,7 @@ Your business logic goes here. Return `error` to trigger `ReportError`; return a
 | `processor` | Your `Processor` implementation |
 | `stream` | JetStream stream name; created if it does not exist |
 | `consumer` | JetStream consumer (durable) name; created if it does not exist |
-| `batchSize` | Max in-flight pull request size (`jetstream.PullMaxMessages`) |
+| `batchSize` | Cap on messages per fetch; a fetch never asks for more than the idle workers |
 | `processTimeout` | Per-message deadline added on top of the parent context |
 | `logger` | Required `*zap.Logger` |
 | `tracingConfig` | Optional OTel tracing; pass nil to disable |
@@ -66,9 +66,13 @@ Your business logic goes here. Return `error` to trigger `ReportError`; return a
 ```go
 type Config struct {
     WorkerCount int // 0 → ICARUS_RUNNER_WORKERS env → ICARUS_RUNNER_WORKER_MULTIPLIER × GOMAXPROCS → GOMAXPROCS
-    QueueSize   int // 0 → 4×WorkerCount (min WorkerCount, max 1000)
+    QueueSize   int // ignored since v0.28.0
 }
 ```
+
+The runner fetches only as many messages as it has idle workers and hands each straight to
+one. A message it cannot start yet stays undelivered in the stream: no ack deadline runs on it,
+no delivery attempt is used, and another replica with a free worker can take it.
 
 Environment overrides:
 
@@ -81,12 +85,35 @@ Environment overrides:
 
 ## Error reporting
 
-When `Process` returns an error:
+When `Process` returns a transient error and delivery attempts remain, the runner retries:
+it marks the unit `retrying` in `EXECUTION_HEARTBEATS` and naks the message with a delay
+(5 s, 15 s, 30 s, then 60 s). Nothing is reported.
 
-1. `ReportError` publishes a failure result to the result subject with a 10-minute timeout
-   (to handle slow Temporal signal delivery). On failure, one automatic retry after 2 s.
-2. The original message is acknowledged (so JetStream does not redeliver).
+On a permanent error, or the last attempt:
+
+1. `ReportError` publishes a failure result to the result subject, with its attempt number,
+   with a 10-minute timeout. On failure, one automatic retry after 2 s.
+2. The original message is acknowledged (permanent) or terminated (transient), so JetStream
+   does not redeliver it.
 3. `ProcessFailureObserver` is called (if registered) for side effects like Argus `node.ended` emission.
+
+See `docs/error-handling-patterns.md`.
+
+## Execution claim
+
+Before running a unit the runner claims it in the `EXECUTION_HEARTBEATS` KV bucket (key
+`<workflow>.<run>.<node>`, 90 s TTL). The entry's `state` decides what a later delivery does:
+
+| Entry | Delivery |
+|---|---|
+| none | Creates the entry and runs |
+| `retrying` | Takes over (revision-checked `Update`) and runs |
+| `running`, no write for 60 s | Takes over: the owning pod is presumed dead |
+| `running`, fresh | Nak'd with a 30 s delay: another worker is running it |
+| `done`, same execution ID | Terminated: a duplicate of a completed execution |
+| `done`, other execution ID | Takes over: Zeus dispatched the node again |
+
+While running, the entry is refreshed every 30 s. A KV error fails open: the unit runs.
 
 ## `ProcessFailureObserver`
 
@@ -94,7 +121,8 @@ When `Process` returns an error:
 type ProcessFailureObserver func(ctx context.Context, msg *message.Message, processErr error) error
 ```
 
-Called after every successful `ReportError`. Use to emit Argus observation events on failure.
+Called after `ReportError` publishes a failure: once per unit, never for a failure that is
+being retried. Use to emit Argus observation events on failure.
 Register with `WithProcessFailureObserver`:
 
 ```go

@@ -44,17 +44,17 @@ Reconnects when the NATS TCP connection is missing or closed. Safe for concurren
 
 | Parameter | Type | Description |
 |---|---|---|
-| `batchSize` | `int` | Max messages per pull request (`jetstream.PullMaxMessages`); must be > 0 |
+| `batchSize` | `int` | Cap on messages per fetch; a fetch never asks for more than the idle workers. Must be > 0 |
 | `processTimeout` | `time.Duration` | Per-message deadline; must be > 0 |
 | `tracingConfig` | `*TracingConfig` | nil disables OTel tracing |
-| `cfg` | `*Config` | nil uses `DefaultConfig()` (workers = GOMAXPROCS, queue = 4×workers) |
+| `cfg` | `*Config` | nil uses `DefaultConfig()` (workers = GOMAXPROCS) |
 
 ## `runner.Config`
 
 ```go
 type Config struct {
     WorkerCount int // explicit goroutine count; 0 = auto-detect
-    QueueSize   int // job queue depth; 0 = 4×WorkerCount (min WorkerCount, max 1000)
+    QueueSize   int // ignored since v0.28.0: the runner fetches only for idle workers
 }
 ```
 

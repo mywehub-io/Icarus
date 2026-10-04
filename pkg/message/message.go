@@ -344,6 +344,15 @@ func (m *Message) InProgress() error {
 	return m.jsMsg.InProgress()
 }
 
+// NakWithDelay negatively acknowledges the message and asks the server to redeliver it no
+// sooner than delay. The redelivery still counts towards the consumer's MaxDeliver.
+func (m *Message) NakWithDelay(delay time.Duration) error {
+	if m.jsMsg == nil {
+		return nil // No JetStream message to nak
+	}
+	return m.jsMsg.NakWithDelay(delay)
+}
+
 // Term terminates the message, indicating it should not be redelivered.
 // Use this when a message cannot be processed and should not be retried.
 func (m *Message) Term() error {
@@ -496,6 +505,11 @@ type ResultMessage struct {
 
 	// Error information (only present when status is "failed")
 	Error *ResultError `json:"error,omitempty"`
+
+	// Attempt is the JetStream delivery attempt that produced this result (NumDelivered), or 0
+	// when unknown. A failed result is published once, by the last attempt: earlier transient
+	// failures are retried by the runner and never reported (see runner.processMessage).
+	Attempt int `json:"attempt,omitempty"`
 
 	// Metadata
 	PluginType      string `json:"plugin_type,omitempty"`       // Plugin type that processed the node

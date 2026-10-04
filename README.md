@@ -13,9 +13,9 @@ A clean, future-proof Go SDK for messaging over NATS JetStream with idiomatic pa
 - **Central Client**: Single client provides access to all JetStream services with automatic initialization
 - **JetStream Messaging Patterns**:
   - Result publishing (JetStream-backed persistence)
-  - Continuous consumption via `consumer.Consume()` with built-in backpressure
+  - Fetch-on-demand consumption: the runner pulls only as many messages as it has idle workers
   - Concurrent message processing with worker pools (Runner)
-- **Runner Framework**: Built-in concurrent message processing with configurable worker pools and automatic success/error callback reporting; optional `ProcessFailureObserver` after every successful `ReportError`
+- **Runner Framework**: Built-in concurrent message processing with configurable worker pools and automatic success/error callback reporting; transient failures retried with backoff before anything is reported; optional `ProcessFailureObserver` after a failure is reported
 - **Distributed Tracing**: Integrated OpenTelemetry tracing support with Jaeger and OTLP exporters for observability
 - **Callback Reporting**: Automatic success and error reporting to result streams with proper message acknowledgment
 - **Robust Error Handling**: SDK-specific errors with proper error wrapping
