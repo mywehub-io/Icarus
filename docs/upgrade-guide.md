@@ -1,5 +1,37 @@
 # Upgrade guide
 
+## Upgrading to v0.28.0
+
+No code change is required, but three runner behaviours change. Roll out Icarus users
+(e.g. Elysium) before or after the result consumer (Zeus) in any order: each side tolerates the
+other's old behaviour.
+
+### `pkg/runner`
+
+- **No prefetching.** The runner fetches only as many messages as it has idle workers
+  (capped at `batchSize`) instead of running `Consume` with a buffered job queue.
+  `Config.QueueSize` is ignored and logged once if set. Work waiting for a worker now stays
+  undelivered in the stream, so it no longer uses delivery attempts or ack deadlines while it
+  waits, and spreads across replicas by free capacity.
+- **Transient failures are retried before they are reported.** A transient error with attempts
+  left is nak'd with a backoff delay (5 s, 15 s, 30 s, 60 s) and nothing is published. Only
+  the last attempt publishes the failure, with `Retryable: false` and its attempt number, and
+  terminates the message. `ProcessFailureObserver` runs once, for that report. A result
+  consumer therefore sees at most one failed result per execution.
+- **The execution claim hands over.** The `EXECUTION_HEARTBEATS` entry now carries a `state`
+  (`running`, `retrying`, `done`). A retry, a dead pod's unit (no write for 60 s) or a new
+  dispatch of the node takes the claim over; a delivery that finds the unit running elsewhere is
+  nak'd with a 30 s delay instead of immediately, and a duplicate of a completed execution is
+  terminated. Before, every redelivery within 90 s of the last write was nak'd at once, which
+  used up all delivery attempts in milliseconds.
+
+### `pkg/message`
+
+- `ReportError` takes optional `ReportErrorOption`s: `WithAttempt(n)` and `FinalAttempt()`.
+  Existing calls compile and behave as before.
+- New: `Message.NakWithDelay`, `IsTransientError`, and `ResultMessage.Attempt`
+  (`attempt`, omitted when 0).
+
 ## Upgrading to v0.27.0
 
 No action required. v0.27.0 only adds streaming primitives (`archive.Reader.EntryRange`,

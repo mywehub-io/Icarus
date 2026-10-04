@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -37,9 +38,13 @@ import (
 // Return semantics:
 //   - nil error → processing succeeded; the runner calls ReportSuccess and
 //     ACKs the NATS message.
-//   - non-nil error → processing failed; the runner calls ReportError, which
-//     NAKs the NATS message for redelivery or routes to the DLQ when
-//     MaxDeliver is exhausted. It also invokes ProcessFailureObserver.
+//   - non-nil error → processing failed. A transient error (anything but an
+//     *errors.AppError of a non-Internal type) with delivery attempts left is
+//     retried: the message is nak'd with a backoff delay (5s, 15s, 30s, 60s)
+//     and nothing is reported. On the last attempt, or for a permanent error,
+//     the runner calls ReportError, which publishes the failed result once and
+//     acks (permanent) or terminates (transient) the message, then invokes
+//     ProcessFailureObserver.
 //
 // Context: the ctx passed to Process is derived from the runner's main context
 // with an additional processTimeout deadline. When processTimeout fires,
@@ -49,9 +54,9 @@ type Processor interface {
 	Process(ctx context.Context, msg *message.Message) (message message.Message, err error)
 }
 
-// ProcessFailureObserver is called after ReportError successfully publishes a
-// failed result. It is invoked for every processing error regardless of
-// whether the error is transient or permanent.
+// ProcessFailureObserver is called after ReportError publishes a failed result:
+// once per unit, for a permanent error or for a transient error on its last
+// delivery attempt. Transient failures that are retried do not invoke it.
 //
 // Typical use: emit a node.ended Argus observation event with HasError=true
 // (see pkg/runner/argus/observer.go for the standard implementation).
@@ -109,8 +114,10 @@ func WithConsumerFilterSubject(filterSubject string) RunnerOption {
 }
 
 // Runner manages concurrent message processing from a NATS JetStream consumer.
-// It pulls messages in batches and dispatches them through an internal worker
-// pool, with automatic success and error reporting to the RESULTS stream.
+// It pulls only as many messages as it has idle workers and hands each straight to one, with
+// automatic success and error reporting to the RESULTS stream. A message the runner cannot
+// start yet stays undelivered in the stream: no ack deadline runs on it, no delivery attempt is
+// used, and another replica with a free worker can take it.
 //
 // Goroutine safety: Runner itself is not safe for concurrent Start/Stop calls.
 // Call Run once per Runner instance. Run is safe to call from a single
@@ -125,8 +132,7 @@ func WithConsumerFilterSubject(filterSubject string) RunnerOption {
 //
 // Worker pool size: resolved at construction from Config.WorkerCount,
 // ICARUS_RUNNER_WORKERS env, ICARUS_RUNNER_WORKER_MULTIPLIER × GOMAXPROCS,
-// or GOMAXPROCS as the fallback (in that order). Queue depth defaults to
-// 4 × WorkerCount (capped at 1000).
+// or GOMAXPROCS as the fallback (in that order).
 type Runner struct {
 	client                 *client.Client
 	processor              Processor
@@ -140,6 +146,13 @@ type Runner struct {
 	tracingShutdown        func(context.Context) error
 	config                 Config
 	jobChan                chan *message.Message
+	// idle holds one token per worker that is free to take a message. The fetch loop takes
+	// tokens before it fetches and asks for no more messages than it holds; a worker returns its
+	// token when it finishes a message.
+	idle                   chan struct{}
+	// maxDeliver is the consumer's MaxDeliver, read when the consumer is resolved. It decides
+	// whether a transient failure is retried or reported as final (see retryPolicy).
+	maxDeliver             atomic.Int64
 	processFailureObserver ProcessFailureObserver
 	// heartbeatKV is the EXECUTION_HEARTBEATS bucket used for the liveness heartbeat and the
 	// claim-per-execution-unit idempotency check (see startAckHeartbeat and claimExecutionUnit).
@@ -154,8 +167,11 @@ type Config struct {
 	// If 0 or less, it will be resolved from env or CPU count.
 	WorkerCount int
 
-	// QueueSize controls the buffered job queue feeding workers.
-	// If 0 or less, it defaults to 4×WorkerCount (min WorkerCount, max 1000).
+	// QueueSize is ignored. The runner used to buffer fetched messages in a queue of this
+	// size; it now fetches only as many messages as it has idle workers, so nothing waits
+	// inside the runner. Kept so existing callers compile.
+	//
+	// Deprecated: no effect since v0.28.0.
 	QueueSize int
 }
 
@@ -168,20 +184,9 @@ func DefaultConfig() Config {
 }
 
 func (c Config) withDefaults() Config {
-	workers := resolveWorkerCount(c.WorkerCount)
-	queue := c.QueueSize
-	if queue <= 0 {
-		queue = workers * 4
-		if queue < workers {
-			queue = workers
-		}
-		if queue > 1000 {
-			queue = 1000
-		}
-	}
 	return Config{
-		WorkerCount: workers,
-		QueueSize:   queue,
+		WorkerCount: resolveWorkerCount(c.WorkerCount),
+		QueueSize:   c.QueueSize,
 	}
 }
 
@@ -222,7 +227,8 @@ func getEnvInt(key string, defaultValue int) int {
 // NewRunner creates a new Runner instance with a connected client and stream/consumer configuration.
 // The client must already be connected before creating the runner.
 // The processor must implement the Processor interface for message handling.
-// batchSize specifies how many messages to pull at once from the stream.
+// batchSize caps how many messages one fetch asks for. A fetch never asks for more messages
+// than the runner has idle workers, so batchSize only matters when it is smaller than that.
 // processTimeout specifies the maximum time allowed for processing a single message.
 // logger is the zap logger instance for structured logging.
 // tracingConfig is optional - if nil, no tracing will be set up. If provided, tracing will be automatically configured and cleaned up.
@@ -268,7 +274,15 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 		logger:         logger,
 		tracer:         otel.Tracer("icarus/runner"),
 		config:         config,
-		jobChan:        make(chan *message.Message, config.QueueSize),
+		jobChan:        make(chan *message.Message, config.WorkerCount),
+		idle:           make(chan struct{}, config.WorkerCount),
+	}
+	for i := 0; i < config.WorkerCount; i++ {
+		runner.idle <- struct{}{}
+	}
+	if config.QueueSize > 0 {
+		logger.Info("runner Config.QueueSize is ignored: the runner fetches only as many messages as it has idle workers",
+			zap.String("stream", stream), zap.String("consumer", consumer), zap.Int("queue_size", config.QueueSize))
 	}
 
 	for _, opt := range opts {
@@ -352,27 +366,26 @@ func (r *Runner) Close() error {
 	return nil
 }
 
+// fetchMaxWait bounds one fetch request. A fetch that finds no messages returns after it, so
+// the loop notices shutdown and freed workers within this time.
+var fetchMaxWait = 5 * time.Second
+
 // Run starts the message processing pipeline and blocks until shutdown completes.
 //
-// Startup: Run launches WorkerCount worker goroutines and one consume-supervision
-// goroutine. The supervision goroutine starts a JetStream Consume() loop
-// (new nats.go/jetstream API) that delivers messages to a callback; the callback
-// wraps each message and dispatches it into the internal job queue with a
-// blocking send, which provides natural backpressure. Worker pool sizing is
-// resolved from Config.WorkerCount (see NewRunner for the resolution order).
+// Startup: Run launches WorkerCount worker goroutines and one fetch goroutine. The fetch
+// goroutine waits until at least one worker is idle, fetches up to that many messages (capped
+// at batchSize) and hands each straight to a worker. It never holds a message no worker can
+// start, so every delivered message is processed at once, under its ack heartbeat. Work that
+// cannot start yet waits undelivered in the stream, where no ack deadline runs and no delivery
+// attempt is used, and where another replica with a free worker can take it.
 //
-// Shutdown — cancel the context to stop: cancelling ctx stops the Consume loop
-// and all workers. Message delivery stops immediately; any messages already in
-// jobChan are drained and processed to completion. Run returns only after every
-// in-flight Process call has returned. There is no explicit stop timeout for
-// draining workers — each Process call is bounded by processTimeout, so the
-// maximum drain time is bounded by processTimeout.
+// Shutdown — cancel the context to stop: fetching stops, and Run returns once every in-flight
+// Process call has returned. A message fetched but not yet started when shutdown begins is
+// nak'd so another replica can take it at once. Each Process call is bounded by processTimeout,
+// which bounds the drain.
 //
-// Error handling on consume failures: transient errors (heartbeat misses during
-// server blips) are retried by the JetStream library itself. Fatal ErrHandler
-// failures and unexpected Consume stops (Closed without ErrHandler, e.g.
-// consumer deleted) restart the Consume loop with exponential backoff
-// (100 ms → 5 s), reconnecting the client when the transport is down.
+// Error handling on fetch failures: a deleted or missing consumer is resolved again, and a
+// dead transport reconnects, with exponential backoff (100 ms → 5 s).
 //
 // Return values:
 //   - context.Canceled / context.DeadlineExceeded — normal shutdown path when
@@ -395,18 +408,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		}(i)
 	}
 
-	dispatchMessage := func(msg *message.Message) {
-		select {
-		case <-ctx.Done():
-			return
-		case r.jobChan <- msg:
-		}
-	}
-
-	// Consume callback: wrap the JetStream message and dispatch it into the
-	// worker pool. The blocking send into jobChan provides backpressure — the
-	// JetStream library stops requesting more messages while the callback blocks.
-	handleMsg := func(jsMsg jetstream.Msg) {
+	// handleMsg wraps a fetched JetStream message and hands it to a worker. The caller holds an
+	// idle token for it, so a worker is free and the send does not wait. It reports whether the
+	// message went to a worker; when it did not, the caller returns the token.
+	handleMsg := func(jsMsg jetstream.Msg) bool {
 		msg, err := message.FromJetStreamMsg(jsMsg)
 		if err != nil {
 			deliverCount := ""
@@ -420,7 +425,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				zap.String("jetstream_deliver_count", deliverCount),
 				zap.Error(err))
 			_ = jsMsg.Nak()
-			return
+			return false
 		}
 		if msg.Metadata == nil {
 			msg.Metadata = make(map[string]string)
@@ -428,18 +433,17 @@ func (r *Runner) Run(ctx context.Context) error {
 		if _, ok := msg.Metadata[message.MetaIcarusEnqueueUnixMs]; !ok {
 			msg.WithMetadata(message.MetaIcarusEnqueueUnixMs, fmt.Sprintf("%d", time.Now().UnixMilli()))
 		}
-		r.logger.Info("Runner dispatching consumed message to job queue",
-			zap.String("stream", r.stream),
-			zap.String("consumer", r.consumer),
-			zap.Int("job_queue_depth", len(r.jobChan)),
-			zap.Int("job_queue_cap", cap(r.jobChan)),
-			zap.Int("worker_count", r.config.WorkerCount),
-			zap.Int("batch_size_config", r.batchSize))
-		dispatchMessage(msg)
+		select {
+		case r.jobChan <- msg:
+			return true
+		case <-ctx.Done():
+			// Shutting down before a worker took it: hand it back so another replica can.
+			_ = jsMsg.Nak()
+			return false
+		}
 	}
 
-	// Start consume supervision goroutine. It keeps a JetStream Consume() loop
-	// alive, restarting it (with reconnect when needed) after fatal failures.
+	// Start the fetch goroutine.
 	backgroundWG.Add(1)
 	go func() {
 		defer backgroundWG.Done()
@@ -461,131 +465,78 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 		}
 
+		var cons jetstream.Consumer
 		for {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				r.logger.Info("Shutting down message processor...")
 				return
-			default:
 			}
 
-			cons, err := r.client.Messages.GetConsumer(ctx, r.stream, r.consumer)
-			if err != nil {
-				if ctx.Err() != nil {
-					r.logger.Debug("Message consuming stopped due to context cancellation")
-					return
-				}
-				r.logger.Error("Error resolving JetStream consumer", zap.Error(err))
-				if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
-					if r.tryReconnectNATS() {
-						backoffDelay = 100 * time.Millisecond
-					}
-				}
-				if !waitBackoff() {
-					return
-				}
-				continue
-			}
-
-			// Buffered channel so the error handler never blocks. Keep the latest
-			// error (replace stale) so a later fatal is not dropped after a
-			// transient heartbeat miss. Some terminal conditions stop Consume
-			// without invoking ErrHandler — those are covered by Closed() below.
-			consumeErrCh := make(chan error, 1)
-			consumeCtx, err := cons.Consume(handleMsg,
-				jetstream.PullMaxMessages(r.batchSize),
-				jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, cerr error) {
-					select {
-					case consumeErrCh <- cerr:
-					default:
-						select {
-						case <-consumeErrCh:
-						default:
-						}
-						select {
-						case consumeErrCh <- cerr:
-						default:
-						}
-					}
-				}),
-			)
-			if err != nil {
-				r.logger.Error("Error starting JetStream consume", zap.Error(err))
-				if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
-					if r.tryReconnectNATS() {
-						backoffDelay = 100 * time.Millisecond
-					}
-				}
-				if !waitBackoff() {
-					return
-				}
-				continue
-			}
-
-			r.logger.Info("JetStream consume started",
-				zap.String("stream", r.stream),
-				zap.String("consumer", r.consumer),
-				zap.Int("batch_size", r.batchSize))
-			backoffDelay = 100 * time.Millisecond
-
-			// Block until shutdown, a fatal consume error, or Consume stopping on
-			// its own (Closed). Watching Closed matches the old pull-loop habit of
-			// always continuing after a failed fetch — nats.go can Stop() on
-			// e.g. consumer deleted without calling ConsumeErrHandler.
-			restart := false
-			for !restart {
-				select {
-				case <-ctx.Done():
-					consumeCtx.Stop()
-					// Wait for the consume goroutine (including any in-flight
-					// callback) to finish so nothing sends on jobChan after Run
-					// closes it. A callback blocked in dispatchMessage unblocks
-					// via ctx.Done().
-					<-consumeCtx.Closed()
-					r.logger.Info("Shutting down message processor...")
-					return
-				case cerr := <-consumeErrCh:
-					// Only true Consume fatals tear down the loop. Do not treat
-					// !IsConnected as fatal here: during nats auto-reconnect the
-					// library may emit ErrNoHeartbeat while Consume is still alive
-					// and will re-issue pulls on CONNECTED. Stopping would fight that.
-					if isFatalConsumeError(cerr) {
-						r.logger.Error("JetStream consume failure; restarting consume loop",
-							zap.String("stream", r.stream),
-							zap.String("consumer", r.consumer),
-							zap.Error(cerr))
-						consumeCtx.Stop()
-						<-consumeCtx.Closed()
-						if icarusnats.IsTransportError(cerr) || !r.client.IsConnected() {
-							r.tryReconnectNATS()
-						}
-						restart = true
-					} else {
-						// Transient (e.g. missed heartbeats during a server blip);
-						// the JetStream library keeps retrying pulls on its own.
-						r.logger.Warn("JetStream consume transient error",
-							zap.String("stream", r.stream),
-							zap.String("consumer", r.consumer),
-							zap.Error(cerr))
-					}
-				case <-consumeCtx.Closed():
+			if cons == nil {
+				c, err := r.client.Messages.GetConsumer(ctx, r.stream, r.consumer)
+				if err != nil {
 					if ctx.Err() != nil {
-						r.logger.Info("Shutting down message processor...")
+						r.logger.Debug("Message consuming stopped due to context cancellation")
 						return
 					}
-					r.logger.Error("JetStream consume stopped; restarting consume loop",
-						zap.String("stream", r.stream),
-						zap.String("consumer", r.consumer))
-					if !r.client.IsConnected() {
-						r.tryReconnectNATS()
+					r.logger.Error("Error resolving JetStream consumer", zap.Error(err))
+					if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
+						if r.tryReconnectNATS() {
+							backoffDelay = 100 * time.Millisecond
+						}
 					}
-					restart = true
+					if !waitBackoff() {
+						return
+					}
+					continue
 				}
+				cons = c
+				r.recordMaxDeliver(cons)
+				r.logger.Info("JetStream fetch started",
+					zap.String("stream", r.stream),
+					zap.String("consumer", r.consumer),
+					zap.Int("worker_count", r.config.WorkerCount),
+					zap.Int("batch_size", r.batchSize),
+					zap.Int64("max_deliver", r.maxDeliver.Load()))
+				backoffDelay = 100 * time.Millisecond
 			}
 
-			if !waitBackoff() {
+			want, ok := r.takeIdle(ctx)
+			if !ok {
+				r.logger.Info("Shutting down message processor...")
 				return
 			}
+
+			batch, err := cons.Fetch(want, jetstream.FetchMaxWait(fetchMaxWait))
+			if err != nil {
+				r.returnIdle(want)
+				if ctx.Err() != nil {
+					return
+				}
+				if r.handleFetchError(err, &cons) && !waitBackoff() {
+					return
+				}
+				continue
+			}
+
+			handed := 0
+			for jsMsg := range batch.Messages() {
+				if handleMsg(jsMsg) {
+					handed++
+				}
+			}
+			r.returnIdle(want - handed)
+
+			if berr := batch.Error(); berr != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if r.handleFetchError(berr, &cons) && !waitBackoff() {
+					return
+				}
+				continue
+			}
+			backoffDelay = 100 * time.Millisecond
 		}
 	}()
 
@@ -601,6 +552,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	case <-done:
 		close(r.jobChan)
 		processWG.Wait()
+		r.nakUnstarted()
 		r.logger.Info("Runner completed successfully")
 		return nil
 	case <-ctx.Done():
@@ -608,12 +560,71 @@ func (r *Runner) Run(ctx context.Context) error {
 		// Stop accepting new messages and drain workers
 		close(r.jobChan)
 		processWG.Wait()
+		r.nakUnstarted()
 		r.logger.Info("Runner stopped due to context cancellation")
 		return ctx.Err()
 	}
 }
 
-// worker executes messages from the job channel until context cancellation or channel close.
+// takeIdle waits for at least one idle worker, then takes every other idle token available up
+// to batchSize, and returns how many it took. It returns false when ctx ends first.
+func (r *Runner) takeIdle(ctx context.Context) (int, bool) {
+	select {
+	case <-r.idle:
+	case <-ctx.Done():
+		return 0, false
+	}
+	n := 1
+	for n < r.batchSize {
+		select {
+		case <-r.idle:
+			n++
+		default:
+			return n, true
+		}
+	}
+	return n, true
+}
+
+// returnIdle gives back n idle tokens the fetch loop took but did not use.
+func (r *Runner) returnIdle(n int) {
+	for i := 0; i < n; i++ {
+		r.idle <- struct{}{}
+	}
+}
+
+// handleFetchError logs a fetch failure and prepares the next attempt: a deleted or missing
+// consumer is resolved again and a dead transport is reconnected. It reports whether the loop
+// should back off before fetching again.
+func (r *Runner) handleFetchError(err error, cons *jetstream.Consumer) bool {
+	if isFatalConsumeError(err) {
+		r.logger.Error("JetStream fetch failure; resolving the consumer again",
+			zap.String("stream", r.stream),
+			zap.String("consumer", r.consumer),
+			zap.Error(err))
+		*cons = nil
+	} else {
+		r.logger.Warn("JetStream fetch error",
+			zap.String("stream", r.stream),
+			zap.String("consumer", r.consumer),
+			zap.Error(err))
+	}
+	if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
+		r.tryReconnectNATS()
+	}
+	return true
+}
+
+// nakUnstarted naks any message still waiting in jobChan after the workers stopped, so another
+// replica can take it at once instead of after the ack deadline.
+func (r *Runner) nakUnstarted() {
+	for msg := range r.jobChan {
+		_ = msg.Nak()
+	}
+}
+
+// worker executes messages from the job channel until context cancellation or channel close,
+// returning its idle token after each one so the fetch loop can take another message for it.
 func (r *Runner) worker(ctx context.Context, id int) {
 	r.logger.Debug("runner worker started", zap.Int("worker_id", id))
 	for {
@@ -629,6 +640,7 @@ func (r *Runner) worker(ctx context.Context, id int) {
 			if err := r.processMessage(ctx, msg); err != nil {
 				r.logger.Error("Message processing failed", zap.Error(err))
 			}
+			r.idle <- struct{}{}
 		}
 	}
 }
@@ -668,6 +680,29 @@ const executionHeartbeatTTL = 90 * time.Second
 // 30s), per the design doc: one ticker, two cadences, rather than a second time.Ticker.
 const executionHeartbeatEveryNTicks = 3
 
+// Heartbeat states. A unit's EXECUTION_HEARTBEATS entry says what the unit is doing, so a
+// redelivery can tell a unit waiting to retry, or abandoned by a dead pod, from one another pod
+// is still running, and Zeus's sweeper can treat a retrying unit as alive.
+const (
+	// heartbeatRunning: a worker is running the unit. Refreshed every executionHeartbeatEveryNTicks.
+	heartbeatRunning = "running"
+	// heartbeatRetrying: the last attempt failed with a transient error and the message was
+	// nak'd with a delay; the next delivery takes the claim over.
+	heartbeatRetrying = "retrying"
+	// heartbeatDone: the unit's result is published. A redelivery of the same execution is a
+	// duplicate and is terminated.
+	heartbeatDone = "done"
+)
+
+// claimStaleAfter is how long a running entry may go without a write before its pod is presumed
+// dead and a redelivery may take the claim over: two missed heartbeat writes (every 30s).
+const claimStaleAfter = 60 * time.Second
+
+// claimBusyNakDelay is how long a delivery that finds the unit running elsewhere waits before
+// it is redelivered. A plain Nak would come straight back and use up the delivery attempts in
+// milliseconds.
+const claimBusyNakDelay = 30 * time.Second
+
 // executionHeartbeat is the JSON payload written to executionHeartbeatBucket.
 type executionHeartbeat struct {
 	WorkflowID  string `json:"workflow_id"`
@@ -677,6 +712,11 @@ type executionHeartbeat struct {
 	Attempt     int    `json:"attempt"`
 	Pod         string `json:"pod"`
 	StartedAt   string `json:"started_at"` // RFC3339, set once per delivery, not per tick
+	// State is one of heartbeatRunning, heartbeatRetrying or heartbeatDone. Empty in entries
+	// written before v0.28.0, which are treated as running.
+	State string `json:"state,omitempty"`
+	// RetryAt is when the next delivery is due, for heartbeatRetrying.
+	RetryAt string `json:"retry_at,omitempty"`
 }
 
 // executionHeartbeatKey builds the EXECUTION_HEARTBEATS key for one execution unit. Dots, not
@@ -699,33 +739,78 @@ func deliverAttempt(msg *message.Message) int {
 	return int(md.NumDelivered)
 }
 
-// claimExecutionUnit attempts to claim key in kv via Create (not Put), so a second pod racing the
-// same execution unit (a redelivery landing on a different pod while the first pod is still alive
-// and heartbeating) fails the claim instead of running the plugin twice. Returns (true, nil) when
-// this call won the claim, (false, nil) when jetstream.ErrKeyExists (someone else already holds
-// it), and (false, err) for any other error — callers must fail OPEN on that last case: a KV
-// outage must not stop all processing platform-wide.
-func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, hb executionHeartbeat) (bool, error) {
+// claimOutcome is what claimExecutionUnit decided.
+type claimOutcome int
+
+const (
+	// claimWon: this delivery owns the unit and runs it.
+	claimWon claimOutcome = iota
+	// claimBusy: another worker is running the unit; redeliver later.
+	claimBusy
+	// claimDuplicate: this execution's result is already published; drop the delivery.
+	claimDuplicate
+)
+
+// claimExecutionUnit claims key for hb's execution. With no entry it Creates one. With an
+// entry it decides from the entry's state:
+//   - done for the same execution: a duplicate delivery (claimDuplicate);
+//   - retrying, done for an earlier execution (Zeus dispatched the node again), or running
+//     with no write for claimStaleAfter (its pod is presumed dead): taken over with an Update
+//     on the entry's revision, so two deliveries racing for it cannot both win;
+//   - running and fresh: claimBusy.
+//
+// A non-nil error means the KV could not be used; callers fail OPEN on it, since a KV outage
+// must not stop all processing platform-wide.
+func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, hb executionHeartbeat, now time.Time) (claimOutcome, error) {
 	payload, err := json.Marshal(hb)
 	if err != nil {
-		return false, err
+		return claimBusy, err
 	}
-	if _, err := kv.Create(ctx, key, payload); err != nil {
-		if errors.Is(err, jetstream.ErrKeyExists) {
-			return false, nil
+	// Two passes: a Create that loses to another creator re-reads what that creator wrote.
+	for pass := 0; pass < 2; pass++ {
+		entry, err := kv.Get(ctx, key)
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			if _, err := kv.Create(ctx, key, payload); err == nil {
+				return claimWon, nil
+			} else if errors.Is(err, jetstream.ErrKeyExists) {
+				continue
+			} else {
+				return claimBusy, err
+			}
 		}
-		return false, err
+		if err != nil {
+			return claimBusy, err
+		}
+
+		var cur executionHeartbeat
+		_ = json.Unmarshal(entry.Value(), &cur) // an unreadable entry is treated as running
+		switch {
+		case cur.State == heartbeatDone && cur.ExecutionID == hb.ExecutionID:
+			return claimDuplicate, nil
+		case cur.State == heartbeatRetrying,
+			cur.State == heartbeatDone,
+			now.Sub(entry.Created()) >= claimStaleAfter:
+			if _, err := kv.Update(ctx, key, payload, entry.Revision()); err == nil {
+				return claimWon, nil
+			} else if errors.Is(err, jetstream.ErrKeyExists) {
+				return claimBusy, nil // another delivery took it over first
+			} else {
+				return claimBusy, err
+			}
+		default:
+			return claimBusy, nil
+		}
 	}
-	return true, nil
+	return claimBusy, nil
 }
 
 // claimOrNak is processMessage's entry-point wrapper around claimExecutionUnit. It returns true
-// when processing should proceed (the claim was won, heartbeatKV is nil, or the claim attempt
-// failed for a reason other than losing the race — fail-open), and false when the message has
-// already been nak'd and processMessage must return without calling Process.
+// when processing should proceed (the claim was won, heartbeatKV is nil, or the KV could not be
+// used — fail-open), and false when the message has already been nak'd or terminated and
+// processMessage must return without calling Process.
 //
 // Isolated as its own method (rather than inlined in processMessage) so the fail-open and
-// lost-race paths are testable without a real *client.Client — both would otherwise be
+// lost-claim paths are testable without a real *client.Client — both would otherwise be
 // unreachable in a unit test, since a won claim falls through into Process and the real
 // ReportSuccess/ReportError machinery.
 func (r *Runner) claimOrNak(ctx context.Context, msg *message.Message, workflowID, runID, nodeID, executionID string) bool {
@@ -741,31 +826,129 @@ func (r *Runner) claimOrNak(ctx context.Context, msg *message.Message, workflowI
 		Attempt:     deliverAttempt(msg),
 		Pod:         os.Getenv("HOSTNAME"),
 		StartedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+		State:       heartbeatRunning,
 	}
-	claimed, claimErr := claimExecutionUnit(ctx, r.heartbeatKV, key, hb)
-	if claimErr == nil && !claimed {
-		r.logger.Info("Execution unit already claimed by another pod; nak-ing without processing",
-			zap.String("stream", r.stream),
-			zap.String("consumer", r.consumer),
-			zap.String("workflow_id", workflowID),
-			zap.String("run_id", runID),
-			zap.String("node_id", nodeID))
-		if nakErr := msg.Nak(); nakErr != nil {
-			r.logger.Warn("Failed to nak message after losing claim race", zap.Error(nakErr))
-		}
-		return false
-	}
+	outcome, claimErr := claimExecutionUnit(ctx, r.heartbeatKV, key, hb, time.Now())
 	if claimErr != nil {
-		// KV unreachable, not ErrKeyExists: fail OPEN. A KV outage must not halt all
-		// processing platform-wide — a broken heartbeat/claim mechanism already looks
-		// identical to "every pod is dead" from Zeus's side, an accepted degradation.
+		// KV unreachable: fail OPEN. A KV outage must not halt all processing platform-wide —
+		// a broken heartbeat/claim mechanism already looks identical to "every pod is dead"
+		// from Zeus's side, an accepted degradation.
 		r.logger.Warn("Failed to claim execution unit (KV unreachable); processing anyway",
 			zap.String("workflow_id", workflowID),
 			zap.String("run_id", runID),
 			zap.String("node_id", nodeID),
 			zap.Error(claimErr))
+		return true
+	}
+	switch outcome {
+	case claimDuplicate:
+		r.logger.Info("Execution unit already completed; terminating duplicate delivery",
+			zap.String("stream", r.stream),
+			zap.String("consumer", r.consumer),
+			zap.String("workflow_id", workflowID),
+			zap.String("run_id", runID),
+			zap.String("node_id", nodeID),
+			zap.String("execution_id", executionID))
+		if err := msg.Term(); err != nil {
+			r.logger.Warn("Failed to terminate duplicate delivery", zap.Error(err))
+		}
+		return false
+	case claimBusy:
+		r.logger.Info("Execution unit is running elsewhere; redelivering later",
+			zap.String("stream", r.stream),
+			zap.String("consumer", r.consumer),
+			zap.String("workflow_id", workflowID),
+			zap.String("run_id", runID),
+			zap.String("node_id", nodeID),
+			zap.Duration("nak_delay", claimBusyNakDelay))
+		if err := msg.NakWithDelay(claimBusyNakDelay); err != nil {
+			r.logger.Warn("Failed to nak message after losing the claim", zap.Error(err))
+		}
+		return false
 	}
 	return true
+}
+
+// setHeartbeatState writes the unit's entry with state (and retryAt for heartbeatRetrying),
+// keeping the claim this pod holds. Failures are logged: the claim and Zeus both cope with a
+// stale entry, more slowly.
+func (r *Runner) setHeartbeatState(msg *message.Message, workflowID, runID, nodeID, executionID, state string, retryAt time.Time) {
+	if r.heartbeatKV == nil || workflowID == "" || runID == "" || nodeID == "" {
+		return
+	}
+	hb := executionHeartbeat{
+		WorkflowID:  workflowID,
+		RunID:       runID,
+		NodeID:      nodeID,
+		ExecutionID: executionID,
+		Attempt:     deliverAttempt(msg),
+		Pod:         os.Getenv("HOSTNAME"),
+		StartedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+		State:       state,
+	}
+	if !retryAt.IsZero() {
+		hb.RetryAt = retryAt.UTC().Format(time.RFC3339Nano)
+	}
+	payload, err := json.Marshal(hb)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := r.heartbeatKV.Put(ctx, executionHeartbeatKey(workflowID, runID, nodeID), payload); err != nil {
+		r.logger.Warn("Failed to write execution heartbeat state",
+			zap.String("workflow_id", workflowID),
+			zap.String("run_id", runID),
+			zap.String("node_id", nodeID),
+			zap.String("state", state),
+			zap.Error(err))
+	}
+}
+
+// defaultMaxDeliver is the attempt limit assumed when the consumer sets none (MaxDeliver 0 or
+// -1): message.NewMessageService's own default. Without a limit a transient failure would be
+// retried forever and never reported.
+const defaultMaxDeliver = 5
+
+// recordMaxDeliver stores the consumer's MaxDeliver from its cached info.
+func (r *Runner) recordMaxDeliver(cons jetstream.Consumer) {
+	limit := int64(defaultMaxDeliver)
+	if info := cons.CachedInfo(); info != nil && info.Config.MaxDeliver > 0 {
+		limit = int64(info.Config.MaxDeliver)
+	}
+	r.maxDeliver.Store(limit)
+}
+
+// attemptLimit is the number of deliveries a unit gets.
+func (r *Runner) attemptLimit() int {
+	if v := r.maxDeliver.Load(); v > 0 {
+		return int(v)
+	}
+	return defaultMaxDeliver
+}
+
+// retryDelay is how long a unit waits before its next attempt after a transient failure on
+// attempt: 5s, 15s, 30s, then 60s. Every delay is below executionHeartbeatTTL, so the retrying
+// entry is still there when the redelivery arrives to take it over.
+func retryDelay(attempt int) time.Duration {
+	switch {
+	case attempt <= 1:
+		return 5 * time.Second
+	case attempt == 2:
+		return 15 * time.Second
+	case attempt == 3:
+		return 30 * time.Second
+	default:
+		return 60 * time.Second
+	}
+}
+
+// willRetry reports whether a failure of processErr on this delivery is retried rather than
+// reported: the error is transient, the message can be redelivered, and attempts remain.
+func (r *Runner) willRetry(msg *message.Message, processErr error, attempt int) bool {
+	return msg.GetJetStreamMsg() != nil &&
+		message.IsTransientError(processErr) &&
+		attempt > 0 && attempt < r.attemptLimit()
 }
 
 // startAckHeartbeat extends the message's ack deadline every ackHeartbeatInterval until the
@@ -836,6 +1019,7 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 					Attempt:     deliverAttempt(msg),
 					Pod:         pod,
 					StartedAt:   startedAt,
+					State:       heartbeatRunning,
 				}
 				payload, marshalErr := json.Marshal(hb)
 				if marshalErr != nil {
@@ -1064,6 +1248,31 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 			zap.String("jetstream_deliver_count", jetstreamDeliver),
 			zap.Error(processErr))
 
+		// A transient failure with attempts left is retried, not reported: Zeus records the
+		// first failed result it sees as final, so publishing one now would end the node
+		// before the retry could succeed. The entry is marked retrying so the redelivery takes
+		// the claim over, and so Zeus's sweeper sees the unit as alive while it waits.
+		attempt := deliverAttempt(msg)
+		if workflowID != "" && runID != "" && r.willRetry(msg, processErr, attempt) {
+			delay := retryDelay(attempt)
+			r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Now().Add(delay))
+			r.logger.Warn("Transient failure; retrying after a delay",
+				zap.String("workflowID", workflowID),
+				zap.String("runID", runID),
+				zap.String("execution_id", executionID),
+				zap.String("node_id", nodeID),
+				zap.Int("attempt", attempt),
+				zap.Int("max_attempts", r.attemptLimit()),
+				zap.Duration("retry_in", delay),
+				zap.Error(processErr))
+			if nakErr := msg.NakWithDelay(delay); nakErr != nil {
+				r.logger.Error("Failed to nak message for retry; it is redelivered after the ack deadline instead",
+					zap.String("execution_id", executionID),
+					zap.Error(nakErr))
+			}
+			return processErr
+		}
+
 		// Report error if we have workflow information
 		// Use a background context with timeout to ensure reporting works even if parent context is cancelled
 		if workflowID != "" && runID != "" {
@@ -1076,7 +1285,8 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 			reportCtx, reportCancel := context.WithTimeout(backgroundWithSpan(span), 10*time.Minute)
 			defer reportCancel()
 
-			if reportErr := r.client.Messages.ReportError(reportCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetJetStreamMsg()); reportErr != nil {
+			reportOpts := []message.ReportErrorOption{message.WithAttempt(attempt), message.FinalAttempt()}
+			if reportErr := r.client.Messages.ReportError(reportCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetJetStreamMsg(), reportOpts...); reportErr != nil {
 				// Critical: If we can't report the error, log it extensively but don't fail silently
 				r.logger.Error("CRITICAL: Failed to report error to JetStream - workflow may hang",
 					zap.String("workflowID", workflowID),
@@ -1092,18 +1302,23 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 				// Try one more time with a fresh context after a brief delay
 				time.Sleep(2 * time.Second)
 				retryCtx, retryCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
-				if retryErr := r.client.Messages.ReportError(retryCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetJetStreamMsg()); retryErr != nil {
+				if retryErr := r.client.Messages.ReportError(retryCtx, executionID, workflowID, runID, correlationID, processErr, msg.GetJetStreamMsg(), reportOpts...); retryErr != nil {
 					r.logger.Error("CRITICAL: Retry also failed to report error to JetStream",
 						zap.String("workflowID", workflowID),
 						zap.String("runID", runID),
 						zap.String("executionID", executionID),
 						zap.Error(retryErr))
+					// The message was nak'd; let its redelivery take the claim over at once.
+					r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Time{})
 				} else {
 					r.logger.Info("Successfully reported error to JetStream on retry",
 						zap.String("workflowID", workflowID),
 						zap.String("executionID", executionID))
+					r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatDone, time.Time{})
 				}
 				retryCancel()
+			} else {
+				r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatDone, time.Time{})
 			}
 		} else {
 			// If we don't have workflow info, still nak the message since processing failed
@@ -1183,6 +1398,8 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		reportCtx, reportCancel := context.WithTimeout(backgroundWithSpan(span), 10*time.Minute)
 		defer reportCancel()
 		if reportErr := r.client.Messages.ReportSuccess(reportCtx, resultMessage, msg.GetJetStreamMsg()); reportErr != nil {
+			// ReportSuccess nak'd the message; let its redelivery take the claim over at once.
+			r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Time{})
 			r.logger.Error("Error reporting success, will report as error to workflow",
 				zap.String("workflowID", workflowID),
 				zap.String("runID", runID),
@@ -1233,6 +1450,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 			}
 			return reportErr
 		}
+		r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatDone, time.Time{})
 	} else {
 		// If we don't have workflow info, still ack the message since processing succeeded
 		r.logger.Warn("Runner: processed message success without workflow/run_id — direct Ack (no result publish to Zeus)",

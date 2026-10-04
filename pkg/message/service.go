@@ -593,8 +593,12 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 //   - msg: JetStream message to acknowledge/nak after error reporting (can be nil)
 //
 // Returns an error if the result cannot be published.
-func (s *MessageService) ReportError(ctx context.Context, executionID, workflowID, runID, correlationID string, err error, msg jetstream.Msg) error {
+func (s *MessageService) ReportError(ctx context.Context, executionID, workflowID, runID, correlationID string, err error, msg jetstream.Msg, opts ...ReportErrorOption) error {
 	startTime := time.Now()
+	var o reportErrorOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 
 	if ctx.Err() != nil {
 		return fmt.Errorf("report error cancelled: %w", ctx.Err())
@@ -622,13 +626,12 @@ func (s *MessageService) ReportError(ctx context.Context, executionID, workflowI
 	}
 
 	// Determine if transient or permanent
-	isTransient := true
+	isTransient := IsTransientError(err)
 	errorMsg := err.Error()
 	errorCode := "INTERNAL_ERROR"
 	errorType := "internal"
 
 	if appErr, ok := err.(*sdkerrors.AppError); ok {
-		isTransient = (appErr.Type == sdkerrors.Internal)
 		errorCode = appErr.Code
 		if errorCode == "" {
 			errorCode = "APP_ERROR"
@@ -682,9 +685,10 @@ func (s *MessageService) ReportError(ctx context.Context, executionID, workflowI
 	resultMsg.WithError(&ResultError{
 		Code:      errorCode,
 		Message:   errorMsg,
-		Retryable: isTransient,
+		Retryable: isTransient && !o.final,
 		Type:      errorType,
 	})
+	resultMsg.Attempt = o.attempt
 
 	// Publish error result to JetStream
 	if err := s.PublishResult(ctx, resultMsg); err != nil {
@@ -711,10 +715,24 @@ func (s *MessageService) ReportError(ctx context.Context, executionID, workflowI
 		zap.String("workflow_id", workflowID),
 		zap.Duration("duration", time.Since(startTime)))
 
-	// Ack/Nak based on error type
+	// Ack/Nak based on error type. A transient error on the final attempt is terminated: the
+	// failure is now reported, so a redelivery would only run the unit again behind a result
+	// Zeus has already recorded.
 	if msg != nil {
 		ackAction := "ack_permanent_suppress_redelivery"
-		if isTransient {
+		if isTransient && o.final {
+			ackAction = "term_transient_final_attempt"
+			if termErr := msg.Term(); termErr != nil {
+				s.logger.Warn("Failed to TERM source message after final-attempt error result publish",
+					zap.String("execution_id", executionID),
+					zap.String("workflow_id", workflowID),
+					zap.String("run_id", runID),
+					zap.String("correlation_id", correlationID),
+					zap.String("jetstream_deliver_count", jetStreamDeliverCountStr(msg)),
+					zap.String("jetstream_source_ack_action", "term_transient_final_attempt_failed"),
+					zap.Error(termErr))
+			}
+		} else if isTransient {
 			ackAction = "nak_transient_redelivery"
 			if nakErr := msg.Nak(); nakErr != nil {
 				s.logger.Warn("Failed to NAK source message after error result publish (redelivery semantics may be broken)",
@@ -751,6 +769,35 @@ func (s *MessageService) ReportError(ctx context.Context, executionID, workflowI
 	}
 
 	return nil
+}
+
+// ReportErrorOption adjusts ReportError.
+type ReportErrorOption func(*reportErrorOptions)
+
+type reportErrorOptions struct {
+	attempt int
+	final   bool
+}
+
+// WithAttempt records the delivery attempt (JetStream NumDelivered) on the published result.
+func WithAttempt(attempt int) ReportErrorOption {
+	return func(o *reportErrorOptions) { o.attempt = attempt }
+}
+
+// FinalAttempt marks the report as the last attempt: a transient error is published as not
+// retryable and the source message is terminated instead of nak'd. The runner passes it once
+// the unit has used all its deliveries; without it a transient error is nak'd for redelivery.
+func FinalAttempt() ReportErrorOption {
+	return func(o *reportErrorOptions) { o.final = true }
+}
+
+// IsTransientError reports whether err is worth retrying: any error except an *AppError of a
+// type other than Internal. ReportError and the runner's retry decision both use it.
+func IsTransientError(err error) bool {
+	if appErr, ok := err.(*sdkerrors.AppError); ok {
+		return appErr.Type == sdkerrors.Internal
+	}
+	return true
 }
 
 // jetStreamDeliverCountStr returns JetStream NumDelivered for grep-friendly diagnostics, or "".

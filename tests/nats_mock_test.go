@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"time"
@@ -18,10 +19,12 @@ type mockMsg struct {
 	subject string
 	data    []byte
 
-	mu     sync.Mutex
-	acked  bool
-	nakked bool
-	termed bool
+	mu           sync.Mutex
+	acked        bool
+	nakked       bool
+	termed       bool
+	nakDelays    []time.Duration
+	numDelivered uint64 // 0 means 1
 }
 
 func newMockMsg(subject string, data []byte) *mockMsg {
@@ -33,8 +36,12 @@ func (m *mockMsg) Subject() string { return m.subject }
 func (m *mockMsg) Reply() string   { return "" }
 
 func (m *mockMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	delivered := m.numDelivered
+	if delivered == 0 {
+		delivered = 1
+	}
 	return &jetstream.MsgMetadata{
-		NumDelivered: 1,
+		NumDelivered: delivered,
 		NumPending:   0,
 		Sequence:     jetstream.SequencePair{Stream: 1, Consumer: 1},
 	}, nil
@@ -62,6 +69,25 @@ func (m *mockMsg) Term() error {
 }
 
 func (m *mockMsg) InProgress() error { return nil }
+
+func (m *mockMsg) NakWithDelay(d time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nakDelays = append(m.nakDelays, d)
+	return nil
+}
+
+func (m *mockMsg) wasTermed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.termed
+}
+
+func (m *mockMsg) delayedNaks() []time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]time.Duration(nil), m.nakDelays...)
+}
 
 func (m *mockMsg) wasAcked() bool {
 	m.mu.Lock()
@@ -95,10 +121,13 @@ type MockJS struct {
 	consumerErrorBudget int
 	consumerAttempts    int
 
-	// activeConsumes tracks live Consume loops so tests can Stop them without
-	// invoking ConsumeErrHandler (simulates nats.go stopping on consumer deleted).
-	activeConsumes []*mockConsumeContext
-	consumeStarts  int
+	// fetchBatches records the batch size of every Fetch, so tests can check the runner never
+	// asks for more messages than it has idle workers.
+	fetchBatches []int
+	// fetchErrors are returned, one per Fetch call, before any message is delivered.
+	fetchErrors []error
+	// consumerLookups counts Consumer calls, failed or not.
+	consumerLookups int
 }
 
 type publishedRecord struct {
@@ -119,6 +148,35 @@ func (m *MockJS) addMessage(msg *message.Message) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.queue = append(m.queue, newMockMsg("test.subject", data))
+}
+
+// addMessageOnAttempt queues msg as JetStream delivery attempt n and returns its handle.
+func (m *MockJS) addMessageOnAttempt(msg *message.Message, n uint64) *mockMsg {
+	data, _ := msg.ToBytes()
+	jsMsg := newMockMsg("test.subject", data)
+	jsMsg.numDelivered = n
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.queue = append(m.queue, jsMsg)
+	return jsMsg
+}
+
+// publishedResults returns every result message published so far.
+func (m *MockJS) publishedResults(t interface{ Fatalf(string, ...any) }) []message.ResultMessage {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []message.ResultMessage
+	for _, p := range m.published {
+		if p.subject != "result" && !strings.HasPrefix(p.subject, "result") {
+			continue
+		}
+		var rm message.ResultMessage
+		if err := json.Unmarshal(p.data, &rm); err != nil {
+			t.Fatalf("decoding published result: %v", err)
+		}
+		out = append(out, rm)
+	}
+	return out
 }
 
 // addRawMessage queues a raw payload (e.g. malformed JSON) for delivery.
@@ -150,23 +208,32 @@ func (m *MockJS) setConsumerErrorBudget(err error, budget int) {
 	m.consumerErrorBudget = budget
 }
 
-// stopActiveConsumes stops all in-flight Consume loops without delivering an
-// ErrHandler callback. Closed() fires so the runner supervision loop can restart.
-func (m *MockJS) stopActiveConsumes() int {
-	m.mu.Lock()
-	cons := append([]*mockConsumeContext(nil), m.activeConsumes...)
-	m.activeConsumes = nil
-	m.mu.Unlock()
-	for _, c := range cons {
-		c.Stop()
-	}
-	return len(cons)
-}
-
-func (m *MockJS) consumeStartCount() int {
+// failNextFetches makes the next Fetch calls return errs, one each.
+func (m *MockJS) failNextFetches(errs ...error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.consumeStarts
+	m.fetchErrors = append(m.fetchErrors, errs...)
+}
+
+// fetchBatchSizes returns the batch size of every Fetch so far.
+func (m *MockJS) fetchBatchSizes() []int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]int(nil), m.fetchBatches...)
+}
+
+// queued returns how many messages are still undelivered.
+func (m *MockJS) queued() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.queue)
+}
+
+// consumerResolutions returns how many times the runner looked its consumer up.
+func (m *MockJS) consumerResolutions() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.consumerLookups
 }
 
 func (m *MockJS) publishedSubjects() []string {
@@ -215,6 +282,7 @@ func (m *MockJS) CreateStream(ctx context.Context, cfg jetstream.StreamConfig) (
 func (m *MockJS) Consumer(ctx context.Context, stream, consumer string) (jetstream.Consumer, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.consumerLookups++
 	if m.consumerError != nil {
 		m.consumerAttempts++
 		if m.consumerErrorBudget == 0 || m.consumerAttempts <= m.consumerErrorBudget {
@@ -287,57 +355,35 @@ func (c *mockConsumer) CachedInfo() *jetstream.ConsumerInfo {
 	}
 }
 
-func (c *mockConsumer) Consume(handler jetstream.MessageHandler, opts ...jetstream.PullConsumeOpt) (jetstream.ConsumeContext, error) {
-	cc := &mockConsumeContext{
-		stopCh:   make(chan struct{}),
-		closedCh: make(chan struct{}),
-	}
+// Fetch delivers up to batch queued messages, waiting briefly when none are queued, as a pull
+// request that expires empty would.
+func (c *mockConsumer) Fetch(batch int, opts ...jetstream.FetchOpt) (jetstream.MessageBatch, error) {
 	c.owner.mu.Lock()
-	c.owner.consumeStarts++
-	c.owner.activeConsumes = append(c.owner.activeConsumes, cc)
+	c.owner.fetchBatches = append(c.owner.fetchBatches, batch)
+	if len(c.owner.fetchErrors) > 0 {
+		err := c.owner.fetchErrors[0]
+		c.owner.fetchErrors = c.owner.fetchErrors[1:]
+		c.owner.mu.Unlock()
+		return nil, err
+	}
 	c.owner.mu.Unlock()
 
-	go func() {
-		defer close(cc.closedCh)
-		for {
-			select {
-			case <-cc.stopCh:
-				return
-			default:
-			}
-			msgs := c.owner.popMessages(10)
-			if len(msgs) == 0 {
-				select {
-				case <-cc.stopCh:
-					return
-				case <-time.After(5 * time.Millisecond):
-				}
-				continue
-			}
-			for _, msg := range msgs {
-				select {
-				case <-cc.stopCh:
-					return
-				default:
-					handler(msg)
-				}
-			}
-		}
-	}()
-	return cc, nil
+	msgs := c.owner.popMessages(batch)
+	if len(msgs) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	ch := make(chan jetstream.Msg, len(msgs))
+	for _, m := range msgs {
+		ch <- m
+	}
+	close(ch)
+	return &mockBatch{msgs: ch}, nil
 }
 
-// mockConsumeContext implements jetstream.ConsumeContext.
-type mockConsumeContext struct {
-	stopCh   chan struct{}
-	closedCh chan struct{}
-	stopOnce sync.Once
+// mockBatch implements jetstream.MessageBatch.
+type mockBatch struct {
+	msgs chan jetstream.Msg
 }
 
-func (c *mockConsumeContext) Stop() {
-	c.stopOnce.Do(func() { close(c.stopCh) })
-}
-
-func (c *mockConsumeContext) Drain() { c.Stop() }
-
-func (c *mockConsumeContext) Closed() <-chan struct{} { return c.closedCh }
+func (b *mockBatch) Messages() <-chan jetstream.Msg { return b.msgs }
+func (b *mockBatch) Error() error                   { return nil }

@@ -2,19 +2,38 @@
 
 ## Runner error flow
 
-When `Processor.Process` returns an error:
+When `Processor.Process` returns an error, the runner first decides whether to retry it.
 
-1. The runner calls `ReportError` to publish a failure result to Zeus via the result subject.
-2. `ReportError` acknowledges the original JetStream message (prevents redelivery by the runner).
+**Transient error with attempts left** (any error except an `*errors.AppError` whose type is
+not `Internal`, on a delivery before the consumer's `MaxDeliver`):
+
+1. The unit's `EXECUTION_HEARTBEATS` entry is marked `retrying`.
+2. The message is nak'd with a delay: 5 s after attempt 1, 15 s after 2, 30 s after 3, 60 s after.
+3. Nothing is published and `ProcessFailureObserver` is not called. Zeus records the first
+   failed result it receives as final, so reporting here would end the node before the retry
+   could succeed.
+
+The redelivery takes the claim over from the `retrying` entry and runs the unit again.
+
+**Permanent error, or the last attempt:**
+
+1. The runner calls `ReportError` to publish the failure result once, with its attempt number.
+2. The message is acknowledged (permanent) or terminated (transient on the last attempt), so it
+   is not redelivered.
 3. If `ReportError` fails, the runner retries once after 2 seconds with a fresh context.
 4. If the retry also fails, the error is logged as CRITICAL. The workflow may hang.
 5. `ProcessFailureObserver` is called (if registered) for side effects such as Argus emission.
 
 ```
 Process(msg) → error
-    → ReportError (10-min timeout, 1 retry on failure)
-    → ProcessFailureObserver (30-s timeout, best-effort, not retried)
+    ├─ transient, attempts left → mark retrying → NakWithDelay(backoff)
+    └─ permanent or last attempt
+         → ReportError (10-min timeout, 1 retry on failure)
+         → ProcessFailureObserver (30-s timeout, best-effort, not retried)
 ```
+
+`MaxDeliver` is read from the consumer when the runner resolves it. A consumer with no limit
+(0 or -1) is treated as 5, so a transient failure is always reported eventually.
 
 ## Using `pkg/errors.AppError`
 
@@ -43,7 +62,8 @@ if errs.As(err, &appErr) {
 The embedded runtime distinguishes these via `NodeFailureError.Permanent`:
 
 - `Permanent = true`: the runner does not NAK the message (no redelivery).
-- `Permanent = false`: the message is NAK'd for JetStream redelivery up to `MaxDeliver`.
+- `Permanent = false`: the runner retries the unit with backoff up to `MaxDeliver`, and reports
+  the failure only on the last attempt (see Runner error flow).
 
 For plugin processors, return a `NodeFailureError` from `EmbeddedNode.Process` when the
 failure is deterministic (e.g. schema mismatch, missing required field). Return a plain
