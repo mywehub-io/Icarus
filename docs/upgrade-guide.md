@@ -16,8 +16,9 @@ other's old behaviour.
 - **Transient failures are retried before they are reported.** A transient error with attempts
   left is nak'd with a backoff delay (5 s, 15 s, 30 s, 60 s) and nothing is published. Only
   the last attempt publishes the failure, with `Retryable: false` and its attempt number, and
-  terminates the message. `ProcessFailureObserver` runs once, for that report. A result
-  consumer therefore sees at most one failed result per execution.
+  terminates the message. `ProcessFailureObserver` runs once, for that report. A result that
+  cannot be published is retried the same way, and a unit cancelled by shutdown is handed back
+  unreported, so a result consumer sees at most one failed result per execution.
 - **The execution claim hands over.** The `EXECUTION_HEARTBEATS` entry now carries a `state`
   (`running`, `retrying`, `done`). A retry, a dead pod's unit (no write for 60 s) or a new
   dispatch of the node takes the claim over; a delivery that finds the unit running elsewhere is
@@ -28,6 +29,9 @@ other's old behaviour.
 ### `pkg/message`
 
 - `ReportError` takes optional `ReportErrorOption`s: `WithAttempt(n)` and `FinalAttempt()`.
+- `ReportSuccess` no longer reports a failure or naks when it cannot publish the result. Check
+  the returned error with `errors.Is`: `ErrResultNotPublished` means the message is unsettled
+  and yours to retry or report; `ErrAckAfterPublish` means the result was published.
   Existing calls compile and behave as before.
 - New: `Message.NakWithDelay`, `IsTransientError`, and `ResultMessage.Attempt`
   (`attempt`, omitted when 0).

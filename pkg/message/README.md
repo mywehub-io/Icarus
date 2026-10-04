@@ -80,7 +80,7 @@ Accessed via `client.Messages`. Key methods (all built on the new `nats.go/jetst
 | Method | Description |
 |---|---|
 | `GetConsumer(ctx, stream, consumer)` | Resolve a `jetstream.Consumer` handle for `Consume` |
-| `ReportSuccess(ctx, result, originalMsg)` | Publish result to the configured result subject, then ack (`originalMsg` is a `jetstream.Msg`) |
+| `ReportSuccess(ctx, result, originalMsg)` | Publish result to the configured result subject, then ack (`originalMsg` is a `jetstream.Msg`). If publishing fails it returns an error wrapping `ErrResultNotPublished` and leaves the message unsettled for the caller to retry or report; if only the ack fails, the error wraps `ErrAckAfterPublish` |
 | `ReportError(ctx, executionID, workflowID, runID, correlationID, err, originalMsg, opts...)` | Publish error result. Without options: nak on transient errors, ack on permanent. `WithAttempt(n)` records the attempt; `FinalAttempt()` marks a transient error as not retryable and terminates the message instead of nak-ing it. `IsTransientError(err)` is the classification used |
 | `PublishResult(ctx, result)` | Publish a result message with retry/backoff |
 | `EnsureStream(ctx, stream)` | Create stream if it does not exist (never updates existing) |

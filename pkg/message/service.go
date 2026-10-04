@@ -408,6 +408,14 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 	return nil
 }
 
+// ErrResultNotPublished is returned by ReportSuccess when the result could not be published.
+// The source message is left unsettled for the caller to retry or report.
+var ErrResultNotPublished = errors.New("result not published")
+
+// ErrAckAfterPublish is returned by ReportSuccess when the result was published but the source
+// message could not be acknowledged. The unit is complete; its redelivery is a duplicate.
+var ErrAckAfterPublish = errors.New("result published, ack failed")
+
 // ReportSuccess publishes unit execution result to JetStream result stream.
 // For results below the resolver's inline threshold (resolver.DefaultMaxInlineBytes,
 // 500KB), includes full payload inline. For larger results, stores in
@@ -526,20 +534,9 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 			zap.String("run_id", runID),
 			zap.Error(err))
 
-		// Report the publish failure as an error
-		publishErr := fmt.Errorf("failed to publish result: %w", err)
-		if reportErr := s.ReportError(ctx, executionID, workflowID, runID, correlationID, publishErr, msg); reportErr != nil {
-			s.logger.Error("Failed to report publish error (cascading failure)",
-				zap.String("execution_id", executionID),
-				zap.String("workflow_id", workflowID),
-				zap.String("run_id", runID),
-				zap.Error(reportErr))
-		}
-
-		if msg != nil {
-			_ = msg.Nak() // Retry on publish failure
-		}
-		return publishErr
+		// The caller decides whether to retry or report: a failure published here would end the
+		// node in Zeus before a retry could deliver the result.
+		return fmt.Errorf("%w: %w", ErrResultNotPublished, err)
 	}
 
 	publishDuration := time.Since(startTime)
@@ -571,7 +568,7 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 				zap.String("jetstream_deliver_count", jetStreamDeliverCountStr(msg)),
 				zap.String("jetstream_source_ack_action", "ack_after_success_result_publish_failed"),
 				zap.Error(err))
-			return fmt.Errorf("failed to acknowledge: %w", err)
+			return fmt.Errorf("%w: %w", ErrAckAfterPublish, err)
 		}
 	}
 

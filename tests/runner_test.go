@@ -754,6 +754,51 @@ func TestRunnerTransientFailureOnLastAttemptReportsFinal(t *testing.T) {
 	}
 }
 
+// A plugin that succeeded but whose result could not be published is retried like a transient
+// failure: no failed result reaches Zeus while attempts remain, so the retry can still deliver
+// the real result.
+func TestRunnerResultPublishFailureRetriesWithoutReporting(t *testing.T) {
+	mockClient := newMockClient()
+	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
+		WithMetadata("execution_id", "wf-1-node-1-123").
+		WithNode("parent-node", map[string]interface{}{}).
+		WithPayload(`{}`)
+	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 1)
+	mockClient.setReportError(errors.New("results stream unavailable"))
+
+	mockProc := &mockProcessor{
+		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
+			out := message.NewWorkflowMessage("wf-1", "run-1").WithPayload(`{"ok":true}`)
+			out.Payload.ExecutionID = "wf-1-node-1-123"
+			return *out, nil
+		},
+	}
+	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil && len(jsMsg.delayedNaks()) == 0 && !jsMsg.wasNakked() && !jsMsg.wasTermed() {
+			time.Sleep(50 * time.Millisecond)
+		}
+		cancel()
+	}()
+	_ = r.Run(ctx)
+
+	if got := mockClient.mockJS.publishedResults(t); len(got) != 0 {
+		t.Fatalf("published %d results, want 0 while attempts remain", len(got))
+	}
+	if got := jsMsg.delayedNaks(); len(got) != 1 || got[0] != 5*time.Second {
+		t.Fatalf("NakWithDelay calls = %v, want [5s]", got)
+	}
+	if jsMsg.wasNakked() || jsMsg.wasAcked() || jsMsg.wasTermed() {
+		t.Fatal("an unpublished result must only be retried with a delay")
+	}
+}
+
 func TestRunnerProcessFailureObserverPlainError(t *testing.T) {
 	var observerCalls atomic.Int32
 	mockClient := newMockClient()

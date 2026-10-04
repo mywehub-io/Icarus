@@ -27,10 +27,19 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
   `retry_at`. A retry, a dead pod's unit (no write for 60 s) or a new dispatch takes the claim
   over with a revision-checked update; a delivery that finds the unit running elsewhere is nak'd
   with a 30 s delay; a duplicate of a completed execution is terminated.
+- `public:` `ReportSuccess` no longer publishes a failed result or naks when the result cannot
+  be published. It returns an error wrapping `message.ErrResultNotPublished` and leaves the
+  message unsettled; if the result was published but the ack failed, the error wraps
+  `message.ErrAckAfterPublish`. The runner retries an unpublished result like a transient
+  failure and marks a published one done.
+- `public:` A unit cancelled by runner shutdown is nak'd for immediate redelivery and not
+  reported, unless it was on its last attempt. A message picked up after shutdown began is
+  nak'd instead of waiting out its ack deadline.
 
 ### Added
 
-- `public:` `message.ReportErrorOption`, `message.WithAttempt`, `message.FinalAttempt`,
+- `public:` `message.ErrResultNotPublished`, `message.ErrAckAfterPublish`,
+  `message.ReportErrorOption`, `message.WithAttempt`, `message.FinalAttempt`,
   `message.IsTransientError`, `Message.NakWithDelay` and `ResultMessage.Attempt`.
 
 ### Fixed

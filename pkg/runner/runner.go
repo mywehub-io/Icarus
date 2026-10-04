@@ -951,6 +951,57 @@ func (r *Runner) willRetry(msg *message.Message, processErr error, attempt int) 
 		attempt > 0 && attempt < r.attemptLimit()
 }
 
+// handleReportSuccessError settles a unit whose plugin succeeded but whose result could not be
+// reported. Zeus treats the first failed result as final, so at most one is published:
+//   - published but not acked: the unit is complete; mark it done so a redelivery is Term'd;
+//   - not published, attempts left: retry after a delay, publishing nothing;
+//   - otherwise: report one final failure.
+func (r *Runner) handleReportSuccessError(span trace.Span, msg *message.Message, workflowID, runID, nodeID, executionID, correlationID string, reportErr error) error {
+	if errors.Is(reportErr, message.ErrAckAfterPublish) {
+		r.logger.Warn("Result published but the source message was not acked; a redelivery will be dropped as a duplicate",
+			zap.String("workflowID", workflowID),
+			zap.String("execution_id", executionID),
+			zap.Error(reportErr))
+		r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatDone, time.Time{})
+		return nil
+	}
+	if icarusnats.IsTransportError(reportErr) || !r.client.IsConnected() {
+		r.tryReconnectNATS()
+	}
+	attempt := deliverAttempt(msg)
+	if errors.Is(reportErr, message.ErrResultNotPublished) && r.willRetry(msg, reportErr, attempt) {
+		delay := retryDelay(attempt)
+		r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Now().Add(delay))
+		r.logger.Warn("Result not published; retrying the unit after a delay",
+			zap.String("workflowID", workflowID),
+			zap.String("execution_id", executionID),
+			zap.Int("attempt", attempt),
+			zap.Duration("retry_in", delay),
+			zap.Error(reportErr))
+		if nakErr := msg.NakWithDelay(delay); nakErr != nil {
+			r.logger.Error("Failed to nak message for retry; it is redelivered after the ack deadline instead",
+				zap.String("execution_id", executionID),
+				zap.Error(nakErr))
+		}
+		return reportErr
+	}
+	errorCtx, errorCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
+	defer errorCancel()
+	opts := []message.ReportErrorOption{message.WithAttempt(attempt), message.FinalAttempt()}
+	if err := r.client.Messages.ReportError(errorCtx, executionID, workflowID, runID, correlationID, reportErr, msg.GetJetStreamMsg(), opts...); err != nil {
+		r.logger.Error("CRITICAL: Failed to report error after the success report failed - workflow may hang",
+			zap.String("workflowID", workflowID),
+			zap.String("runID", runID),
+			zap.String("executionID", executionID),
+			zap.String("originalError", reportErr.Error()),
+			zap.Error(err))
+		r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Time{})
+		return reportErr
+	}
+	r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatDone, time.Time{})
+	return reportErr
+}
+
 // startAckHeartbeat extends the message's ack deadline every ackHeartbeatInterval until the
 // returned stop function is called. Stop is idempotent and waits for the goroutine to exit.
 //
@@ -1124,6 +1175,9 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 			zap.String("runID", runID),
 			zap.String("correlationID", correlationID))
 		span.SetStatus(codes.Error, "Context cancelled before processing")
+		if nakErr := msg.Nak(); nakErr != nil {
+			r.logger.Warn("Failed to nak unstarted message at shutdown", zap.Error(nakErr))
+		}
 		return ctx.Err()
 	default:
 		// Continue with processing
@@ -1253,6 +1307,17 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		// before the retry could succeed. The entry is marked retrying so the redelivery takes
 		// the claim over, and so Zeus's sweeper sees the unit as alive while it waits.
 		attempt := deliverAttempt(msg)
+		// The runner is shutting down, so the plugin was cancelled, not failed. Hand the unit
+		// back at once for another replica; only the last attempt is reported, as a failure.
+		if ctx.Err() != nil && workflowID != "" && runID != "" && msg.GetJetStreamMsg() != nil && attempt > 0 && attempt < r.attemptLimit() {
+			r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Time{})
+			if nakErr := msg.Nak(); nakErr != nil {
+				r.logger.Error("Failed to nak message at shutdown; it is redelivered after the ack deadline instead",
+					zap.String("execution_id", executionID),
+					zap.Error(nakErr))
+			}
+			return processErr
+		}
 		if workflowID != "" && runID != "" && r.willRetry(msg, processErr, attempt) {
 			delay := retryDelay(attempt)
 			r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Now().Add(delay))
@@ -1398,57 +1463,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		reportCtx, reportCancel := context.WithTimeout(backgroundWithSpan(span), 10*time.Minute)
 		defer reportCancel()
 		if reportErr := r.client.Messages.ReportSuccess(reportCtx, resultMessage, msg.GetJetStreamMsg()); reportErr != nil {
-			// ReportSuccess nak'd the message; let its redelivery take the claim over at once.
-			r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Time{})
-			r.logger.Error("Error reporting success, will report as error to workflow",
-				zap.String("workflowID", workflowID),
-				zap.String("runID", runID),
-				zap.Error(reportErr))
-
-			if icarusnats.IsTransportError(reportErr) || !r.client.IsConnected() {
-				r.tryReconnectNATS()
-			}
-
-			// Extract executionID from resultMessage metadata
-			executionID := ""
-			if resultMessage.Metadata != nil {
-				executionID = resultMessage.Metadata["execution_id"]
-			}
-
-			// Report the failure as an error to Temporal so the workflow knows about it
-			// Use longer timeout (30s) to match ReportError's retry logic
-			errorCtx, errorCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
-			defer errorCancel()
-
-			if errorReportErr := r.client.Messages.ReportError(errorCtx, executionID, workflowID, runID, correlationID, reportErr, msg.GetJetStreamMsg()); errorReportErr != nil {
-				// Critical: If we can't report the error, log it extensively
-				r.logger.Error("CRITICAL: Failed to report error to workflow after success report failed - workflow may hang",
-					zap.String("workflowID", workflowID),
-					zap.String("runID", runID),
-					zap.String("executionID", executionID),
-					zap.String("originalError", reportErr.Error()),
-					zap.Error(errorReportErr))
-
-				if icarusnats.IsTransportError(errorReportErr) || !r.client.IsConnected() {
-					r.tryReconnectNATS()
-				}
-
-				// Try one more time with a fresh context
-				time.Sleep(2 * time.Second)
-				retryCtx, retryCancel := context.WithTimeout(backgroundWithSpan(span), 30*time.Second)
-				if retryErr := r.client.Messages.ReportError(retryCtx, executionID, workflowID, runID, correlationID, reportErr, msg.GetJetStreamMsg()); retryErr != nil {
-					r.logger.Error("CRITICAL: Retry also failed to report error to JetStream",
-						zap.String("workflowID", workflowID),
-						zap.String("executionID", executionID),
-						zap.Error(retryErr))
-				} else {
-					r.logger.Info("Successfully reported error to JetStream on retry",
-						zap.String("workflowID", workflowID),
-						zap.String("executionID", executionID))
-				}
-				retryCancel()
-			}
-			return reportErr
+			return r.handleReportSuccessError(span, msg, workflowID, runID, nodeID, executionID, correlationID, reportErr)
 		}
 		r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatDone, time.Time{})
 	} else {
