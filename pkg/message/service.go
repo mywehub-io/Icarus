@@ -788,14 +788,6 @@ func FinalAttempt() ReportErrorOption {
 	return func(o *reportErrorOptions) { o.final = true }
 }
 
-// IsTransientError reports whether err is worth retrying: any error except an *AppError of a
-// type other than Internal. ReportError and the runner's retry decision both use it.
-func IsTransientError(err error) bool {
-	if appErr, ok := err.(*sdkerrors.AppError); ok {
-		return appErr.Type == sdkerrors.Internal
-	}
-	return true
-}
 
 // jetStreamDeliverCountStr returns JetStream NumDelivered for grep-friendly diagnostics, or "".
 func jetStreamDeliverCountStr(msg jetstream.Msg) string {

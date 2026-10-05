@@ -61,7 +61,7 @@ type Config struct {
 // ApplyDefaults sets default values for configuration fields
 func (c *Config) ApplyDefaults() {
 	if c.Timeout == 0 {
-		c.Timeout = 5 * time.Second
+		c.Timeout = time.Minute
 	}
 	if c.SecurityLevel == "" {
 		c.SecurityLevel = SecurityLevelStandard

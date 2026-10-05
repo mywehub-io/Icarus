@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -500,7 +502,7 @@ func TestClaimOrNak_WinsClaim_Processes(t *testing.T) {
 func TestWillRetry(t *testing.T) {
 	r := newHeartbeatRunner()
 	r.maxDeliver.Store(5)
-	transient := errors.New("connection reset")
+	transient := fmt.Errorf("call dependency: %w", syscall.ECONNRESET)
 
 	for attempt := 1; attempt <= 5; attempt++ {
 		msg := buildMessageFor(t, &heartbeatMsg{numDelivered: uint64(attempt)})
@@ -513,6 +515,9 @@ func TestWillRetry(t *testing.T) {
 	msg := buildMessageFor(t, &heartbeatMsg{})
 	if r.willRetry(msg, sdkerrors.NewBadRequestError("bad input", "BAD_INPUT", nil), 1) {
 		t.Error("a permanent error must not be retried")
+	}
+	if r.willRetry(msg, errors.New("invalid regex"), 1) {
+		t.Error("an unclassified error is permanent and must not be retried")
 	}
 	if r.willRetry(&message.Message{}, transient, 1) {
 		t.Error("a message with no JetStream handle cannot be redelivered, so must not be retried")

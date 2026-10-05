@@ -4,8 +4,22 @@
 
 When `Processor.Process` returns an error, the runner first decides whether to retry it.
 
-**Transient error with attempts left** (any error except an `*errors.AppError` whose type is
-not `Internal`, on a delivery before the consumer's `MaxDeliver`):
+**Transient error with attempts left** (`message.IsTransientError`, on a delivery before the
+consumer's `MaxDeliver`, and not a unit that outran `processTimeout`). An error is transient
+only when something in its chain says so; anything else is permanent:
+
+| In the error chain | Transient |
+| --- | --- |
+| An error implementing `message.TransientClassifier` | What its `Transient()` returns |
+| An `*errors.AppError` | When its type is `Internal` |
+| A network timeout, a refused, reset or unreachable connection, a DNS failure | Yes |
+| A gRPC status `Unavailable`, `ResourceExhausted` or `DeadlineExceeded` | Yes |
+| An Azure `*azcore.ResponseError` with status 408, 429 or 5xx | Yes |
+| `context.DeadlineExceeded` from a bound the unit set itself | Yes |
+| Anything else, such as a plain `errors.New` or `fmt.Errorf` | No |
+
+Wrap causes with `%w`: a dependency failure formatted with `%v` loses its type and is permanent.
+
 
 1. The unit's `EXECUTION_HEARTBEATS` entry is marked `retrying`.
 2. The message is nak'd with a delay: 5 s after attempt 1, 15 s after 2, 30 s after 3, 60 s after.

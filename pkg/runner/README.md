@@ -85,7 +85,9 @@ Environment overrides:
 
 ## Error reporting
 
-When `Process` returns a transient error and delivery attempts remain, the runner retries:
+When `Process` returns a transient error (`message.IsTransientError`: an `Internal` `AppError`,
+a `TransientClassifier`, or a failure reaching a dependency; anything else is permanent) and
+delivery attempts remain, and the unit did not outrun `processTimeout`, the runner retries:
 it marks the unit `retrying` in `EXECUTION_HEARTBEATS` and naks the message with a delay
 (5 s, 15 s, 30 s, then 60 s). Nothing is reported.
 
