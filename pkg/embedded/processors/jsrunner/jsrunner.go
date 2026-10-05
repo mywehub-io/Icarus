@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/dop251/goja"
 	"github.com/wehubfusion/Icarus/pkg/embedded/runtime"
@@ -56,7 +55,7 @@ func (n *JSRunnerNode) Process(input runtime.ProcessInput) runtime.ProcessOutput
 	}
 
 	// Execute JavaScript with timeout
-	ctx, cancel := context.WithTimeout(input.Ctx, time.Duration(cfg.Timeout)*time.Millisecond)
+	ctx, cancel := context.WithTimeout(input.Ctx, cfg.Timeout)
 	defer cancel()
 
 	result, err := n.executeScript(ctx, input, &cfg)
@@ -167,6 +166,9 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 	case execErr := <-errChan:
 		return nil, execErr
 	case <-ctx.Done():
+		// Stop the script too: without this its goroutine keeps running after the node has
+		// failed, and a runaway loop holds a CPU core until the pod restarts.
+		vm.Interrupt("script execution timed out")
 		return nil, NewTimeoutError(n.NodeId(), "script execution timed out", input.ItemIndex, cfg.Timeout)
 	}
 
@@ -378,6 +380,11 @@ func wrapScript(script string) string {
 		return fmt.Sprintf("(function() {\n%s\n})()", script)
 	}
 
-	// Single expression - auto-return
-	return fmt.Sprintf("(function() { return %s; })()", script)
+	// Single expression - auto-return. A one-line statement such as `throw new Error("x");`
+	// or `while (true) {}` does not parse after `return`, so it runs as written instead.
+	asExpression := fmt.Sprintf("(function() { return %s; })()", script)
+	if _, err := goja.Parse("", asExpression); err == nil {
+		return asExpression
+	}
+	return fmt.Sprintf("(function() {\n%s\n})()", script)
 }

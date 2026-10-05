@@ -13,6 +13,33 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Fixed
+
+- `public:` An unclassified error is permanent again. v0.28.0 retried every error that was not
+  an `*AppError` of a non-Internal type, so a deterministic failure (an Error node, an invalid
+  expression, a missing input) waited about two minutes of retries before it was reported.
+  `IsTransientError` now retries only what is marked or recognised as transient, looking through
+  the whole error chain: an error implementing `TransientClassifier`, an `*AppError` of type
+  `Internal`, or a failure reaching a dependency (a network timeout, a refused, reset or
+  unreachable connection, a DNS failure, gRPC `Unavailable`, `ResourceExhausted` or
+  `DeadlineExceeded`, or an Azure 408, 429 or 5xx). A wrapped `*AppError` is now classified by its
+  type rather than treated as transient.
+- `public:` A unit that outruns `processTimeout` is reported at once instead of retried.
+- `public:` JS Runner: a one-line statement such as `throw new Error("x");` or `while (…) {…}`
+  runs as written. It was auto-returned as an expression and failed with a `SyntaxError` without
+  running. A one-line expression is still returned.
+- `public:` JS Runner: the script timeout applies, and its default is 1 minute (was 5s). It was
+  multiplied by a millisecond a second time, so a script ran until the runner's `processTimeout`
+  instead. A script that times out or is cancelled is now interrupted; before, its goroutine kept
+  running after the node had failed.
+
+### Added
+
+- `public:` `message.TransientClassifier`, for an error to say whether retrying it can succeed
+  without changing its type or text.
+
+## [0.28.0] — 2026-10-04
+
 ### Changed
 
 - `public:` The runner fetches only as many messages as it has idle workers (capped at

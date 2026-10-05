@@ -1318,7 +1318,10 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 			}
 			return processErr
 		}
-		if workflowID != "" && runID != "" && r.willRetry(msg, processErr, attempt) {
+		// A unit that outran processTimeout is reported, not retried: each retry would take as
+		// long again before failing the same way.
+		outranTimeout := processCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+		if workflowID != "" && runID != "" && !outranTimeout && r.willRetry(msg, processErr, attempt) {
 			delay := retryDelay(attempt)
 			r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Now().Add(delay))
 			r.logger.Warn("Transient failure; retrying after a delay",

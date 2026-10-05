@@ -3,6 +3,9 @@ package tests
 import (
 	"context"
 	"errors"
+	"fmt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -83,7 +86,6 @@ func (m *mockClientWrapper) setConsumerError(err error) {
 func (m *mockClientWrapper) setConsumerErrorBudget(err error, budget int) {
 	m.mockJS.setConsumerErrorBudget(err, budget)
 }
-
 
 func (m *mockClientWrapper) setReportError(err error) {
 	m.mockJS.setReportError(err)
@@ -687,7 +689,7 @@ func TestRunnerTransientFailureRetriesWithoutReporting(t *testing.T) {
 
 	mockProc := &mockProcessor{
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
-			return message.Message{}, errors.New("secret store briefly unavailable")
+			return message.Message{}, fmt.Errorf("fetch secret: %w", status.Error(codes.Unavailable, "secret store briefly unavailable"))
 		},
 	}
 	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil,
@@ -729,7 +731,7 @@ func TestRunnerTransientFailureOnLastAttemptReportsFinal(t *testing.T) {
 
 	mockProc := &mockProcessor{
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
-			return message.Message{}, errors.New("secret store still unavailable")
+			return message.Message{}, fmt.Errorf("fetch secret: %w", status.Error(codes.Unavailable, "secret store still unavailable"))
 		},
 	}
 	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
@@ -796,6 +798,72 @@ func TestRunnerResultPublishFailureRetriesWithoutReporting(t *testing.T) {
 	}
 	if jsMsg.wasNakked() || jsMsg.wasAcked() || jsMsg.wasTermed() {
 		t.Fatal("an unpublished result must only be retried with a delay")
+	}
+}
+
+// An unclassified failure (an Error node, a bad expression) is permanent: it is reported on the
+// first attempt, not retried for nearly two minutes first.
+func TestRunnerUnclassifiedFailureReportsAtOnce(t *testing.T) {
+	mockClient := newMockClient()
+	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
+		WithMetadata("execution_id", "wf-1-node-1-123").
+		WithNode("parent-node", map[string]interface{}{}).
+		WithPayload(`{}`)
+	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 1)
+
+	mockProc := &mockProcessor{
+		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
+			return message.Message{}, errors.New("Error node fired: order rejected")
+		},
+	}
+	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 30*time.Second, createTestLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	results := mockClient.mockJS.publishedResults(t)
+	if len(results) != 1 {
+		t.Fatalf("published %d results, want 1 on the first attempt", len(results))
+	}
+	if res := results[0]; res.Status != "failed" || res.Error == nil || res.Error.Retryable || res.Error.Message != "Error node fired: order rejected" {
+		t.Fatalf("result = %+v, want one non-retryable failure with the error text unchanged", res.Error)
+	}
+	if len(jsMsg.delayedNaks()) != 0 || !jsMsg.wasAcked() {
+		t.Fatalf("delayed naks %v, acked %v; want acked with no retry", jsMsg.delayedNaks(), jsMsg.wasAcked())
+	}
+}
+
+// A unit that outran processTimeout is reported at once: a retry would take as long again.
+func TestRunnerProcessTimeoutReportsAtOnce(t *testing.T) {
+	mockClient := newMockClient()
+	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
+		WithMetadata("execution_id", "wf-1-node-1-123").
+		WithNode("parent-node", map[string]interface{}{}).
+		WithPayload(`{}`)
+	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 1)
+
+	mockProc := &mockProcessor{
+		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
+			<-ctx.Done()
+			return message.Message{}, ctx.Err()
+		},
+	}
+	r, err := runner.NewRunner(mockClient.Client, mockProc, "test-stream", "test-consumer", 1, 100*time.Millisecond, createTestLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	if got := mockClient.mockJS.publishedResults(t); len(got) != 1 || got[0].Error == nil || got[0].Error.Retryable {
+		t.Fatalf("published %+v, want one non-retryable failure", got)
+	}
+	if len(jsMsg.delayedNaks()) != 0 {
+		t.Fatalf("a timed-out unit was retried: %v", jsMsg.delayedNaks())
 	}
 }
 

@@ -125,9 +125,18 @@ func TestMessageServiceReportError(t *testing.T) {
 		t.Errorf("ReportError failed: %v", err)
 	}
 
-	// Plain errors are transient (internal) → source message must be NAKed for redelivery
-	if !jsMsg.wasNakked() {
-		t.Error("Expected transient error to NAK the source message")
+	// A plain error is permanent (message.IsTransientError) → acked, not redelivered
+	if jsMsg.wasNakked() || !jsMsg.wasAcked() {
+		t.Error("Expected an unclassified error to ACK the source message")
+	}
+
+	// A transient one is NAKed for redelivery
+	transientMsg := newMockMsg("test.subject", []byte("test data"))
+	if err := c.Messages.ReportError(ctx, executionID, workflowID, runID, "", sdkerrors.NewInternalError("", "dependency down", "UNAVAILABLE", nil), transientMsg); err != nil {
+		t.Errorf("ReportError failed: %v", err)
+	}
+	if !transientMsg.wasNakked() {
+		t.Error("Expected a transient error to NAK the source message")
 	}
 
 	// Test ReportError without JetStream message (should also succeed)

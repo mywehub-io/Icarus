@@ -1,5 +1,28 @@
 # Upgrade guide
 
+## Upgrading to v0.28.1
+
+- **Unclassified errors fail at once.** Only an error marked or recognised as transient is
+  retried: an `*AppError` of type `Internal` (anywhere in the chain), an error implementing
+  `message.TransientClassifier`, or a failure reaching a dependency (network timeout, refused or
+  reset connection, DNS failure, gRPC `Unavailable`/`ResourceExhausted`/`DeadlineExceeded`, Azure
+  408/429/5xx). A plain `fmt.Errorf` or `errors.New` is permanent, as every failure was before
+  v0.28.0. Wrap a cause with `%w`, not `%v`, so a dependency failure stays recognisable.
+- **A unit that outruns `processTimeout` is reported, not retried.**
+- Error text and the reported error type are unchanged.
+
+### `pkg/embedded/processors/jsrunner`
+
+- **The script timeout applies, and defaults to 1 minute.** A JS Runner script now fails with a
+  `TimeoutError` after its `timeout`, and is interrupted. Since v0.6.0 the timeout was multiplied
+  by a millisecond a second time, so a script ran until the runner's `processTimeout` instead,
+  whatever its `timeout` said. The default was 5s; it is now 1 minute. A script that takes longer
+  than its timeout, which used to succeed, now fails: set `timeout` (a duration string, such as
+  `"2m"`) on that node's config.
+- **One-line statements run.** `throw new Error("x");`, `while (…) {…}` and similar one-line
+  statements without `return` used to be auto-returned as an expression and fail with a
+  `SyntaxError`. They now run as written. One-line expressions are still returned.
+
 ## Upgrading to v0.28.0
 
 No code change is required, but three runner behaviours change. Roll out Icarus users

@@ -3,6 +3,9 @@ package tests
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	goruntime "runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,8 +36,8 @@ func TestConfigApplyDefaults(t *testing.T) {
 	cfg := jsrunner.Config{}
 	cfg.ApplyDefaults()
 
-	if cfg.Timeout != 5*time.Second {
-		t.Fatalf("expected default timeout 5s, got %v", cfg.Timeout)
+	if cfg.Timeout != time.Minute {
+		t.Fatalf("expected default timeout 1m, got %v", cfg.Timeout)
 	}
 	if cfg.SecurityLevel != jsrunner.SecurityLevelStandard {
 		t.Fatalf("expected default security level standard, got %s", cfg.SecurityLevel)
@@ -236,23 +239,37 @@ func TestProcess_ScriptExecutionTimeout(t *testing.T) {
 		t.Fatalf("failed to create node: %v", err)
 	}
 
-	// Config with very short timeout and infinite loop script
-	rawConfig, _ := json.Marshal(jsrunner.Config{
-		Script:  "while(true) {}",
-		Timeout: 100 * time.Millisecond,
-	})
-
+	// Config with very short timeout and infinite loop script. The config is JSON as Apollo sends
+	// it: json.Marshal of a Config writes Timeout as nanoseconds, which UnmarshalJSON rejects, so
+	// the node would fail on its config and never run the script.
 	input := runtime.ProcessInput{
 		Ctx:       context.Background(),
 		Data:      map[string]interface{}{},
-		RawConfig: rawConfig,
+		RawConfig: []byte(`{"script":"while(true) {}","timeout":"100ms"}`),
 		ItemIndex: 0,
 	}
 
+	goroutinesBefore := goruntime.NumGoroutine()
+	start := time.Now()
 	output := node.Process(input)
+	elapsed := time.Since(start)
 
-	if output.Error == nil {
-		t.Fatalf("expected error due to timeout, got nil")
+	var timeoutErr *jsrunner.TimeoutError
+	if !errors.As(output.Error, &timeoutErr) {
+		t.Fatalf("expected a TimeoutError, got %v", output.Error)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("expected the 100ms timeout to stop the script, took %v", elapsed)
+	}
+
+	// The interrupted script's goroutine exits instead of spinning on.
+	deadline := time.Now().Add(2 * time.Second)
+	for goruntime.NumGoroutine() > goroutinesBefore {
+		if time.Now().After(deadline) {
+			t.Fatalf("script goroutine still running after the timeout: %d goroutines, %d before",
+				goruntime.NumGoroutine(), goroutinesBefore)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -266,23 +283,57 @@ func TestProcess_ScriptExecutionError(t *testing.T) {
 		t.Fatalf("failed to create node: %v", err)
 	}
 
-	// Script that throws an error
-	rawConfig, _ := json.Marshal(jsrunner.Config{
-		Script:  "throw new Error('test error')",
-		Timeout: 5 * time.Second,
-	})
+	// One-line statements that throw: each must run and fail with its own message, not with a
+	// SyntaxError from being auto-returned as an expression.
+	for _, script := range []string{
+		"throw new Error('test error')",
+		"throw new Error('test error');",
+		"if (true) { throw new Error('test error') }",
+	} {
+		rawConfig, _ := json.Marshal(map[string]interface{}{"script": script, "timeout": "5s"})
 
-	input := runtime.ProcessInput{
-		Ctx:       context.Background(),
-		Data:      map[string]interface{}{},
-		RawConfig: rawConfig,
-		ItemIndex: 0,
+		input := runtime.ProcessInput{
+			Ctx:       context.Background(),
+			Data:      map[string]interface{}{},
+			RawConfig: rawConfig,
+			ItemIndex: 0,
+		}
+
+		output := node.Process(input)
+
+		var execErr *jsrunner.ExecutionError
+		if !errors.As(output.Error, &execErr) {
+			t.Fatalf("%q: expected an ExecutionError, got %v", script, output.Error)
+		}
+		if msg := output.Error.Error(); !strings.Contains(msg, "test error") || strings.Contains(msg, "SyntaxError") {
+			t.Fatalf("%q: expected the script's own error, got %q", script, msg)
+		}
+	}
+}
+
+// TestProcess_OneLineExpressionReturnsValue checks a one-line expression is still returned.
+func TestProcess_OneLineExpressionReturnsValue(t *testing.T) {
+	node, err := jsrunner.NewJSRunnerNode(runtime.EmbeddedNodeConfig{
+		NodeId:     "test-node",
+		PluginType: "plugin-js",
+	})
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
 	}
 
-	output := node.Process(input)
-
-	if output.Error == nil {
-		t.Fatalf("expected error due to script error, got nil")
+	for script, want := range map[string]int64{"1 + 1": 2, "[1, 2, 3].length;": 3} {
+		rawConfig, _ := json.Marshal(map[string]interface{}{"script": script})
+		output := node.Process(runtime.ProcessInput{
+			Ctx:       context.Background(),
+			Data:      map[string]interface{}{},
+			RawConfig: rawConfig,
+		})
+		if output.Error != nil {
+			t.Fatalf("%q: unexpected error: %v", script, output.Error)
+		}
+		if got := output.Data["result"]; got != want {
+			t.Fatalf("%q: expected result %d, got %v (%T)", script, want, got, got)
+		}
 	}
 }
 
@@ -508,27 +559,27 @@ func TestProcess_ContextCancellation(t *testing.T) {
 		t.Fatalf("failed to create node: %v", err)
 	}
 
-	// Config with long-running script
-	rawConfig, _ := json.Marshal(jsrunner.Config{
-		Script:  "while(true) {}",
-		Timeout: 5 * time.Second,
-	})
-
 	// Create context that will be cancelled immediately
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
+	// Config with long-running script
 	input := runtime.ProcessInput{
 		Ctx:       ctx,
 		Data:      map[string]interface{}{},
-		RawConfig: rawConfig,
+		RawConfig: []byte(`{"script":"while(true) {}","timeout":"5s"}`),
 		ItemIndex: 0,
 	}
 
+	start := time.Now()
 	output := node.Process(input)
 
-	if output.Error == nil {
-		t.Fatalf("expected error due to context cancellation, got nil")
+	var timeoutErr *jsrunner.TimeoutError
+	if !errors.As(output.Error, &timeoutErr) {
+		t.Fatalf("expected the cancelled script to stop with a TimeoutError, got %v", output.Error)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("expected cancellation to stop the script at once, took %v", elapsed)
 	}
 }
 
