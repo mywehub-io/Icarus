@@ -32,9 +32,26 @@ func zapFields(fields []Field) []zap.Field {
 	return out
 }
 
-func (z *zapLogger) Debug(msg string, fields ...Field) { z.l.Debug(msg, zapFields(fields)...) }
-func (z *zapLogger) Info(msg string, fields ...Field)  { z.l.Info(msg, zapFields(fields)...) }
-func (z *zapLogger) Warn(msg string, fields ...Field)  { z.l.Warn(msg, zapFields(fields)...) }
+// Each method checks the level before converting fields: zap.Any on every field of every per-item
+// debug line was paid even when debug logging was off.
+func (z *zapLogger) Debug(msg string, fields ...Field) {
+	if z.l.Core().Enabled(zap.DebugLevel) {
+		z.l.Debug(msg, zapFields(fields)...)
+	}
+}
+
+func (z *zapLogger) Info(msg string, fields ...Field) {
+	if z.l.Core().Enabled(zap.InfoLevel) {
+		z.l.Info(msg, zapFields(fields)...)
+	}
+}
+
+func (z *zapLogger) Warn(msg string, fields ...Field) {
+	if z.l.Core().Enabled(zap.WarnLevel) {
+		z.l.Warn(msg, zapFields(fields)...)
+	}
+}
+
 func (z *zapLogger) Error(msg string, fields ...Field) { z.l.Error(msg, zapFields(fields)...) }
 
 // Compile-time proof the adapter satisfies the interface the runtime logs through.

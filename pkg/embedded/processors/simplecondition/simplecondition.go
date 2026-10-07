@@ -3,6 +3,7 @@ package simplecondition
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/wehubfusion/Icarus/pkg/embedded/runtime"
@@ -93,8 +94,11 @@ func (n *SimpleConditionNode) evaluateCondition(input runtime.ProcessInput, manu
 		for key := range input.Data {
 			availableFields = append(availableFields, key)
 		}
-		msg := fmt.Sprintf("field '%s' not found in input. Available fields: %v. Input data: %+v",
-			fieldPath, availableFields, input.Data)
+		// Keys only: the values are the item itself, which can be patient data, and this
+		// message becomes node output and log text.
+		sort.Strings(availableFields)
+		msg := fmt.Sprintf("field '%s' not found in input. Available fields: %v",
+			fieldPath, availableFields)
 		return false, nil, msg
 	}
 

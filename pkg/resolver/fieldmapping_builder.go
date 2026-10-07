@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/wehubfusion/Icarus/pkg/embedded/runtime"
+	"github.com/wehubfusion/Icarus/pkg/fileref"
 	"github.com/wehubfusion/Icarus/pkg/message"
 )
 
@@ -1226,6 +1227,21 @@ func buildInputFromMappings(params BuildInputParams) ([]byte, error) {
 			// Source result has no projected fields
 			failedMappings = append(failedMappings, fmt.Sprintf("source node '%s' result has no projected fields",
 				mapping.SourceNodeID))
+		}
+
+		// A byte port's value is a file reference: copied as it is to every destination, never
+		// unwrapped, merged into the root or descended into (decisions D4). Nothing is downloaded.
+		if mapping.ValueType == message.ValueTypeByte && sourceData != nil {
+			if _, isRef := fileref.Parse(sourceData); isRef {
+				for _, destEndpoint := range mapping.DestinationEndpoints {
+					dest := destEndpoint
+					if dest == "" || dest == "/" {
+						dest = mapping.SourceEndpoint
+					}
+					setFieldAtPath(inputData, dest, deepCopyValue(sourceData))
+				}
+				continue
+			}
 		}
 
 		if sourceData == nil {

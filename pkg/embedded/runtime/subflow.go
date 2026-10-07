@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/wehubfusion/Icarus/pkg/filestore"
 )
 
 // SubflowProcessor processes embedded nodes for a single parent item.
@@ -1212,6 +1214,10 @@ func (sp *SubflowProcessor) processDepthLevelParallel(
 				TotalItems:    0,
 				IsIteration:   iter != nil,
 				IterationPath: "",
+				Files:         filestore.FromContext(ctx),
+				WorkflowID:    sp.workflowID,
+				RunID:         sp.runID,
+				ParentNodeID:  sp.parentNodeId,
 			}
 			if iter != nil {
 				procInput.TotalItems = iter.TotalItems
@@ -1401,6 +1407,10 @@ func (sp *SubflowProcessor) processSingleNodeAtDepth(
 		TotalItems:    0,
 		IsIteration:   iter != nil,
 		IterationPath: "",
+		Files:         filestore.FromContext(ctx),
+		WorkflowID:    sp.workflowID,
+		RunID:         sp.runID,
+		ParentNodeID:  sp.parentNodeId,
 	}
 	if iter != nil {
 		procInput.TotalItems = iter.TotalItems

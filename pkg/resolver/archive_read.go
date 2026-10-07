@@ -101,9 +101,13 @@ func (s *Service) readArchive(
 	sourceNodeIDs map[string]bool,
 	mappings []message.FieldMapping,
 ) (map[string]*SourceResult, error) {
-	size, err := s.blobClient.BlobSize(ctx, f.BlobURL)
-	if err != nil {
-		return nil, fmt.Errorf("resolver: archive size for %s: %w", f.BlobURL, err)
+	size := f.SizeBytes
+	if size <= 0 {
+		var err error
+		size, err = s.blobClient.BlobSize(ctx, f.BlobURL)
+		if err != nil {
+			return nil, fmt.Errorf("resolver: archive size for %s: %w", f.BlobURL, err)
+		}
 	}
 
 	ra, err := storage.NewBlobReaderAt(ctx, s.blobClient, f.BlobURL, size)

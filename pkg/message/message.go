@@ -89,6 +89,23 @@ type FieldMapping struct {
 	DataType             string   `json:"dataType"`
 	Iterate              bool     `json:"iterate"`
 	IsEventTrigger       bool     `json:"isEventTrigger,omitempty"` // True when this mapping is an event trigger (conditional execution)
+	// ValueType is what the source port carries, from the plan (Zeus resolves the port type):
+	// "" for data, ValueTypeByte for a file reference, ValueTypeRecords for a record stream.
+	// Only a mapping typed here may hand a node a fileref.FileRef it will open (decisions D11).
+	ValueType string `json:"valueType,omitempty"`
+}
+
+// Field mapping value types (FieldMapping.ValueType).
+const (
+	// ValueTypeByte marks a byte port: the value is a fileref.FileRef, passed, never descended into.
+	ValueTypeByte = "BYTE"
+	// ValueTypeRecords marks a record port: the value is a FileRef to an .ndjson file, or an array.
+	ValueTypeRecords = "RECORDS"
+)
+
+// IsFile reports whether the mapping's value is a file reference (byte or records port).
+func (f FieldMapping) IsFile() bool {
+	return f.ValueType == ValueTypeByte || f.ValueType == ValueTypeRecords
 }
 
 // ConnectionDetails represents connection information

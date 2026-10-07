@@ -494,3 +494,27 @@ func (a *AzureBlobClient) extractBlobPath(reference string) (string, error) {
 
 	return ref, nil
 }
+
+// URLFor returns the URL of blobPath in the configured container, escaped as the SDK escapes
+// it, so a path can be handed to DownloadRange and BlobSize, which take URLs.
+func (a *AzureBlobClient) URLFor(blobPath string) string {
+	return a.client.ServiceClient().NewContainerClient(a.containerName).NewBlockBlobClient(blobPath).URL()
+}
+
+// DeleteBlob deletes blobPath from the configured container. A blob that does not exist is not
+// an error: the caller wants it gone, and it is.
+func (a *AzureBlobClient) DeleteBlob(ctx context.Context, blobPath string) error {
+	ctx, op := a.startOp(ctx, spanBlobDelete, logInfo, attribute.String("blob.path", blobPath))
+	_, err := a.client.DeleteBlob(ctx, a.containerName, blobPath, nil)
+	if err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && (respErr.ErrorCode == "BlobNotFound" || respErr.StatusCode == 404) {
+			op.finish(nil)
+			return nil
+		}
+		op.finish(err)
+		return fmt.Errorf("blob delete failed: %w", err)
+	}
+	op.finish(nil)
+	return nil
+}

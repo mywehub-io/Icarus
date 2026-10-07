@@ -79,6 +79,14 @@ func TestProcessMissingFieldSoftFail(t *testing.T) {
 	if !strings.Contains(warning, "message_type") {
 		t.Errorf("expected warning to mention missing field 'message_type', got: %s", warning)
 	}
+	// The warning names the available keys but never echoes their values: it becomes node
+	// output and log text, and an item can carry patient data.
+	if !strings.Contains(warning, "HL7_version") || !strings.Contains(warning, "sending_facility") {
+		t.Errorf("expected warning to list the available keys, got: %s", warning)
+	}
+	if strings.Contains(warning, "MFT") || strings.Contains(warning, "2.4") {
+		t.Errorf("warning must not contain input values, got: %s", warning)
+	}
 	if output.Data["true"] != nil {
 		t.Errorf("expected output[\"true\"] to be nil when field missing, got %v", output.Data["true"])
 	}

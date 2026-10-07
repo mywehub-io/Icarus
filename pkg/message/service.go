@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	sdkerrors "github.com/wehubfusion/Icarus/pkg/errors"
 	"go.opentelemetry.io/otel"
@@ -60,6 +62,10 @@ type MessageService struct {
 	// configured idle period (no pulls/acks). Intended for tenant pods whose lifecycle
 	// is shorter than the platform's; central/shared consumers should leave this at 0.
 	inactiveThreshold time.Duration
+	// resultStreamKnown is set once the result stream has been confirmed or created, so a
+	// result publish does not pay a STREAM.INFO round trip each time. Cleared when a publish finds
+	// the stream gone, which recreates it before the next attempt.
+	resultStreamKnown atomic.Bool
 }
 
 // BlobStorageClient interface for storing large results
@@ -281,6 +287,9 @@ func (s *MessageService) getMessageIdentifier(msg *Message) string {
 // be published to resultSubject. The stream is created on first use and never
 // modified afterwards.
 func (s *MessageService) ensureResultStream(ctx context.Context) error {
+	if s.resultStreamKnown.Load() {
+		return nil
+	}
 	streamName := s.resultStream
 
 	// Check if stream exists
@@ -316,6 +325,7 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 		}
 	}
 
+	s.resultStreamKnown.Store(true)
 	return nil
 }
 
@@ -368,6 +378,13 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 		if publishErr == nil {
 			break
 		}
+		if errors.Is(publishErr, jetstream.ErrNoStreamResponse) || errors.Is(publishErr, nats.ErrNoResponders) {
+			// The stream was deleted after it was confirmed: recreate it before retrying.
+			s.resultStreamKnown.Store(false)
+			if ensureErr := s.ensureResultStream(ctx); ensureErr != nil {
+				publishErr = ensureErr
+			}
+		}
 
 		if attempt < s.publishMaxRetries {
 			s.logger.Warn("Failed to publish result, retrying",
@@ -396,7 +413,7 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 		seq = pubAck.Sequence
 		stream = pubAck.Stream
 	}
-	s.logger.Info("Successfully published result message",
+	s.logger.Debug("Successfully published result message",
 		zap.String("execution_id", resultMsg.ExecutionID),
 		zap.String("workflow_id", resultMsg.WorkflowID),
 		zap.String("node_id", resultMsg.NodeID),
@@ -500,7 +517,7 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 	// Respect resolver's decision - use whatever it returned (blob or inline)
 	if resultMessage.Payload.BlobReference != nil {
 		// Resolver decided to use blob storage
-		s.logger.Info("Publishing result with blob reference from resolver",
+		s.logger.Debug("Publishing result with blob reference from resolver",
 			zap.String("execution_id", executionID),
 			zap.String("blob_url", resultMessage.Payload.BlobReference.URL),
 			zap.Int("size_bytes", resultMessage.Payload.BlobReference.SizeBytes))
@@ -512,7 +529,7 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 		inlineData := resultMessage.Payload.GetInlineData()
 		resultSize := len(inlineData)
 
-		s.logger.Info("Publishing result with inline data from resolver",
+		s.logger.Debug("Publishing result with inline data from resolver",
 			zap.String("execution_id", executionID),
 			zap.Int("size_bytes", resultSize))
 
@@ -540,7 +557,7 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 	}
 
 	publishDuration := time.Since(startTime)
-	s.logger.Info("Successfully published result to JetStream",
+	s.logger.Debug("Successfully published result to JetStream",
 		zap.String("workflow_id", workflowID),
 		zap.String("run_id", runID),
 		zap.String("execution_id", executionID),
@@ -551,7 +568,7 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 	// Acknowledge the source message
 	if msg != nil {
 		reportSuccessTotalMs := time.Since(startTime).Milliseconds()
-		s.logger.Info("JetStream source message ack after successful result publish",
+		s.logger.Debug("JetStream source message ack after successful result publish",
 			zap.String("workflow_id", workflowID),
 			zap.String("run_id", runID),
 			zap.String("execution_id", executionID),

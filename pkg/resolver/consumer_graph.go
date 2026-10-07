@@ -13,6 +13,9 @@ type RequiredBlobFile struct {
 	BlobURL       string   `json:"blobUrl"`       // URL to download the blob file
 	BlobPath      string   `json:"blobPath"`      // Blob storage path (for reference)
 	ContainsNodes []string `json:"containsNodes"` // List of node IDs whose results are in this file
+	// SizeBytes is the archive's length, from the result message. When set, the resolver opens
+	// the archive without a HEAD request first. Zero means unknown: the resolver asks.
+	SizeBytes int64 `json:"sizeBytes,omitempty"`
 }
 
 // ResultLocation tracks where a node's result is stored and includes inline data if available

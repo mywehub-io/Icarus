@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/wehubfusion/Icarus/pkg/filestore"
 )
 
 // FieldMapping represents the mapping configuration between nodes.
@@ -31,6 +33,9 @@ type FieldMapping struct {
 	IsEventTrigger bool `json:"isEventTrigger,omitempty"`
 	// Iterate indicates if this mapping should iterate over array items
 	Iterate bool `json:"iterate"`
+	// ValueType is "" for data, "BYTE" for a file reference, "RECORDS" for a record stream
+	// (message.FieldMapping.ValueType).
+	ValueType string `json:"valueType,omitempty"`
 }
 
 // IsEvent returns true if this mapping is an event trigger
@@ -666,6 +671,14 @@ type ProcessInput struct {
 	IsIteration bool
 	// IterationPath is the array path being iterated (e.g., "data")
 	IterationPath string
+	// Files opens the run's input files and writes output files. Nil when the parent unit runs
+	// without a file store (the old inline path, until the cut).
+	Files filestore.Store
+	// WorkflowID, RunID and ParentNodeID place an output file: fileref.PathFor with
+	// PathOptions.ParentNodeID set to ParentNodeID.
+	WorkflowID   string
+	RunID        string
+	ParentNodeID string
 }
 
 // ProcessOutput contains the result of embedded node processing.

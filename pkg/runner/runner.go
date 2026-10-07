@@ -106,6 +106,33 @@ func WithProcessFailureObserver(obs ProcessFailureObserver) RunnerOption {
 	}
 }
 
+// UnitObserver is told when each unit enters and leaves Process, for metrics. runner is the
+// stream name, a small bounded set; never pass ids as labels. Calls are made on the worker
+// goroutine and must not block.
+type UnitObserver interface {
+	UnitStarted(runner string, queueWait time.Duration, inputBytes int64)
+	UnitFinished(runner string, d time.Duration, err error, outputBytes int64)
+}
+
+// WithUnitObserver registers a UnitObserver.
+func WithUnitObserver(obs UnitObserver) RunnerOption {
+	return func(r *Runner) {
+		r.unitObserver = obs
+	}
+}
+
+// payloadBytes is the size a message reports for its payload: the blob reference's, or the
+// inline data's length.
+func payloadBytes(p *message.Payload) int64 {
+	if p == nil {
+		return 0
+	}
+	if p.BlobReference != nil && p.BlobReference.SizeBytes > 0 {
+		return int64(p.BlobReference.SizeBytes)
+	}
+	return int64(len(p.GetInlineData()))
+}
+
 // WithConsumerFilterSubject sets the JetStream consumer FilterSubject (tenant/default routing).
 func WithConsumerFilterSubject(filterSubject string) RunnerOption {
 	return func(r *Runner) {
@@ -154,6 +181,7 @@ type Runner struct {
 	// whether a transient failure is retried or reported as final (see retryPolicy).
 	maxDeliver             atomic.Int64
 	processFailureObserver ProcessFailureObserver
+	unitObserver           UnitObserver
 	// heartbeatKV is the EXECUTION_HEARTBEATS bucket used for the liveness heartbeat and the
 	// claim-per-execution-unit idempotency check (see startAckHeartbeat and claimExecutionUnit).
 	// nil when the bucket could not be created/reached at startup; both mechanisms degrade to
@@ -367,8 +395,10 @@ func (r *Runner) Close() error {
 }
 
 // fetchMaxWait bounds one fetch request. A fetch that finds no messages returns after it, so
-// the loop notices shutdown and freed workers within this time.
-var fetchMaxWait = 5 * time.Second
+// the loop notices shutdown and freed workers within this time. A worker that frees up while a
+// fetch is open waits up to this long for new work, so it is kept short (it was 5 s); an idle
+// runner pays one cheap pull request per second for it.
+var fetchMaxWait = 1 * time.Second
 
 // Run starts the message processing pipeline and blocks until shutdown completes.
 //
@@ -1130,7 +1160,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 			}
 		}
 	}
-	r.logger.Info("Runner processMessage start",
+	r.logger.Debug("Runner processMessage start",
 		zap.String("stream", r.stream),
 		zap.String("consumer", r.consumer),
 		zap.String("workflow_id", workflowID),
@@ -1184,7 +1214,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	}
 
 	start := time.Now()
-	r.logger.Info("Processing message",
+	r.logger.Debug("Processing message",
 		zap.String("workflowID", workflowID),
 		zap.String("runID", runID),
 		zap.String("correlationID", correlationID))
@@ -1235,10 +1265,18 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	// see startAckHeartbeat.
 	stopHeartbeat := r.startAckHeartbeat(processCtx, msg, workflowID, runID, nodeID)
 
+	if r.unitObserver != nil {
+		r.unitObserver.UnitStarted(r.stream, time.Duration(queueWaitMs)*time.Millisecond, payloadBytes(msg.Payload))
+	}
+
 	// Process the message
+	processStart := time.Now()
 	resultMessage, processErr := r.processor.Process(processCtx, msg)
 	stopHeartbeat()
 	processingTime := time.Since(start)
+	if r.unitObserver != nil {
+		r.unitObserver.UnitFinished(r.stream, time.Since(processStart), processErr, payloadBytes(resultMessage.Payload))
+	}
 
 	// Add processing time to spans
 	span.SetAttributes(attribute.Int64("processing.duration_ms", processingTime.Milliseconds()))
@@ -1454,11 +1492,16 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	if msg.Metadata != nil {
 		jetstreamDeliverEnd = msg.Metadata[message.MetaJetStreamDeliverCount]
 	}
-	r.logger.Info("Successfully processed message",
+	// The one Info line per unit (phase 12 step 1): the per-step lines before it are Debug.
+	r.logger.Info("Unit processed",
+		zap.String("stream", r.stream),
 		zap.String("workflowID", workflowID),
 		zap.String("runID", runID),
+		zap.String("node_id", nodeID),
+		zap.String("execution_id", executionID),
 		zap.String("correlationID", correlationID),
 		zap.String("jetstream_deliver_count", jetstreamDeliverEnd),
+		zap.Int64("queue_wait_ms", queueWaitMs),
 		zap.Duration("processingTime", processingTime))
 	// Report success if we have workflow information
 	// Use a longer timeout for large blob uploads (10 minutes to handle very large files)

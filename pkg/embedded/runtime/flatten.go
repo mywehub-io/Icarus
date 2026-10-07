@@ -3,6 +3,8 @@ package runtime
 import (
 	"fmt"
 	"strings"
+
+	"github.com/wehubfusion/Icarus/pkg/fileref"
 )
 
 // RootArrayKey is the reserved key for root-as-array. When input/root is an array,
@@ -54,6 +56,11 @@ func FlattenMap(data map[string]interface{}, nodeId, basePath string) map[string
 
 		switch v := value.(type) {
 		case map[string]interface{}:
+			// A file reference is one value: it is passed, never descended into.
+			if fileref.IsRef(v) {
+				result[flatKey] = v
+				continue
+			}
 			// Recursively flatten nested objects
 			nested := FlattenMap(v, nodeId, fullPath)
 			for nk, nv := range nested {
@@ -433,6 +440,11 @@ func FlattenMapWithIndex(data map[string]interface{}, nodeId, basePath string, i
 
 		switch v := value.(type) {
 		case map[string]interface{}:
+			// A file reference is one value: it is passed, never descended into.
+			if fileref.IsRef(v) {
+				result[flatKey] = v
+				continue
+			}
 			// Recursively flatten nested objects
 			nested := FlattenMapWithIndex(v, nodeId, fullPath, index)
 			for nk, nv := range nested {
