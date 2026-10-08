@@ -9,6 +9,10 @@ import (
 	"github.com/wehubfusion/Icarus/pkg/schema"
 )
 
+// maxParseFileBytes caps a JSON document read from a file: the schema engine validates it whole
+// (ValidateStream streams it in a later step).
+const maxParseFileBytes = 64 << 20
+
 // executeParse validates and transforms incoming JSON data against a schema
 // Input: ProcessInput.Data["data"] - can be base64 string or raw JSON
 // Output: Flattened schema fields (e.g., {"name": "Alice", "age": 30})
@@ -29,33 +33,43 @@ func (n *JsonOpsNode) executeParse(input runtime.ProcessInput, cfg *Config) runt
 	var dataToValidate []byte
 	var err error
 
-	switch v := dataField.(type) {
-	case string:
-		// Data is base64-encoded string - decode it
-		dataToValidate, err = base64.StdEncoding.DecodeString(v)
-		if err != nil {
-			return runtime.ErrorOutput(NewProcessingError(
-				n.NodeId(),
-				"parse",
-				"failed to decode base64 data",
-				input.ItemIndex,
-				err,
-			))
-		}
-	case []byte:
-		// Data is already bytes
-		dataToValidate = v
-	default:
-		// Data is JSON object/array - marshal it
-		dataToValidate, err = json.Marshal(v)
-		if err != nil {
-			return runtime.ErrorOutput(NewProcessingError(
-				n.NodeId(),
-				"parse",
-				"failed to marshal data field",
-				input.ItemIndex,
-				err,
-			))
+	// Raw payloads: a file a BYTE mapping delivered to "data" is the JSON document itself.
+	fileData, isFile, fileErr := input.ReadTrustedFile("data", maxParseFileBytes)
+	if fileErr != nil {
+		return runtime.ErrorOutput(NewProcessingError(n.NodeId(), "parse", "failed to read data file", input.ItemIndex, fileErr))
+	}
+
+	if isFile {
+		dataToValidate = fileData
+	} else {
+		switch v := dataField.(type) {
+		case string:
+			// Data is base64-encoded string - decode it
+			dataToValidate, err = base64.StdEncoding.DecodeString(v)
+			if err != nil {
+				return runtime.ErrorOutput(NewProcessingError(
+					n.NodeId(),
+					"parse",
+					"failed to decode base64 data",
+					input.ItemIndex,
+					err,
+				))
+			}
+		case []byte:
+			// Data is already bytes
+			dataToValidate = v
+		default:
+			// Data is JSON object/array - marshal it
+			dataToValidate, err = json.Marshal(v)
+			if err != nil {
+				return runtime.ErrorOutput(NewProcessingError(
+					n.NodeId(),
+					"parse",
+					"failed to marshal data field",
+					input.ItemIndex,
+					err,
+				))
+			}
 		}
 	}
 
@@ -69,7 +83,7 @@ func (n *JsonOpsNode) executeParse(input runtime.ProcessInput, cfg *Config) runt
 	}
 
 	// Create schema engine
-	engine := schema.NewEngine()
+	engine := schema.Shared()
 
 	// Process with schema
 	result, err := engine.ProcessWithSchema(

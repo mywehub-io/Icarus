@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/dop251/goja"
 	"github.com/wehubfusion/Icarus/pkg/embedded/runtime"
@@ -14,6 +15,25 @@ import (
 // JSRunnerNode implements JavaScript execution for embedded
 type JSRunnerNode struct {
 	runtime.BaseNode
+
+	// programs caches the compiled script (D20: compile once per node, new VM per item). The key
+	// is the wrapped script; a node's script does not change, so this holds one entry. Workers
+	// share the node, and a *goja.Program is safe to run on many VMs at once.
+	programs sync.Map // string -> *compiledScript
+}
+
+type compiledScript struct {
+	once sync.Once
+	prog *goja.Program
+	err  error
+}
+
+// program returns the compiled form of script, compiling it on first use.
+func (n *JSRunnerNode) program(script string) (*goja.Program, error) {
+	v, _ := n.programs.LoadOrStore(script, &compiledScript{})
+	c := v.(*compiledScript)
+	c.once.Do(func() { c.prog, c.err = goja.Compile("script.js", script, false) })
+	return c.prog, c.err
 }
 
 // NewJSRunnerNode creates a new jsrunner node instance
@@ -98,6 +118,11 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 		return nil, NewConfigError(n.NodeId(), "failed to register utilities", err)
 	}
 
+	// The file helpers read and write the run's files (raw payloads).
+	if err := registerFileHelpers(vm, input); err != nil {
+		return nil, NewConfigError(n.NodeId(), "failed to register file helpers", err)
+	}
+
 	// Inject input data as 'input' global
 	// Auto-unwrap: if input.Data is a map with single key "input" containing an array,
 	// unwrap it to provide better UX for users writing JS scripts
@@ -108,7 +133,7 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 			inputData = nestedInput
 		}
 	}
-	
+
 	if err := vm.Set("input", inputData); err != nil {
 		return nil, NewExecutionError(n.NodeId(), "failed to set input variable", input.ItemIndex, 0, 0, err)
 	}
@@ -146,7 +171,16 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 			}
 		}()
 
-		val, err := vm.RunString(wrappedScript)
+		prog, err := n.program(wrappedScript)
+		if err != nil {
+			errChan <- NewExecutionError(n.NodeId(), err.Error(), input.ItemIndex, 0, 0, err)
+			return
+		}
+		val, err := vm.RunProgram(prog)
+		if err == nil {
+			// Timer callbacks run here, on the VM's goroutine, after the synchronous script.
+			utilityRegistry.RunDueTimers()
+		}
 		if err != nil {
 			if gojaErr, ok := err.(*goja.Exception); ok {
 				errChan <- NewExecutionError(n.NodeId(), gojaErr.Error(), input.ItemIndex, 0, 0, gojaErr)

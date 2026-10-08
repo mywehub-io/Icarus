@@ -56,3 +56,45 @@ func ParseFilesItem(v interface{}) (FileRef, string, bool) {
 	ref, ok := Parse(map[string]interface{}{Key: m[Key]})
 	return ref, key, ok
 }
+
+// FilesKey is the key holding a files list: {"files": [item, ...]}.
+const FilesKey = "files"
+
+// FilesList returns a {files:[...]} value holding refs, each keyed by its file name.
+func FilesList(refs []FileRef) map[string]interface{} {
+	items := make([]interface{}, len(refs))
+	for i, r := range refs {
+		items[i] = FilesItem(r, r.FileName)
+	}
+	return map[string]interface{}{FilesKey: items}
+}
+
+// ParseFilesList reads a {files:[...]} value: at least one item, every item a list item
+// (ParseFilesItem). Other keys beside "files" (form fields) are ignored. It does not say the files
+// may be opened: see InRun.
+func ParseFilesList(v interface{}) (refs []FileRef, keys []string, ok bool) {
+	if raw, isRaw := v.(json.RawMessage); isRaw {
+		var decoded interface{}
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			return nil, nil, false
+		}
+		v = decoded
+	}
+	m, isMap := v.(map[string]interface{})
+	if !isMap {
+		return nil, nil, false
+	}
+	items, isList := m[FilesKey].([]interface{})
+	if !isList || len(items) == 0 {
+		return nil, nil, false
+	}
+	for _, item := range items {
+		ref, key, ok := ParseFilesItem(item)
+		if !ok {
+			return nil, nil, false
+		}
+		refs = append(refs, ref)
+		keys = append(keys, key)
+	}
+	return refs, keys, true
+}

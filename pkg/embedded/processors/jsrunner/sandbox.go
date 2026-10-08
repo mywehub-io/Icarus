@@ -97,21 +97,7 @@ func (s *Sandbox) freezeBuiltins(vm *goja.Runtime) error {
 		return nil
 	}
 
-	freezeScript := `
-		(function() {
-			function freezeObject(obj) {
-				if (obj && typeof obj === 'object') {
-					Object.freeze(obj);
-					if (obj.prototype) {
-						Object.freeze(obj.prototype);
-					}
-				}
-			}
-			return freezeObject;
-		})()
-	`
-
-	val, err := vm.RunString(freezeScript)
+	val, err := vm.RunProgram(freezeProgram)
 	if err != nil {
 		return fmt.Errorf("failed to create freeze function: %w", err)
 	}
@@ -159,3 +145,19 @@ func CreateSecureContext(vm *goja.Runtime, config *Config) error {
 
 	return nil
 }
+
+// freezeProgram builds the function the sandbox freezes builtins with. Compiled once per process
+// and run on each VM (D20).
+var freezeProgram = goja.MustCompile("freeze.js", `
+		(function() {
+			function freezeObject(obj) {
+				if (obj && typeof obj === 'object') {
+					Object.freeze(obj);
+					if (obj.prototype) {
+						Object.freeze(obj.prototype);
+					}
+				}
+			}
+			return freezeObject;
+		})()
+	`, false)

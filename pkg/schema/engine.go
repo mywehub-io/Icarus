@@ -1,6 +1,10 @@
 package schema
 
 import (
+	"crypto/sha256"
+	"sync"
+
+	"github.com/wehubfusion/Icarus/pkg/schema/contracts"
 	"github.com/wehubfusion/Icarus/pkg/schema/csv"
 	"github.com/wehubfusion/Icarus/pkg/schema/hl7"
 	schemajson "github.com/wehubfusion/Icarus/pkg/schema/json"
@@ -13,7 +17,21 @@ type Engine struct {
 	transformer *Transformer
 
 	registry *ProcessorRegistry
+
+	// compiledJSON caches parsed JSON schemas by the SHA-256 of their definition (raw payloads
+	// phase 16): an embedded JSON Parser or Producer used to parse its schema for every item. A
+	// parsed JSON schema is only read while processing (defaults are copied out), so one is shared
+	// safely. Bounded; it starts again empty when full.
+	compiledMu   sync.RWMutex
+	compiledJSON map[[32]byte]contracts.CompiledSchema
 }
+
+const maxCompiledSchemas = 256
+
+var defaultEngine = NewEngine()
+
+// Shared returns a process-wide engine, so callers that process many items reuse its schema cache.
+func Shared() *Engine { return defaultEngine }
 
 // NewEngine creates a new schema engine with JSON, CSV, and HL7 processors registered.
 func NewEngine() *Engine {
@@ -56,11 +74,31 @@ func (e *Engine) Process(
 		return nil, err
 	}
 
-	compiled, err := proc.ParseSchema(schemaDef)
-	if err != nil {
-		return nil, err
+	if format != FormatJSON {
+		compiled, err := proc.ParseSchema(schemaDef)
+		if err != nil {
+			return nil, err
+		}
+		return proc.Process(inputData, compiled, opts)
 	}
 
+	key := sha256.Sum256(schemaDef)
+	e.compiledMu.RLock()
+	compiled, ok := e.compiledJSON[key]
+	e.compiledMu.RUnlock()
+	if !ok {
+		parsed, err := proc.ParseSchema(schemaDef)
+		if err != nil {
+			return nil, err
+		}
+		compiled = parsed
+		e.compiledMu.Lock()
+		if e.compiledJSON == nil || len(e.compiledJSON) >= maxCompiledSchemas {
+			e.compiledJSON = make(map[[32]byte]contracts.CompiledSchema)
+		}
+		e.compiledJSON[key] = compiled
+		e.compiledMu.Unlock()
+	}
 	return proc.Process(inputData, compiled, opts)
 }
 

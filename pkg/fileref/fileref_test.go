@@ -164,3 +164,27 @@ func TestContentTypes(t *testing.T) {
 		}
 	}
 }
+
+func TestDocumentPath(t *testing.T) {
+	if got := DocumentPath("w", "r", "n/1", "input"); got != "results/w/r/n-1.input.json" {
+		t.Fatalf("got %q", got)
+	}
+	if !InRun(FileRef{Path: DocumentPath("w", "r", "n", "output")}, "w", "r") {
+		t.Fatal("a document path must be inside the run")
+	}
+}
+
+func TestFilesList(t *testing.T) {
+	a := FileRef{Path: "results/w/r/n/payload/files/0-a.dat", Size: 3, FileName: "a.dat"}
+	b := FileRef{Path: "results/w/r/n/payload/files/1-b.dat", Size: 4, FileName: "b.dat"}
+	raw, _ := json.Marshal(FilesList([]FileRef{a, b}))
+	refs, keys, ok := ParseFilesList(json.RawMessage(raw))
+	if !ok || len(refs) != 2 || refs[1].Path != b.Path || keys[0] != "a.dat" {
+		t.Fatalf("round trip: %v %v %v", refs, keys, ok)
+	}
+	for _, bad := range []string{`{"files":[]}`, `{"files":[{"file_name":"x","file_data":"eA=="}]}`, `{"x":1}`, `[1]`} {
+		if _, _, ok := ParseFilesList(json.RawMessage(bad)); ok {
+			t.Errorf("%s must not be a files list", bad)
+		}
+	}
+}

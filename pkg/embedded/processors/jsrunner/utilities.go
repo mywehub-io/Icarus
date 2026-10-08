@@ -96,6 +96,16 @@ func (r *UtilityRegistry) CleanupEnabled(vm *goja.Runtime, config *Config) error
 	return nil
 }
 
+// RunDueTimers runs the callbacks of fired timers on the caller's goroutine (see TimersUtility).
+func (r *UtilityRegistry) RunDueTimers() {
+	r.mu.RLock()
+	t, _ := r.utilities["timers"].(*TimersUtility)
+	r.mu.RUnlock()
+	if t != nil {
+		t.RunDue()
+	}
+}
+
 // isAllowedAtLevel checks if a utility is allowed at the given security level
 func (r *UtilityRegistry) isAllowedAtLevel(utility Utility, securityLevel string) bool {
 	allowedLevels := utility.AllowedSecurityLevels()
@@ -266,12 +276,36 @@ func (u *EncodingUtility) Cleanup(vm *goja.Runtime) error {
 	return nil
 }
 
-// TimersUtility provides setTimeout, clearTimeout, setInterval, clearInterval
+// TimersUtility provides setTimeout, clearTimeout, setInterval, clearInterval.
+//
+// A goja runtime is not safe for concurrent use, so a timer never calls into the VM from its own
+// goroutine. When it fires it queues the callback, and RunDue runs queued callbacks on the VM's
+// goroutine once the script's synchronous part has finished, as a JavaScript event loop would.
+// A timer still pending when the script's result is taken never runs.
 type TimersUtility struct {
 	timers map[int]*time.Timer
 	nextID int
 	mu     sync.Mutex
 	vmRef  *goja.Runtime
+	due    []goja.Callable
+}
+
+// RunDue runs the callbacks of timers that have fired, in firing order, on the caller's goroutine,
+// which must be the one running the VM. Callbacks that fire while it runs are run too, up to a
+// bound, so a callback that schedules another cannot loop forever.
+func (u *TimersUtility) RunDue() {
+	const maxCallbacks = 1000
+	for ran := 0; ran < maxCallbacks; ran++ {
+		u.mu.Lock()
+		if len(u.due) == 0 {
+			u.mu.Unlock()
+			return
+		}
+		cb := u.due[0]
+		u.due = u.due[1:]
+		u.mu.Unlock()
+		_, _ = cb(goja.Undefined())
+	}
 }
 
 func (u *TimersUtility) Name() string { return "timers" }
@@ -305,16 +339,11 @@ func (u *TimersUtility) Register(vm *goja.Runtime) error {
 
 		timer := time.AfterFunc(time.Duration(delay)*time.Millisecond, func() {
 			u.mu.Lock()
-			if u.vmRef == currentVM {
-				u.mu.Unlock()
-				callback(goja.Undefined())
-			} else {
-				u.mu.Unlock()
-			}
-
-			u.mu.Lock()
+			defer u.mu.Unlock()
 			delete(u.timers, id)
-			u.mu.Unlock()
+			if u.vmRef == currentVM {
+				u.due = append(u.due, callback)
+			}
 		})
 
 		u.timers[id] = timer
@@ -361,6 +390,7 @@ func (u *TimersUtility) Cleanup(vm *goja.Runtime) error {
 	u.timers = make(map[int]*time.Timer)
 	u.nextID = 0
 	u.vmRef = nil
+	u.due = nil
 
 	return nil
 }

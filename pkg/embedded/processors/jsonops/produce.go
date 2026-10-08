@@ -23,7 +23,7 @@ func (n *JsonOpsNode) executeProduce(input runtime.ProcessInput, cfg *Config) ru
 	}
 
 	// Parse schema to check root type
-	engine := schema.NewEngine()
+	engine := schema.Shared()
 	parsedSchema, parseErr := engine.ParseJSONSchema(cfg.Schema)
 
 	// Determine what data to process based on schema root type
@@ -122,7 +122,12 @@ func (n *JsonOpsNode) executeProduce(input runtime.ProcessInput, cfg *Config) ru
 	encoded := base64.StdEncoding.EncodeToString(processedJSON)
 
 	// Return with "encoded" key containing base64-encoded JSON (matches schema output_fields)
-	return runtime.SuccessOutput(map[string]interface{}{
+	out := map[string]interface{}{
 		"encoded": encoded,
-	})
+	}
+	// Raw payloads phase 4: a file when every consumer of /encoded reads files.
+	if err := input.MaybeFileOutput(out, "encoded", "application/json"); err != nil {
+		return runtime.ErrorOutput(NewProcessingError(n.NodeId(), "produce", "failed to write the output file", input.ItemIndex, err))
+	}
+	return runtime.SuccessOutput(out)
 }

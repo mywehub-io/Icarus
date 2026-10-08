@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -42,7 +43,11 @@ type SubflowProcessor struct {
 	// SubflowProcessor is shared by the worker pool.
 	accountMu    sync.Mutex
 	executedNode map[string]bool
-	skippedNode  map[string]string
+
+	// rawConfigs holds each node's config normalised with its action injected, built once here
+	// rather than for every item (raw payloads phase 16). Read only after construction.
+	rawConfigs  map[string]json.RawMessage
+	skippedNode map[string]string
 }
 
 // Reasons recorded by recordSkipped. A node skipped for one of these was considered and deliberately
@@ -130,6 +135,12 @@ func NewSubflowProcessor(config SubflowConfig) (*SubflowProcessor, error) {
 		return sortedConfigs[i].ExecutionOrder < sortedConfigs[j].ExecutionOrder
 	})
 
+	// Normalise each node's config once; every item reuses it.
+	rawConfigs := make(map[string]json.RawMessage, len(sortedConfigs))
+	for _, nc := range sortedConfigs {
+		rawConfigs[nc.NodeId] = InjectActionFromAction(NormalizeRawConfig(nc.NodeConfig.Config), nc.PluginType, nc.Action)
+	}
+
 	// Create node instances
 	nodes := make([]EmbeddedNode, 0, len(sortedConfigs))
 	for _, nodeConfig := range sortedConfigs {
@@ -166,6 +177,7 @@ func NewSubflowProcessor(config SubflowConfig) (*SubflowProcessor, error) {
 	}
 
 	return &SubflowProcessor{
+		rawConfigs:       rawConfigs,
 		parentNodeId:     config.ParentNodeId,
 		nodes:            nodes,
 		nodeConfigs:      sortedConfigs,
@@ -1201,12 +1213,11 @@ func (sp *SubflowProcessor) processDepthLevelParallel(
 				input = sp.buildSingleNodeInput(config, store)
 			}
 
-			normalized := NormalizeRawConfig(config.NodeConfig.Config)
 			procInput := ProcessInput{
 				Ctx:           ctx,
 				Data:          input,
 				Config:        nil,
-				RawConfig:     InjectActionFromAction(normalized, config.PluginType, config.Action),
+				RawConfig:     sp.rawConfigFor(config),
 				NodeId:        config.NodeId,
 				PluginType:    config.PluginType,
 				Label:         config.Label,
@@ -1218,6 +1229,8 @@ func (sp *SubflowProcessor) processDepthLevelParallel(
 				WorkflowID:    sp.workflowID,
 				RunID:         sp.runID,
 				ParentNodeID:  sp.parentNodeId,
+				ByteFields:    byteFields(config.FieldMappings),
+				FileOutputs:   fileOutputsFor(ctx, config.NodeId),
 			}
 			if iter != nil {
 				procInput.TotalItems = iter.TotalItems
@@ -1394,12 +1407,11 @@ func (sp *SubflowProcessor) processSingleNodeAtDepth(
 		input = sp.buildSingleNodeInput(config, store)
 	}
 
-	normalized := NormalizeRawConfig(config.NodeConfig.Config)
 	procInput := ProcessInput{
 		Ctx:           ctx,
 		Data:          input,
 		Config:        nil,
-		RawConfig:     InjectActionFromAction(normalized, config.PluginType, config.Action),
+		RawConfig:     sp.rawConfigFor(config),
 		NodeId:        config.NodeId,
 		PluginType:    config.PluginType,
 		Label:         config.Label,
@@ -1411,6 +1423,8 @@ func (sp *SubflowProcessor) processSingleNodeAtDepth(
 		WorkflowID:    sp.workflowID,
 		RunID:         sp.runID,
 		ParentNodeID:  sp.parentNodeId,
+		ByteFields:    byteFields(config.FieldMappings),
+		FileOutputs:   fileOutputsFor(ctx, config.NodeId),
 	}
 	if iter != nil {
 		procInput.TotalItems = iter.TotalItems
@@ -2287,3 +2301,12 @@ func (sp *SubflowProcessor) extractFromArrayPath(arr []interface{}, endpoint str
 
 // Ensure SubflowProcessor implements ItemProcessor
 var _ ItemProcessor = (*SubflowProcessor)(nil)
+
+// rawConfigFor returns the node's prepared config: built once in NewSubflowProcessor, or built now
+// for a node the constructor did not see.
+func (sp *SubflowProcessor) rawConfigFor(config EmbeddedNodeConfig) json.RawMessage {
+	if raw, ok := sp.rawConfigs[config.NodeId]; ok {
+		return raw
+	}
+	return InjectActionFromAction(NormalizeRawConfig(config.NodeConfig.Config), config.PluginType, config.Action)
+}

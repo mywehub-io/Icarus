@@ -241,3 +241,10 @@ func PathFor(workflowID, runID, nodeID, port string, opts PathOptions) string {
 func DefaultFileName(port, ext string) string {
 	return SanitizePart(strings.TrimPrefix(port, "/"), "payload") + "." + strings.TrimPrefix(ext, ".")
 }
+
+// DocumentPath is where a node's monitoring document lives (decisions D9):
+// results/{wf}/{run}/{nodeId}.{direction}.json, beside the node's folder so it never collides with
+// a port of the node. direction is "input" or "output".
+func DocumentPath(workflowID, runID, nodeID, direction string) string {
+	return RunPrefix(workflowID, runID) + SanitizePart(nodeID, "node") + "." + SanitizePart(direction, "output") + ".json"
+}

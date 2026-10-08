@@ -42,8 +42,24 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 		return runtime.ErrorOutput(err)
 	}
 
+	// Raw payloads: a file a BYTE mapping delivered to "payload" is streamed as the request body,
+	// with its length, instead of being decoded from base64 in memory.
+	var fileBody io.ReadCloser
+	var fileSize int64
+	if ref, ok := input.TrustedFile("payload"); ok {
+		if input.Files == nil {
+			return runtime.ErrorOutput(NewConfigError(n.NodeId(), "payload", "payload is a file but file storage is not configured", nil))
+		}
+		rc, openErr := input.Files.Open(input.Ctx, ref)
+		if openErr != nil {
+			return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "failed to open payload file: "+openErr.Error(), openErr, 0, nil))
+		}
+		defer rc.Close()
+		fileBody, fileSize = rc, ref.Size
+	}
+
 	// Build request
-	req, err := n.buildRequest(input.Ctx, &cfg, input.Data)
+	req, err := n.buildRequest(input.Ctx, &cfg, input.Data, fileBody, fileSize)
 	if err != nil {
 		return runtime.ErrorOutput(err)
 	}
@@ -55,6 +71,20 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 		return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "request failed: "+err.Error(), err, 0, nil))
 	}
 	defer resp.Body.Close()
+
+	// Raw payloads phase 4: when every consumer of /body reads files, stream the response into a
+	// file with its Content-Type instead of reading it into memory.
+	if input.WritesFile("body") {
+		ct := resp.Header.Get("Content-Type")
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		ref, werr := input.WriteOutputFile("body", ct, resp.Body)
+		if werr != nil {
+			return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "failed to store response body: "+werr.Error(), werr, resp.StatusCode, nil))
+		}
+		return runtime.SuccessOutput(map[string]interface{}{"status": resp.StatusCode, "body": ref})
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -69,7 +99,7 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 	return runtime.SuccessOutput(output)
 }
 
-func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}) (*http.Request, error) {
+func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}, fileBody io.Reader, fileSize int64) (*http.Request, error) {
 	urlStr, usingConnection, conn, err := n.resolveURL(cfg, data)
 	if err != nil {
 		return nil, err
@@ -80,16 +110,21 @@ func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map
 		return nil, err
 	}
 
-	payloadBytes := n.extractPayload(data)
-
 	var body io.Reader
-	if len(payloadBytes) > 0 && method != "GET" && method != "HEAD" {
-		body = bytes.NewReader(payloadBytes)
+	if method != "GET" && method != "HEAD" {
+		if fileBody != nil {
+			body = fileBody
+		} else if payloadBytes := n.extractPayload(data); len(payloadBytes) > 0 {
+			body = bytes.NewReader(payloadBytes)
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, body)
 	if err != nil {
 		return nil, NewConfigError(n.NodeId(), "url", "invalid URL: "+err.Error(), err)
+	}
+	if fileBody != nil && body != nil {
+		req.ContentLength = fileSize
 	}
 
 	if err := n.applyHeaders(req, cfg, data); err != nil {

@@ -57,7 +57,9 @@ func (t *Transformer) applyDefaultsToValue(data interface{}, prop *Property) (in
 			value, exists := obj[propName]
 
 			if !exists && propDef.Default != nil {
-				obj[propName] = propDef.Default
+				// A copy: the transform below may fill nested defaults into it, and the schema
+				// (cached and shared, see schema.Engine) must never change.
+				obj[propName] = copyDefault(propDef.Default)
 			} else if !exists && propDef.Type == TypeUUID {
 				generated := uuid.New().String()
 				prefix := ""
@@ -240,4 +242,24 @@ func (t *Transformer) truncateRecursive(data interface{}, maxLevel, currentLevel
 	}
 
 	return data
+}
+
+// copyDefault deep-copies a default value made of JSON maps and slices.
+func copyDefault(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for k, x := range t {
+			out[k] = copyDefault(x)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, x := range t {
+			out[i] = copyDefault(x)
+		}
+		return out
+	default:
+		return v
+	}
 }

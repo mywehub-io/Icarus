@@ -679,6 +679,12 @@ type ProcessInput struct {
 	WorkflowID   string
 	RunID        string
 	ParentNodeID string
+	// ByteFields are the input fields a BYTE mapping delivered (raw payloads): the only fields a
+	// processor may open as files. See TrustedFile.
+	ByteFields map[string]bool
+	// FileOutputs are this node's byte output endpoints every consumer reads as files (see
+	// WithFileOutputs). WriteOutputFile/MaybeFileOutput write those; others stay base64.
+	FileOutputs map[string]bool
 }
 
 // ProcessOutput contains the result of embedded node processing.

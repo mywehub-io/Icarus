@@ -49,6 +49,8 @@ type Service struct {
 	maxInlineBytes     int
 	maxConcurrentBlobs int
 	logger             *zap.Logger
+	// recordsMaterialiseMax caps building a records file in memory (see WithRecordsMaterialiseMax).
+	recordsMaterialiseMax int64
 }
 
 // NewService builds a resolver service. If blobClient is nil, only inline resolution works.
@@ -148,7 +150,7 @@ func (s *Service) ResolveMappedInput(
 		}
 	}
 
-	return s.buildInputFromFieldMappings(base, params)
+	return s.buildInputFromFieldMappings(ctx, base, params)
 }
 
 // ResolveMappedInputWithConsumerGraph resolves input using consumer graph to download multiple blob files.
@@ -288,15 +290,15 @@ func (s *Service) ResolveMappedInputWithConsumerGraph(
 		}
 	}
 
-	// Build input using field mappings with all source results
+	// Build input using field mappings with all source results; records references become the
+	// arrays they hold, for this (non-streaming) consumer.
 	buildParams := BuildInputParams{
 		UnitNodeID:    params.BlobSourceNodeID,
 		FieldMappings: params.FieldMappings,
 		SourceResults: params.SourceResults,
 		TriggerData:   params.TriggerData,
 	}
-
-	return buildInputFromMappings(buildParams)
+	return s.materialiseAndBuild(ctx, buildParams)
 }
 
 // downloadAndParseBlobFiles downloads multiple blob files in parallel and extracts SourceResults.
@@ -374,6 +376,7 @@ func (s *Service) downloadAndParseBlobFiles(
 
 // buildInputFromFieldMappings centralizes the logic for constructing unit inputs using field mappings.
 func (s *Service) buildInputFromFieldMappings(
+	ctx context.Context,
 	base []byte,
 	params *FieldMappingParams,
 ) ([]byte, error) {
@@ -387,19 +390,16 @@ func (s *Service) buildInputFromFieldMappings(
 		return []byte("{}"), nil
 	}
 
-	sourceResults := params.SourceResults
 	// Note: When using consumer graph, sourceResults should already be populated
 	// from downloadAndParseBlobFiles. If not, we can't extract from base blob
 	// without knowing which nodes are in the file (requires ContainsNodes).
-
 	buildParams := BuildInputParams{
 		UnitNodeID:    params.BlobSourceNodeID,
 		FieldMappings: params.FieldMappings,
-		SourceResults: sourceResults,
+		SourceResults: params.SourceResults,
 		TriggerData:   params.TriggerData,
 	}
-
-	return buildInputFromMappings(buildParams)
+	return s.materialiseAndBuild(ctx, buildParams)
 }
 
 // sourceResultsFromContent builds SourceResults from a flat map.

@@ -2,8 +2,9 @@ package simplecondition
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
+
+	"github.com/wehubfusion/Icarus/pkg/embedded/processors/internal/compiled"
 )
 
 // compareValues dispatches to the appropriate comparison function based on operator.
@@ -123,7 +124,7 @@ func compareEndsWith(actualValue, expectedValue interface{}, caseInsensitive boo
 func compareRegex(nodeID string, itemIndex int, actualValue, expectedValue interface{}) (bool, error) {
 	actual := toString(actualValue)
 	pattern := toString(expectedValue)
-	re, err := regexp.Compile(pattern)
+	re, err := compiled.Regexp(pattern)
 	if err != nil {
 		return false, NewComparisonError(nodeID, itemIndex, string(OpRegex), fmt.Sprintf("invalid regex pattern '%s': %v", pattern, err))
 	}
