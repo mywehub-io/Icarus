@@ -25,7 +25,7 @@ if err := c.Connect(ctx); err != nil {
 defer c.Close()
 ```
 
-## 2. Inject blob storage (optional but recommended for large payloads)
+## 2. Inject blob storage (required)
 
 ```go
 blob, err := storage.NewAzureBlobClient(os.Getenv("BLOB_CONNECTION_STRING"), "results", logger)
@@ -35,8 +35,9 @@ if err != nil {
 c.SetBlobStorage(blob)
 ```
 
-Payloads above 500 KB (per `pkg/resolver.DefaultMaxInlineBytes`) are automatically uploaded
-and replaced by a `BlobReference` in the result message.
+Every result is a blob: `resolver.Service.CreateResult` writes the unit's output document to
+storage and `ReportSuccess` publishes the `BlobReference`. There is no inline result and no size
+threshold; a result message without a blob reference is refused.
 
 ## 3. Implement `Processor`
 
@@ -44,23 +45,34 @@ and replaced by a `BlobReference` in the result message.
 type MyProcessor struct { /* dependencies */ }
 
 func (p *MyProcessor) Process(ctx context.Context, msg *message.Message) (message.Message, error) {
-    // Resolve input — handles inline and blob references transparently
-    inputBytes := []byte(msg.Payload.GetInlineData())
-    // ... or download from msg.Payload.BlobReference via your resolver service
+    // Resolve the input from the consumer graph and field mappings
+    // (resolverSvc.ResolveMappedInputWithConsumerGraph)
+    inputBytes, err := resolveInput(ctx, msg)
+    if err != nil {
+        return message.Message{}, err
+    }
 
-    // Do your work
+    // Do your work: the output is a flat document of "nodeId-/path" keys
     result, err := doWork(ctx, inputBytes)
     if err != nil {
         return message.Message{}, err // triggers ReportError
     }
 
+    // Write the result as a blob and carry its reference
+    res, err := resolverSvc.CreateResult(ctx, result, resolver.ResultMeta{
+        WorkflowID: msg.Payload.WorkflowID, RunID: msg.Payload.RunID,
+        NodeID: msg.Payload.NodeID, ExecutionID: msg.Payload.ExecutionID,
+    })
+    if err != nil {
+        return message.Message{}, err
+    }
     out := *msg // copy metadata forward
     out.Payload = &message.Payload{
-        InlineData:  strPtr(string(result)),
-        ExecutionID: msg.Payload.ExecutionID,
-        WorkflowID:  msg.Payload.WorkflowID,
-        RunID:       msg.Payload.RunID,
-        NodeID:      msg.Payload.NodeID,
+        BlobReference: res.BlobReference,
+        ExecutionID:   msg.Payload.ExecutionID,
+        WorkflowID:    msg.Payload.WorkflowID,
+        RunID:         msg.Payload.RunID,
+        NodeID:        msg.Payload.NodeID,
     }
     return out, nil
 }

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/wehubfusion/Icarus/pkg/fileref"
 	"github.com/wehubfusion/Icarus/pkg/schema/contracts"
 )
 
@@ -138,6 +139,8 @@ func (w *streamWalker) walkValue(prop *Property, path string) error {
 	}
 
 	switch {
+	case delim == '{' && prop != nil && prop.Type == TypeByte:
+		return w.walkByteObject(prop, path)
 	case delim == '{' && prop != nil && prop.Type == TypeObject:
 		return w.walkObject(prop, path)
 	case delim == '[' && prop != nil && prop.Type == TypeArray:
@@ -163,6 +166,51 @@ func (w *streamWalker) walkValue(prop *Property, path string) error {
 		return w.walkObject(nil, path)
 	}
 	return w.skipRest()
+}
+
+// maxByteRefBytes bounds the inner object of a file reference read into memory. A real reference
+// is a few hundred bytes; a larger value is not one.
+const maxByteRefBytes = 64 << 10
+
+// walkByteObject validates an object where the schema expects a BYTE value, whose '{' has been
+// read. A byte value is a file reference, an object with the single key "$file", and its length
+// is the file's size. Any other object is the type mismatch Validate reports for it. Only the
+// reference's inner object is held; every other key is skipped.
+func (w *streamWalker) walkByteObject(prop *Property, path string) error {
+	var inner json.RawMessage
+	keys := 0
+	for w.dec.More() {
+		tok, err := w.dec.Token()
+		if err != nil {
+			return syntaxErr(err)
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return fmt.Errorf("invalid input JSON: object key is %T", tok)
+		}
+		keys++
+		if key == fileref.Key && keys == 1 {
+			if err := w.dec.Decode(&inner); err != nil {
+				return syntaxErr(err)
+			}
+			continue
+		}
+		if err := w.skipValue(); err != nil {
+			return err
+		}
+	}
+	if _, err := w.dec.Token(); err != nil { // '}'
+		return syntaxErr(err)
+	}
+	var value interface{} = map[string]interface{}{}
+	if keys == 1 && inner != nil && len(inner) <= maxByteRefBytes {
+		var m interface{}
+		if err := json.Unmarshal(inner, &m); err == nil {
+			value = map[string]interface{}{fileref.Key: m}
+		}
+	}
+	w.v.validateValueIntoState(value, prop, path, w.state)
+	return w.stop()
 }
 
 // walkObject walks an object whose '{' has been read. A nil prop validates nothing.

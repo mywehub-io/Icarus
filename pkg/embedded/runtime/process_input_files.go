@@ -1,9 +1,6 @@
 package runtime
 
 import (
-	"bytes"
-	"context"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"path"
@@ -16,6 +13,10 @@ import (
 // byteFields returns the top-level input fields a mapping the plan marks BYTE delivers: the only
 // fields whose file references a processor may open (raw payloads, D11). A root destination takes
 // the source endpoint's last segment, as the resolver names it.
+// ByteFieldsOf is the ProcessInput.ByteFields for a node with these mappings, for a caller that
+// builds a ProcessInput itself (Elysium's standalone embedded unit).
+func ByteFieldsOf(mappings []FieldMapping) map[string]bool { return byteFields(mappings) }
+
 func byteFields(mappings []FieldMapping) map[string]bool {
 	var out map[string]bool
 	for _, m := range mappings {
@@ -51,6 +52,23 @@ func (in ProcessInput) TrustedFile(field string) (fileref.FileRef, bool) {
 	return fileref.Parse(in.Data[field])
 }
 
+// OpenTrustedFile opens the file at a trusted input field for streaming. isFile is false when the
+// field is not a trusted file reference.
+func (in ProcessInput) OpenTrustedFile(field string) (rc io.ReadCloser, ref fileref.FileRef, isFile bool, err error) {
+	ref, ok := in.TrustedFile(field)
+	if !ok {
+		return nil, ref, false, nil
+	}
+	if in.Files == nil {
+		return nil, ref, true, fmt.Errorf("input %s is a file but file storage is not configured", field)
+	}
+	rc, err = in.Files.Open(in.Ctx, ref)
+	if err != nil {
+		return nil, ref, true, fmt.Errorf("open input %s file: %w", field, err)
+	}
+	return rc, ref, true, nil
+}
+
 // ReadTrustedFile reads the file at a trusted input field whole. isFile is false when the field
 // is not a trusted file reference, and the processor reads the value as it always has. max > 0
 // refuses a larger file.
@@ -80,31 +98,10 @@ func (in ProcessInput) ReadTrustedFile(field string, max int64) (data []byte, is
 	return data, true, nil
 }
 
-type fileOutputsKey struct{}
-
-// WithFileOutputs records, for a unit's embedded nodes, which byte output ports every consumer
-// reads as files (node id -> endpoints). Elysium sets it from unit metadata embedded_file_outputs;
-// the runtime gives each node its own set in ProcessInput.FileOutputs.
-func WithFileOutputs(ctx context.Context, byNode map[string][]string) context.Context {
-	return context.WithValue(ctx, fileOutputsKey{}, byNode)
-}
-
-func fileOutputsFor(ctx context.Context, nodeID string) map[string]bool {
-	byNode, _ := ctx.Value(fileOutputsKey{}).(map[string][]string)
-	ports := byNode[nodeID]
-	if len(ports) == 0 {
-		return nil
-	}
-	out := make(map[string]bool, len(ports))
-	for _, p := range ports {
-		out["/"+strings.Trim(p, "/")] = true
-	}
-	return out
-}
-
-// WritesFile reports whether the node should write output port as a file.
+// WritesFile reports whether the node writes byte output port as a file: always, when the run has
+// a file store (a byte value is a file, raw payloads D1).
 func (in ProcessInput) WritesFile(port string) bool {
-	return in.Files != nil && in.FileOutputs["/"+strings.Trim(port, "/")]
+	return in.Files != nil
 }
 
 // WriteOutputFile writes one byte output of this embedded node under its parent unit
@@ -133,26 +130,4 @@ func (in ProcessInput) WriteOutputFile(port, contentType string, body io.Reader)
 		return nil, fmt.Errorf("output %s: %w", port, err)
 	}
 	return fileref.Value(ref), nil
-}
-
-// MaybeFileOutput writes data[key], a base64 byte output, as a file when the port is in
-// FileOutputs; otherwise it leaves data alone.
-func (in ProcessInput) MaybeFileOutput(data map[string]interface{}, key, contentType string) error {
-	if data == nil || !in.WritesFile(key) {
-		return nil
-	}
-	b64, ok := data[key].(string)
-	if !ok {
-		return nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		return fmt.Errorf("output %s: %w", key, err)
-	}
-	ref, err := in.WriteOutputFile(key, contentType, bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	data[key] = ref
-	return nil
 }

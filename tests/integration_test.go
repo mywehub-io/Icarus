@@ -51,7 +51,7 @@ func (p *integrationProcessor) Process(ctx context.Context, msg *message.Message
 	if execID := msg.Metadata["execution_id"]; execID != "" {
 		result.WithMetadata("execution_id", execID)
 	}
-	result.WithPayload(`{"result":"processed successfully"}`)
+	withResultBlob(result.WithPayload())
 
 	return *result, nil
 }
@@ -75,7 +75,7 @@ func TestClientMessageServiceIntegration(t *testing.T) {
 	msg := message.NewWorkflowMessage(workflowID, runID).
 		WithMetadata("execution_id", workflowID+"-test-node-1700000000000").
 		WithNode("test-node", map[string]interface{}{"type": "integration"}).
-		WithPayload(`{"data":"test message data"}`).
+		WithPayload().
 		WithOutput("stream")
 
 	data, err := msg.ToBytes()
@@ -97,14 +97,12 @@ func TestClientMessageServiceIntegration(t *testing.T) {
 	if consumed.Workflow.RunID != runID {
 		t.Errorf("RunID mismatch: expected %s, got %s", runID, consumed.Workflow.RunID)
 	}
-	if consumed.Payload.GetInlineData() != `{"data":"test message data"}` {
-		t.Errorf("Payload data mismatch: got %s", consumed.Payload.GetInlineData())
-	}
 	if consumed.Node.NodeID != "test-node" {
 		t.Errorf("Node ID mismatch: expected 'test-node', got %s", consumed.Node.NodeID)
 	}
 
 	// 4. Report success and verify the result is published + source message ACKed
+	withResultBlob(consumed)
 	if err := c.Messages.ReportSuccess(ctx, *consumed, consumed.GetJetStreamMsg()); err != nil {
 		t.Fatalf("ReportSuccess failed: %v", err)
 	}
@@ -147,7 +145,7 @@ func TestRunnerIntegration(t *testing.T) {
 	// Add test messages to the mock queue
 	for i := 0; i < 3; i++ {
 		testMsg := message.NewWorkflowMessage("integration-workflow", "integration-run").
-			WithPayload("test data")
+			WithPayload()
 		mockJS.addMessage(testMsg)
 	}
 
@@ -199,7 +197,7 @@ func TestRunnerWithFailingProcessor(t *testing.T) {
 
 	// Add a test message
 	testMsg := message.NewWorkflowMessage("failing-workflow", "failing-run").
-		WithPayload("test data")
+		WithPayload()
 	mockJS.addMessage(testMsg)
 
 	// Run the runner for a short time
@@ -233,7 +231,7 @@ func TestEndToEndWorkflow(t *testing.T) {
 	initialMsg := message.NewWorkflowMessage(workflowID, runID).
 		WithMetadata("execution_id", workflowID+"-input-node-1700000000000").
 		WithNode("input-node", map[string]interface{}{"type": "input"}).
-		WithPayload("initial data").
+		WithPayload().
 		WithOutput("stream")
 	mockJS.addMessage(initialMsg)
 

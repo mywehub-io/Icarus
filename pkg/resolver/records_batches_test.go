@@ -40,7 +40,7 @@ func results(ref interface{}) map[string]*SourceResult {
 // Batches of an over-cap iterated records input, put together, are exactly the whole input.
 func TestRecordsBatchesMatchTheWholeInput(t *testing.T) {
 	ctx, ref := bigRecords(t, 2503)
-	whole, err := NewService(nil, 0).materialiseAndBuild(ctx, BuildInputParams{FieldMappings: iterFile, SourceResults: results(ref)})
+	whole, err := NewService(nil).materialiseAndBuild(ctx, BuildInputParams{FieldMappings: iterFile, SourceResults: results(ref)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestRecordsBatchesMatchTheWholeInput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewService(nil, 0).WithRecordsMaterialiseMax(1024)
+	s := NewService(nil).WithRecordsMaterialiseMax(1024)
 	_, err = s.materialiseAndBuild(WithRecordsBatching(ctx, 1000), BuildInputParams{FieldMappings: iterFile, SourceResults: results(ref)})
 	var batches *RecordsBatches
 	if !errors.As(err, &batches) {
@@ -87,7 +87,7 @@ func TestRecordsBatchesMatchTheWholeInput(t *testing.T) {
 // Without batching on ctx, or for a whole-array reader, over the cap is still refused.
 func TestRecordsOverTheCapStillRefusedWhereBatchingCannotServe(t *testing.T) {
 	ctx, ref := bigRecords(t, 50)
-	s := NewService(nil, 0).WithRecordsMaterialiseMax(64)
+	s := NewService(nil).WithRecordsMaterialiseMax(64)
 	if _, err := s.materialiseAndBuild(ctx, BuildInputParams{FieldMappings: iterFile, SourceResults: results(ref)}); !errors.Is(err, ErrRecordsTooLarge) {
 		t.Fatalf("no batching on ctx: want too large, got %v", err)
 	}
@@ -124,4 +124,38 @@ func concatInputs(acc, part interface{}) (int, interface{}) {
 		return n, a
 	}
 	return 0, acc
+}
+
+// An iterated records input above the batching threshold is read in batches although it is far
+// below the materialise cap; below the threshold, or for a whole-array reader, it is built whole.
+func TestIteratedRecordsAboveTheBatchThresholdAreBatched(t *testing.T) {
+	ctx, ref := bigRecords(t, 500) // about 20 KB
+	s := NewService(nil).WithRecordsBatchAbove(4 << 10)
+	bctx := WithRecordsBatching(ctx, 100)
+
+	_, err := s.materialiseAndBuild(bctx, BuildInputParams{FieldMappings: iterFile, SourceResults: results(ref)})
+	var batches *RecordsBatches
+	if !errors.As(err, &batches) {
+		t.Fatalf("an iterated input above the threshold must be batched, got %v", err)
+	}
+	batches.Close()
+
+	// Below the threshold it is built whole.
+	small := NewService(nil).WithRecordsBatchAbove(1 << 20)
+	if _, err := small.materialiseAndBuild(bctx, BuildInputParams{FieldMappings: iterFile, SourceResults: results(ref)}); err != nil {
+		t.Fatalf("below the threshold nothing is batched: %v", err)
+	}
+
+	// Without batching on the context nothing is batched whatever the size.
+	if _, err := s.materialiseAndBuild(ctx, BuildInputParams{FieldMappings: iterFile, SourceResults: results(ref)}); err != nil {
+		t.Fatalf("no batching on ctx: %v", err)
+	}
+
+	// A whole-array reader of the same port needs the array, so the input is built whole.
+	whole := append([]message.FieldMapping{}, iterFile...)
+	whole = append(whole, message.FieldMapping{SourceNodeID: "csv", SourceEndpoint: "/data", DestinationEndpoints: []string{"/all"},
+		ValueType: message.ValueTypeRecords, DataType: "FIELD"})
+	if _, err := s.materialiseAndBuild(bctx, BuildInputParams{FieldMappings: whole, SourceResults: results(ref)}); err != nil {
+		t.Fatalf("a whole-array reader rules batching out, and the file fits the cap: %v", err)
+	}
 }

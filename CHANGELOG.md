@@ -13,6 +13,33 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Breaking: inline data is removed (raw payloads hard cut)
+
+A byte value is always a file reference and every unit result is a blob. Nothing is deprecated
+in place; the inline path is gone. Upgrading needs the consumers and producers of a stream to
+move together, and in-flight runs, the dead-letter stream and the JetStream backlog to be drained
+first.
+
+- `public:` `message.Payload.InlineData`, `GetInlineData` and `HasInlineData` are removed.
+  `Message.WithPayload()` takes no argument.
+- `public:` `message.ResultMessage.InlineResult`, `WithInlineResult` and `HasInlineResult` are
+  removed. `ReportSuccess` requires `Payload.BlobReference` and refuses a result without one.
+- `public:` `message.BlobReference.SizeBytes` is `int64`.
+- `public:` `resolver.NewService(blobClient)` no longer takes an inline threshold;
+  `DefaultMaxInlineBytes` and `Service.MaxInlineBytes` are removed. `ResolveInput`,
+  `ResolveMappedInput` and `ResolveMappedInputWithConsumerGraph` lose their `inline` argument.
+- `public:` `Service.CreateResult` always writes an archive and returns only a `BlobReference`
+  (`Result.InlineData` and `Result.UsedBlob` are removed); a nil blob client is an error, and the
+  payload must be a flat `nodeId-/path` document.
+- `public:` Removed: `Service.CreateResultStream`, `LocateEntry`, `EntryLocator`,
+  `StreamDestination`, `RangeSource`, `archive.StreamedValue`, `archive.BuildOpaque`,
+  `archive.BuildPayload`, `archive.Reader.IsRaw`, `Raw` and `Payload`, the opaque (raw) archive
+  kind, `resolver.ResultLocation.HasInlineData` and `InlineData`, and
+  `BuildPriorUnitOutputsFromConsumerGraph`. `Service.PriorUnitOutputs` replaces the last: it
+  reads the result blobs that hold the named nodes.
+- `public:` Embedded processors no longer read or write base64: a byte input must be a file
+  reference and a byte output is a file. `ProcessInput.MaybeFileOutput` is removed.
+
 ### Fixed
 
 - `public:` An unclassified error is permanent again. v0.28.0 retried every error that was not

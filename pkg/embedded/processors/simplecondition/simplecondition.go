@@ -12,6 +12,9 @@ import (
 // SimpleConditionNode implements conditional logic evaluation for embeddedv2.
 type SimpleConditionNode struct {
 	runtime.BaseNode
+
+	// cfgCache holds the parsed configuration, read-only, shared by every worker of the unit.
+	cfgCache runtime.ConfigCache[Config]
 }
 
 // NewSimpleConditionNode creates a new simple condition node.
@@ -24,12 +27,18 @@ func NewSimpleConditionNode(config runtime.EmbeddedNodeConfig) (runtime.Embedded
 	}, nil
 }
 
+// Prepare implements runtime.ConfigPreparer: the configuration is parsed once for the unit.
+func (n *SimpleConditionNode) Prepare(rawConfig json.RawMessage) {
+	_, _ = n.cfgCache.Get(rawConfig, runtime.ParseJSON[Config])
+}
+
 // Process evaluates conditions and returns event-based routing output.
 func (n *SimpleConditionNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
-	var cfg Config
-	if err := json.Unmarshal(input.RawConfig, &cfg); err != nil {
+	cfgp, err := n.cfgCache.Get(input.RawConfig, runtime.ParseJSON[Config])
+	if err != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "configuration", fmt.Sprintf("failed to parse configuration: %v", err)))
 	}
+	cfg := *cfgp
 
 	if err := cfg.Validate(); err != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "configuration", fmt.Sprintf("invalid configuration: %v", err)))

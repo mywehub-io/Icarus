@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sync"
 
+	"github.com/wehubfusion/Icarus/pkg/fileref"
 	"github.com/wehubfusion/Icarus/pkg/schema/contracts"
 )
 
@@ -219,7 +220,14 @@ func (v *Validator) validateValueIntoState(value interface{}, prop *Property, pa
 				}
 			}
 		default:
-			if state.add(contracts.ValidationError{Path: path, Message: fmt.Sprintf("expected string or bytes, got %T", value), Code: "TYPE_MISMATCH"}) {
+			if ref, ok := fileref.Parse(value); ok {
+				// A byte value is a file reference: its length is the file's size, not a decoded string.
+				for _, e := range v.validateByteLength(ref.Size, prop.Validation, path) {
+					if state.add(e) {
+						return
+					}
+				}
+			} else if state.add(contracts.ValidationError{Path: path, Message: fmt.Sprintf("expected string or bytes, got %T", value), Code: "TYPE_MISMATCH"}) {
 				return
 			}
 		}
@@ -412,11 +420,16 @@ func (v *Validator) validateValue(value interface{}, prop *Property, path string
 		case []byte:
 			errors = append(errors, v.validateByte(string(val), prop.Validation, path)...)
 		default:
-			errors = append(errors, contracts.ValidationError{
-				Path:    path,
-				Message: fmt.Sprintf("expected string or bytes, got %T", value),
-				Code:    "TYPE_MISMATCH",
-			})
+			if ref, ok := fileref.Parse(value); ok {
+				// A byte value is a file reference: its length is the file's size, not a decoded string.
+				errors = append(errors, v.validateByteLength(ref.Size, prop.Validation, path)...)
+			} else {
+				errors = append(errors, contracts.ValidationError{
+					Path:    path,
+					Message: fmt.Sprintf("expected string or bytes, got %T", value),
+					Code:    "TYPE_MISMATCH",
+				})
+			}
 		}
 
 	case TypeUUID:
@@ -614,7 +627,17 @@ func (v *Validator) validateByte(value string, rules *ValidationRules, path stri
 		}
 	}
 
-	byteLength := len(decoded)
+	return v.validateByteLength(int64(len(decoded)), rules, path)
+}
+
+// validateByteLength applies minLength and maxLength to a byte value's length in bytes: the
+// decoded length of a base64 string, or the size of a file reference.
+func (v *Validator) validateByteLength(length int64, rules *ValidationRules, path string) []contracts.ValidationError {
+	var errors []contracts.ValidationError
+	if rules == nil {
+		return errors
+	}
+	byteLength := int(length)
 
 	if rules.MinLength != nil {
 		minL := int(*rules.MinLength)

@@ -148,6 +148,11 @@ func NewSubflowProcessor(config SubflowConfig) (*SubflowProcessor, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create node %s: %w", nodeConfig.Label, err)
 		}
+		// A node that parses its configuration once is given it now, so the first item does not
+		// race to parse it and no item parses it again.
+		if p, ok := n.(ConfigPreparer); ok {
+			p.Prepare(rawConfigs[nodeConfig.NodeId])
+		}
 		nodes = append(nodes, n)
 	}
 
@@ -1230,7 +1235,6 @@ func (sp *SubflowProcessor) processDepthLevelParallel(
 				RunID:         sp.runID,
 				ParentNodeID:  sp.parentNodeId,
 				ByteFields:    byteFields(config.FieldMappings),
-				FileOutputs:   fileOutputsFor(ctx, config.NodeId),
 			}
 			if iter != nil {
 				procInput.TotalItems = iter.TotalItems
@@ -1424,7 +1428,6 @@ func (sp *SubflowProcessor) processSingleNodeAtDepth(
 		RunID:         sp.runID,
 		ParentNodeID:  sp.parentNodeId,
 		ByteFields:    byteFields(config.FieldMappings),
-		FileOutputs:   fileOutputsFor(ctx, config.NodeId),
 	}
 	if iter != nil {
 		procInput.TotalItems = iter.TotalItems

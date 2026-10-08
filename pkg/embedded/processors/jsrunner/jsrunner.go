@@ -16,6 +16,9 @@ import (
 type JSRunnerNode struct {
 	runtime.BaseNode
 
+	// cfgCache holds the parsed configuration, read-only, shared by every worker of the unit.
+	cfgCache runtime.ConfigCache[Config]
+
 	// programs caches the compiled script (D20: compile once per node, new VM per item). The key
 	// is the wrapped script; a node's script does not change, so this holds one entry. Workers
 	// share the node, and a *goja.Program is safe to run on many VMs at once.
@@ -48,13 +51,19 @@ func NewJSRunnerNode(config runtime.EmbeddedNodeConfig) (runtime.EmbeddedNode, e
 	}, nil
 }
 
+// Prepare implements runtime.ConfigPreparer: the configuration is parsed once for the unit.
+func (n *JSRunnerNode) Prepare(rawConfig json.RawMessage) {
+	_, _ = n.cfgCache.Get(rawConfig, runtime.ParseJSON[Config])
+}
+
 // Process executes the JavaScript code
 func (n *JSRunnerNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
 	// Parse configuration
-	var cfg Config
-	if err := json.Unmarshal(input.RawConfig, &cfg); err != nil {
+	cfgp, err := n.cfgCache.Get(input.RawConfig, runtime.ParseJSON[Config])
+	if err != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "failed to parse configuration", err))
 	}
+	cfg := *cfgp
 
 	// Apply defaults
 	cfg.ApplyDefaults()

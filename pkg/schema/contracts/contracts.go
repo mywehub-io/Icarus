@@ -86,6 +86,11 @@ type ProcessOptions struct {
 	CodeSeverityOverrides map[string]Severity
 	ApplyDefaults         bool
 	StructureData         bool
+	// ByteDefault, when set, is called for a BYTE property that takes its default value (a base64
+	// string saved in the schema) and returns the value to use instead: the processor decodes the
+	// default and writes it as a file, so the property carries a file reference like every other
+	// byte value (raw payloads Q4). Nil keeps the base64 string. JSON schemas only.
+	ByteDefault func(property, base64Value string) (interface{}, error)
 }
 
 // ProcessResult contains the result of schema processing.

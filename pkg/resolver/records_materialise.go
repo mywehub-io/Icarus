@@ -35,6 +35,27 @@ func (s *Service) recordsCap() int64 {
 	return DefaultRecordsMaterialiseMaxBytes
 }
 
+// DefaultRecordsBatchAboveBytes is the records file size above which a consumer that iterates over
+// it reads it in batches, never holding it whole (ICARUS_RECORDS_BATCH_ABOVE_BYTES). Below it the
+// array is built, as a small file costs less that way than the reader and the per-batch passes.
+const DefaultRecordsBatchAboveBytes int64 = 4 << 20
+
+// WithRecordsBatchAbove sets that size (0 or less keeps the default). It only matters for a context
+// that allows batching (WithRecordsBatching).
+func (s *Service) WithRecordsBatchAbove(n int64) *Service {
+	if n > 0 {
+		s.recordsBatchAboveMax = n
+	}
+	return s
+}
+
+func (s *Service) recordsBatchAbove() int64 {
+	if s.recordsBatchAboveMax > 0 {
+		return s.recordsBatchAboveMax
+	}
+	return DefaultRecordsBatchAboveBytes
+}
+
 type recordsStreamingKey struct{}
 
 // WithRecordsStreaming marks the consumer resolved under ctx as one that reads a records file

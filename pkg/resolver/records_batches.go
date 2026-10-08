@@ -83,10 +83,16 @@ func (b *RecordsBatches) Close() error {
 	return b.reader.Close()
 }
 
-// materialiseAndBuild materialises the records the mappings read and builds the input. An
-// over-cap records port read only by iterate mappings, when ctx allows batching, becomes a
-// *RecordsBatches error instead.
+// materialiseAndBuild materialises the records the mappings read and builds the input. A records
+// port read only by iterate mappings that is above the batching threshold, when ctx allows
+// batching, becomes a *RecordsBatches error instead, so a large iterated input is read in batches
+// rather than built whole; so does one above the materialise cap, which could not be built at all.
 func (s *Service) materialiseAndBuild(ctx context.Context, params BuildInputParams) ([]byte, error) {
+	if recordsBatchSize(ctx) > 0 {
+		if batches, ok := s.batchRecordsAbove(ctx, params, s.recordsBatchAbove()); ok {
+			return nil, batches
+		}
+	}
 	err := s.materialiseRecords(ctx, params.FieldMappings, params.SourceResults)
 	if err == nil {
 		return buildInputFromMappings(params)
@@ -94,15 +100,19 @@ func (s *Service) materialiseAndBuild(ctx context.Context, params BuildInputPara
 	if !errors.Is(err, ErrRecordsTooLarge) || recordsBatchSize(ctx) == 0 {
 		return nil, err
 	}
-	return nil, s.batchRecords(ctx, params, err)
+	if batches, ok := s.batchRecordsAbove(ctx, params, s.recordsCap()); ok {
+		return nil, batches
+	}
+	return nil, err
 }
 
-// batchRecords sets up batching for the one over-cap records port, or returns tooLarge when the
-// input is not one batching can serve.
-func (s *Service) batchRecords(ctx context.Context, params BuildInputParams, tooLarge error) error {
+// batchRecordsAbove sets up batching for the one records port above threshold bytes, when the
+// input is one batching can serve: every mapping that reads the port iterates, and no other port is
+// batched. ok is false otherwise, and the caller builds the input whole or refuses it.
+func (s *Service) batchRecordsAbove(ctx context.Context, params BuildInputParams, threshold int64) (*RecordsBatches, bool) {
 	store := filestore.FromContext(ctx)
 	if store == nil {
-		return tooLarge
+		return nil, false
 	}
 	type port struct{ node, port string }
 	var big *port
@@ -117,29 +127,29 @@ func (s *Service) batchRecords(ctx context.Context, params BuildInputParams, too
 		}
 		p := port{m.SourceNodeID, recordsPort(m.SourceEndpoint)}
 		ref, ok := fileref.Parse(r.RawFlatKeys[p.node+"-"+p.port])
-		if !ok || !ref.IsRecords() || ref.Size <= s.recordsCap() {
+		if !ok || !ref.IsRecords() || ref.Size <= threshold {
 			continue
 		}
 		if !m.Iterate {
-			return tooLarge // a whole-array reader needs it all
+			return nil, false // a whole-array reader needs it all
 		}
 		if big != nil && *big != p {
-			return tooLarge // only one batched port
+			return nil, false // only one batched port
 		}
 		big, bigRef = &p, ref
 	}
 	if big == nil {
-		return tooLarge
+		return nil, false
 	}
 	// Any whole-array reader of the same port rules batching out.
 	for _, m := range params.FieldMappings {
 		if m.ValueType == message.ValueTypeRecords && m.SourceNodeID == big.node && recordsPort(m.SourceEndpoint) == big.port && !m.Iterate {
-			return tooLarge
+			return nil, false
 		}
 	}
 	reader, err := records.Open(ctx, store, bigRef)
 	if err != nil {
-		return fmt.Errorf("resolver: open records %s: %w", bigRef.Path, err)
+		return nil, false
 	}
 	r := params.SourceResults[big.node]
 	key := big.node + "-" + big.port
@@ -155,5 +165,5 @@ func (s *Service) batchRecords(ctx context.Context, params BuildInputParams, too
 			}
 		},
 		build: func() ([]byte, error) { return buildInputFromMappings(params) },
-	}
+	}, true
 }

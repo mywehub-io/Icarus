@@ -157,7 +157,7 @@ func TestMessageSerializationErrors(t *testing.T) {
 	// Test serializing message that can't be marshaled (shouldn't happen with normal usage)
 	// This is more of a theoretical test since our Message struct should always be serializable
 	msg := message.NewWorkflowMessage("workflow-test", "run-test").
-		WithPayload( "content")
+		WithPayload()
 	data, err := msg.ToBytes()
 	if err != nil {
 		t.Errorf("Unexpected error serializing valid message: %v", err)

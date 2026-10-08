@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/wehubfusion/Icarus/pkg/fileref"
 	"github.com/wehubfusion/Icarus/pkg/storage"
@@ -26,6 +27,21 @@ type Backend interface {
 	DownloadRange(ctx context.Context, blobURL string, offset, count int64) ([]byte, error)
 	URLFor(blobPath string) string
 	DeleteBlob(ctx context.Context, blobPath string) error
+}
+
+// BackendCopier is a Backend that can copy a blob from a URL the storage service reads itself, so
+// the bytes never pass through this process. storage.AzureBlobClient implements it. An error
+// wrapping storage.ErrCopyNotStarted means nothing was written.
+type BackendCopier interface {
+	CopyFromURL(ctx context.Context, blobPath, sourceURL, contentType string, size int64, timeout time.Duration, metadata map[string]string) (string, error)
+}
+
+// Copier is implemented by a Store whose backend is a BackendCopier (raw payloads D14).
+type Copier interface {
+	// CopyFromURL copies sourceURL, whose length is size (-1 when unknown), into a new file at path,
+	// which must be under the run's prefix. contentType and fileName describe the new file.
+	// ok is false, with a nil error, when the backend cannot copy: the caller streams instead.
+	CopyFromURL(ctx context.Context, path, contentType, fileName, sourceURL string, size int64, timeout time.Duration) (ref fileref.FileRef, ok bool, err error)
 }
 
 // Store opens and creates the files of one run.
@@ -149,6 +165,48 @@ func (s *store) Create(ctx context.Context, path, contentType, fileName string) 
 		w.uploadErr = err
 	}()
 	return w, nil
+}
+
+// CopyFromURL implements Copier.
+func (s *store) CopyFromURL(ctx context.Context, path, contentType, fileName, sourceURL string, size int64, timeout time.Duration) (fileref.FileRef, bool, error) {
+	c, ok := s.backend.(BackendCopier)
+	if !ok {
+		return fileref.FileRef{}, false, nil
+	}
+	if err := s.check(path); err != nil {
+		return fileref.FileRef{}, true, err
+	}
+	if contentType == "" {
+		contentType = fileref.ContentTypeFor(path)
+	}
+	if _, err := c.CopyFromURL(ctx, path, sourceURL, contentType, size, timeout, map[string]string{
+		"workflow_id": s.workflowID,
+		"run_id":      s.runID,
+	}); err != nil {
+		return fileref.FileRef{}, true, fmt.Errorf("filestore: copy to %s: %w", path, err)
+	}
+	if size < 0 {
+		// An asynchronous copy of unknown length: the committed blob has the size.
+		n, err := backendSize(ctx, s.backend, path)
+		if err != nil {
+			return fileref.FileRef{}, true, fmt.Errorf("filestore: size of %s: %w", path, err)
+		}
+		size = n
+	}
+	return fileref.FileRef{Path: path, Size: size, ContentType: contentType, FileName: fileName}, true, nil
+}
+
+// backendSizer is implemented by a Backend that can report a blob's length by path.
+type backendSizer interface {
+	BlobSize(ctx context.Context, blobURL string) (int64, error)
+}
+
+func backendSize(ctx context.Context, b Backend, path string) (int64, error) {
+	sz, ok := b.(backendSizer)
+	if !ok {
+		return 0, fmt.Errorf("backend cannot report a size")
+	}
+	return sz.BlobSize(ctx, b.URLFor(path))
 }
 
 func errOrClosed(err error) error {

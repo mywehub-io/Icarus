@@ -13,9 +13,21 @@ import (
 	"github.com/wehubfusion/Icarus/pkg/fileref"
 )
 
-// maxScriptFileBytes caps one file a script reads or writes: a script holds the whole file in
-// memory (raw payloads; ICARUS_JS_MAX_FILE_BYTES in the plan, a constant until it is configurable).
-const maxScriptFileBytes = 16 << 20
+// DefaultMaxFileBytes caps one file a script reads or writes: a script holds the whole file in
+// memory. A host overrides it with SetMaxFileBytes (Elysium: ICARUS_JS_MAX_FILE_BYTES).
+const DefaultMaxFileBytes = 16 << 20
+
+var maxFileBytes atomic.Int64
+
+func init() { maxFileBytes.Store(DefaultMaxFileBytes) }
+
+// SetMaxFileBytes sets the largest file a script may read or write; n <= 0 restores the default.
+func SetMaxFileBytes(n int64) {
+	if n <= 0 {
+		n = DefaultMaxFileBytes
+	}
+	maxFileBytes.Store(n)
+}
 
 // registerFileHelpers sets the "file" global a script uses to read the files its inputs reference
 // and to write files for its byte outputs (raw payloads, phase 5 step 5):
@@ -25,8 +37,8 @@ const maxScriptFileBytes = 16 << 20
 //	file.bytes(ref)  the file as an array of byte values
 //	file.write(name, contentType, content)   writes a file; returns its reference
 //
-// Only files in this run can be opened: the run's store refuses any other path. Without a store
-// (the old inline path) the helpers are absent and a script keeps using atob on base64 inputs.
+// Only files in this run can be opened: the run's store refuses any other path. A run always has a
+// store; the guard keeps a unit test without one from failing at registration.
 func registerFileHelpers(vm *goja.Runtime, input runtime.ProcessInput) error {
 	if input.Files == nil {
 		return nil
@@ -36,8 +48,8 @@ func registerFileHelpers(vm *goja.Runtime, input runtime.ProcessInput) error {
 		if !ok {
 			panic(vm.NewTypeError("file: argument is not a file reference"))
 		}
-		if ref.Size > maxScriptFileBytes {
-			panic(vm.NewTypeError(fmt.Sprintf("file: %d bytes is above the %d byte limit for a script", ref.Size, maxScriptFileBytes)))
+		if limit := maxFileBytes.Load(); ref.Size > limit {
+			panic(vm.NewTypeError(fmt.Sprintf("file: %d bytes is above the %d byte limit for a script", ref.Size, limit)))
 		}
 		rc, err := input.Files.Open(input.Ctx, ref)
 		if err != nil {
@@ -117,8 +129,8 @@ func registerFileHelpers(vm *goja.Runtime, input runtime.ProcessInput) error {
 			}
 			content = b
 		}
-		if len(content) > maxScriptFileBytes {
-			panic(vm.NewTypeError(fmt.Sprintf("file.write: %d bytes is above the %d byte limit for a script", len(content), maxScriptFileBytes)))
+		if limit := maxFileBytes.Load(); int64(len(content)) > limit {
+			panic(vm.NewTypeError(fmt.Sprintf("file.write: %d bytes is above the %d byte limit for a script", len(content), limit)))
 		}
 		if contentType == "" || contentType == "undefined" {
 			contentType = fileref.ContentTypeFor(name)

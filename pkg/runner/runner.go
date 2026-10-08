@@ -121,16 +121,12 @@ func WithUnitObserver(obs UnitObserver) RunnerOption {
 	}
 }
 
-// payloadBytes is the size a message reports for its payload: the blob reference's, or the
-// inline data's length.
+// payloadBytes is the size a message reports for its payload: the blob reference's.
 func payloadBytes(p *message.Payload) int64 {
-	if p == nil {
+	if p == nil || p.BlobReference == nil {
 		return 0
 	}
-	if p.BlobReference != nil && p.BlobReference.SizeBytes > 0 {
-		return int64(p.BlobReference.SizeBytes)
-	}
-	return int64(len(p.GetInlineData()))
+	return p.BlobReference.SizeBytes
 }
 
 // WithConsumerFilterSubject sets the JetStream consumer FilterSubject (tenant/default routing).

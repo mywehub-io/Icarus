@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/wehubfusion/Icarus/pkg/fileref"
+	"github.com/wehubfusion/Icarus/pkg/filestore/memfs"
+	"github.com/wehubfusion/Icarus/pkg/storage"
 )
 
 // memBackend stores blobs in memory and, like a block blob upload, commits a blob only when
@@ -213,4 +215,40 @@ type failingBackend struct{ *memBackend }
 
 func (failingBackend) UploadStream(context.Context, string, io.Reader, string, map[string]string) (string, error) {
 	return "", errors.New("boom")
+}
+
+// A store whose backend can copy copies server-side, sizes the result and refuses a path outside
+// the run; a backend that cannot copy answers ok=false so the caller streams.
+func TestStoreCopyFromURL(t *testing.T) {
+	b := memfs.New()
+	b.Put("source/blob.csv", []byte("a,b\n1,2\n"))
+	st, err := New(b, "wf", "run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := st.(Copier)
+	if !ok {
+		t.Fatal("store must implement Copier")
+	}
+	path := fileref.RunPrefix("wf", "run") + "node/payload/files/0-blob.csv"
+	ref, ok, err := c.CopyFromURL(context.Background(), path, "text/csv", "blob.csv", b.URLFor("source/blob.csv"), 8, 0)
+	if err != nil || !ok || ref.Size != 8 || ref.Path != path || ref.ContentType != "text/csv" || ref.FileName != "blob.csv" {
+		t.Fatalf("copy: %+v ok=%v err=%v", ref, ok, err)
+	}
+	if string(b.Blobs[path]) != "a,b\n1,2\n" || len(b.Copies) != 1 {
+		t.Fatalf("destination = %q copies %v", b.Blobs[path], b.Copies)
+	}
+	// Unknown size is read back from the backend.
+	ref, _, err = c.CopyFromURL(context.Background(), path+"2", "", "", b.URLFor("source/blob.csv"), -1, 0)
+	if err != nil || ref.Size != 8 {
+		t.Fatalf("unknown size: %+v %v", ref, err)
+	}
+	// Another run's path is refused, as for Create.
+	if _, _, err := c.CopyFromURL(context.Background(), fileref.RunPrefix("wf", "other")+"x", "", "", b.URLFor("source/blob.csv"), 8, 0); !errors.Is(err, ErrNotInRun) {
+		t.Fatalf("path outside the run: %v", err)
+	}
+	// A refused copy is the not-started error, which the caller answers by streaming.
+	if _, _, err := c.CopyFromURL(context.Background(), path+"3", "", "", "https://elsewhere/blob", 8, 0); !errors.Is(err, storage.ErrCopyNotStarted) {
+		t.Fatalf("unreadable source: %v", err)
+	}
 }

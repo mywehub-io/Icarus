@@ -2,7 +2,6 @@ package httpclient_test
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +9,18 @@ import (
 
 	"github.com/wehubfusion/Icarus/pkg/embedded/processors/httpclient"
 	"github.com/wehubfusion/Icarus/pkg/embedded/runtime"
+	"github.com/wehubfusion/Icarus/pkg/fileref"
+	"github.com/wehubfusion/Icarus/pkg/filestore"
+	"github.com/wehubfusion/Icarus/pkg/filestore/memfs"
 )
+
+// withRun gives input the run's files, as the runner does, on a fresh in-memory backend.
+func withRun(input runtime.ProcessInput) (runtime.ProcessInput, *memfs.Backend) {
+	b := memfs.New()
+	store, _ := filestore.New(b, "w", "r")
+	input.Files, input.WorkflowID, input.RunID, input.ParentNodeID = store, "w", "r", "p"
+	return input, b
+}
 
 func createTestNode(t *testing.T, nodeID string) *httpclient.HTTPClientNode {
 	config := runtime.EmbeddedNodeConfig{
@@ -95,12 +105,16 @@ func TestProcess_Success(t *testing.T) {
 	rawCfg, _ := json.Marshal(cfg)
 
 	node := createTestNode(t, "node1")
+	payload := fileref.FileRef{Path: fileref.RunPrefix("w", "r") + "t/payload.json", Size: int64(len(`{"data":"test"}`))}
 	input := runtime.ProcessInput{
 		Ctx:       context.Background(),
-		Data:      map[string]interface{}{"payload": base64.StdEncoding.EncodeToString([]byte(`{"data":"test"}`))},
+		Data:      map[string]interface{}{"payload": fileref.Value(payload)},
 		RawConfig: rawCfg,
 		NodeId:    "node1",
 	}
+	input, backend := withRun(input)
+	backend.Put(payload.Path, []byte(`{"data":"test"}`))
+	input.ByteFields = map[string]bool{"payload": true}
 	output := node.Process(input)
 	if output.Error != nil {
 		t.Fatalf("process failed: %v", output.Error)
@@ -111,16 +125,12 @@ func TestProcess_Success(t *testing.T) {
 	if status, ok := output.Data["status"].(int); !ok || status != 200 {
 		t.Errorf("status: got %v", output.Data["status"])
 	}
-	bodyB64, ok := output.Data["body"].(string)
+	bodyRef, ok := fileref.Parse(output.Data["body"])
 	if !ok {
-		t.Fatalf("body type: got %T", output.Data["body"])
+		t.Fatalf("body is not a file reference: got %T", output.Data["body"])
 	}
-	body, err := base64.StdEncoding.DecodeString(bodyB64)
-	if err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	if string(body) != `{"ok":true}` {
-		t.Errorf("body: got %q", string(body))
+	if got := string(backend.Blobs[bodyRef.Path]); got != `{"ok":true}` {
+		t.Errorf("body: got %q", got)
 	}
 }
 
@@ -150,6 +160,7 @@ func TestProcess_GETWithNoPayload(t *testing.T) {
 		RawConfig: rawCfg,
 		NodeId:    "node1",
 	}
+	input, _ = withRun(input)
 	output := node.Process(input)
 	if output.Error != nil {
 		t.Fatalf("process failed: %v", output.Error)
@@ -172,9 +183,9 @@ func TestProcess_BearerAuth(t *testing.T) {
 	cfg := map[string]interface{}{
 		"label": "test",
 		"connection": map[string]interface{}{
-			"url":         server.URL,
-			"method":      "GET",
-			"auth_type":   "bearer",
+			"url":          server.URL,
+			"method":       "GET",
+			"auth_type":    "bearer",
 			"bearer_token": "secret-token-123",
 		},
 		"manual_inputs": []map[string]string{},
@@ -188,6 +199,7 @@ func TestProcess_BearerAuth(t *testing.T) {
 		RawConfig: rawCfg,
 		NodeId:    "node1",
 	}
+	input, _ = withRun(input)
 	output := node.Process(input)
 	if output.Error != nil {
 		t.Fatalf("process failed: %v", output.Error)
@@ -213,8 +225,8 @@ func TestProcess_URLFromInput_OverridesConnection(t *testing.T) {
 	defer otherServer.Close()
 
 	cfg := map[string]interface{}{
-		"label": "test",
-		"url":   map[string]interface{}{"source": "input", "inputKey": "url"},
+		"label":  "test",
+		"url":    map[string]interface{}{"source": "input", "inputKey": "url"},
 		"method": "GET",
 		"connection": map[string]interface{}{
 			"url":    otherServer.URL,
@@ -230,6 +242,7 @@ func TestProcess_URLFromInput_OverridesConnection(t *testing.T) {
 		RawConfig: rawCfg,
 		NodeId:    "node1",
 	}
+	input, _ = withRun(input)
 	output := node.Process(input)
 	if output.Error != nil {
 		t.Fatalf("process failed: %v", output.Error)
@@ -238,8 +251,8 @@ func TestProcess_URLFromInput_OverridesConnection(t *testing.T) {
 
 func TestProcess_URLFromInput_Missing_Fails(t *testing.T) {
 	cfg := map[string]interface{}{
-		"label": "test",
-		"url":   map[string]interface{}{"source": "input", "inputKey": "url"},
+		"label":  "test",
+		"url":    map[string]interface{}{"source": "input", "inputKey": "url"},
 		"method": "GET",
 	}
 	rawCfg, _ := json.Marshal(cfg)
@@ -267,8 +280,8 @@ func TestProcess_URLFromConfig_Success(t *testing.T) {
 	defer server.Close()
 
 	cfg := map[string]interface{}{
-		"label": "test",
-		"url":   map[string]interface{}{"source": "config", "value": server.URL},
+		"label":  "test",
+		"url":    map[string]interface{}{"source": "config", "value": server.URL},
 		"method": "POST",
 	}
 	rawCfg, _ := json.Marshal(cfg)
@@ -280,6 +293,7 @@ func TestProcess_URLFromConfig_Success(t *testing.T) {
 		RawConfig: rawCfg,
 		NodeId:    "node1",
 	}
+	input, _ = withRun(input)
 	output := node.Process(input)
 	if output.Error != nil {
 		t.Fatalf("process failed: %v", output.Error)
@@ -333,6 +347,7 @@ func TestProcess_HeadersFromInput_DynamicKeys(t *testing.T) {
 		RawConfig: rawCfg,
 		NodeId:    "node1",
 	}
+	input, _ = withRun(input)
 	output := node.Process(input)
 	if output.Error != nil {
 		t.Fatalf("process failed: %v", output.Error)
@@ -375,6 +390,7 @@ func TestProcess_HeadersMerge_InputOverridesConfig(t *testing.T) {
 		RawConfig: rawCfg,
 		NodeId:    "node1",
 	}
+	input, _ = withRun(input)
 	output := node.Process(input)
 	if output.Error != nil {
 		t.Fatalf("process failed: %v", output.Error)
@@ -410,6 +426,7 @@ func TestProcess_ConfigHeaders_AsArray(t *testing.T) {
 		RawConfig: rawCfg,
 		NodeId:    "node1",
 	}
+	input, _ = withRun(input)
 	output := node.Process(input)
 	if output.Error != nil {
 		t.Fatalf("process failed: %v", output.Error)

@@ -48,7 +48,7 @@ func (p *JSONSchemaProcessor) Process(inputData []byte, cs contracts.CompiledSch
 
 	if options.ApplyDefaults {
 		var err error
-		data, err = p.transformer.ApplyDefaults(data, s)
+		data, err = p.transformer.ApplyDefaultsWith(data, s, options.ByteDefault)
 		if err != nil {
 			return nil, fmt.Errorf("failed to apply defaults: %w", err)
 		}

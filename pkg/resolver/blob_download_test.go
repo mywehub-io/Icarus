@@ -146,7 +146,7 @@ func TestDownloadAndParseBlobFilesBoundsConcurrency(t *testing.T) {
 		nodes = append(nodes, node)
 	}
 
-	svc := NewService(fake, 0).WithMaxConcurrentBlobDownloads(limit)
+	svc := NewService(fake).WithMaxConcurrentBlobDownloads(limit)
 	got, err := svc.downloadAndParseBlobFiles(context.Background(), required, mappingsFor(nodes...))
 	if err != nil {
 		t.Fatalf("downloadAndParseBlobFiles: %v", err)
@@ -176,7 +176,7 @@ func TestDownloadAndParseBlobFilesMergeOrderIsStable(t *testing.T) {
 		{BlobURL: "https://acct/c/second.json", ContainsNodes: []string{"n"}},
 	}
 
-	svc := NewService(fake, 0)
+	svc := NewService(fake)
 	// Repeat: a completion-order dependency would show up intermittently.
 	for i := 0; i < 50; i++ {
 		got, err := svc.downloadAndParseBlobFiles(context.Background(), required, mappingsFor("n"))
@@ -209,7 +209,7 @@ func TestDownloadAndParseBlobFilesReportsLowestIndexError(t *testing.T) {
 		{BlobURL: "https://acct/c/bad2.json", ContainsNodes: []string{"n"}},
 	}
 
-	svc := NewService(fake, 0)
+	svc := NewService(fake)
 	for i := 0; i < 25; i++ {
 		_, err := svc.downloadAndParseBlobFiles(context.Background(), required, mappingsFor("n"))
 		if err == nil {
@@ -240,7 +240,7 @@ func TestDownloadAndParseBlobFilesHonoursCancellation(t *testing.T) {
 	}()
 
 	start := time.Now()
-	if _, err := NewService(fake, 0).WithMaxConcurrentBlobDownloads(2).
+	if _, err := NewService(fake).WithMaxConcurrentBlobDownloads(2).
 		downloadAndParseBlobFiles(ctx, required, mappingsFor("n")); err == nil {
 		t.Fatal("expected cancellation to surface as an error")
 	}

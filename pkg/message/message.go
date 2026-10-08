@@ -39,19 +39,17 @@ type Node struct {
 	Configuration interface{} `json:"configuration"`
 }
 
-// BlobReference contains information for fetching data from blob storage.
-// When a payload exceeds the resolver's inline threshold (resolver.DefaultMaxInlineBytes,
-// 500KB by default and configurable per service), it is uploaded to Azure Blob Storage
-// and a BlobReference is included instead of the raw data.
+// BlobReference contains information for fetching data from blob storage. A unit's result is
+// always a blob (an archive of its output document), and the result message carries this
+// reference to it.
 type BlobReference struct {
 	URL       string `json:"url"`       // Direct blob URL (for metadata/logging)
-	SizeBytes int    `json:"sizeBytes"` // Original data size in bytes
+	SizeBytes int64  `json:"sizeBytes"` // Data size in bytes
 }
 
 // Payload represents the message payload data
 type Payload struct {
-	InlineData    *string        `json:"inlineData,omitempty"`    // Inline data (for small payloads) - nullable
-	BlobReference *BlobReference `json:"blobReference,omitempty"` // Reference to blob storage (for large payloads)
+	BlobReference *BlobReference `json:"blobReference,omitempty"` // Reference to the unit's result blob
 	FieldMappings []FieldMapping `json:"fieldMappings,omitempty"` // Field mappings for extracting data from blob
 	// Execution context fields (for convenience - also available in Workflow/Node/Metadata)
 	CorrelationID string `json:"correlation_id,omitempty"` // Correlation ID for tracking related messages
@@ -59,19 +57,6 @@ type Payload struct {
 	WorkflowID    string `json:"workflow_id"`              // Workflow identifier
 	RunID         string `json:"run_id"`                   // Workflow run identifier
 	NodeID        string `json:"node_id"`                  // Node identifier
-}
-
-// GetInlineData returns the inline data as a string, or empty string if nil
-func (p *Payload) GetInlineData() string {
-	if p == nil || p.InlineData == nil {
-		return ""
-	}
-	return *p.InlineData
-}
-
-// HasInlineData returns true if inline data is present
-func (p *Payload) HasInlineData() bool {
-	return p != nil && p.InlineData != nil && *p.InlineData != ""
 }
 
 // Output represents output destination information
@@ -229,15 +214,10 @@ func (m *Message) WithNode(nodeID string, configuration interface{}) *Message {
 	return m
 }
 
-// WithPayload adds payload information to the message
-func (m *Message) WithPayload(data string) *Message {
-	var dataPtr *string
-	if data != "" {
-		dataPtr = &data
-	}
-	m.Payload = &Payload{
-		InlineData: dataPtr,
-	}
+// WithPayload adds the payload to the message, filling its execution context fields from the
+// message's workflow, node and metadata.
+func (m *Message) WithPayload() *Message {
+	m.Payload = &Payload{}
 	// Populate execution context fields from message structure if available
 	if m.CorrelationID != "" {
 		m.Payload.CorrelationID = m.CorrelationID
@@ -515,10 +495,9 @@ type ResultMessage struct {
 	// Execution status
 	Status string `json:"status"` // "success", "failed", "skipped"
 
-	// Result data - one of these will be populated based on result size
-	InlineResult  json.RawMessage `json:"inline_result,omitempty"`  // Full result data for results under the inline threshold
-	BlobReference *BlobReference  `json:"blob_reference,omitempty"` // Blob reference for results over the inline threshold
-	Events        json.RawMessage `json:"events,omitempty"`         // Lightweight event outputs used for trigger evaluation
+	// Result data: the blob holding the unit's output, always present on success.
+	BlobReference *BlobReference  `json:"blob_reference,omitempty"`
+	Events        json.RawMessage `json:"events,omitempty"` // Lightweight event outputs used for trigger evaluation
 
 	// Error information (only present when status is "failed")
 	Error *ResultError `json:"error,omitempty"`
@@ -576,15 +555,7 @@ func (r *ResultMessage) WithCorrelationID(correlationID string) *ResultMessage {
 	return r
 }
 
-// WithInlineResult sets the inline result data
-func (r *ResultMessage) WithInlineResult(result json.RawMessage) *ResultMessage {
-	r.InlineResult = result
-	r.ResultSize = len(result)
-	r.UpdatedAt = time.Now().Format(time.RFC3339)
-	return r
-}
-
-// WithBlobReference sets the blob reference for large results
+// WithBlobReference sets the blob reference for the result
 func (r *ResultMessage) WithBlobReference(blobRef *BlobReference) *ResultMessage {
 	r.BlobReference = blobRef
 	r.UpdatedAt = time.Now().Format(time.RFC3339)
@@ -637,11 +608,6 @@ func ResultMessageFromBytes(data []byte) (*ResultMessage, error) {
 // FromNATSMsg converts a NATS message to a ResultMessage
 func ResultMessageFromNATSMsg(natsMsg *nats.Msg) (*ResultMessage, error) {
 	return ResultMessageFromBytes(natsMsg.Data)
-}
-
-// HasInlineResult returns true if the result is available inline
-func (r *ResultMessage) HasInlineResult() bool {
-	return len(r.InlineResult) > 0
 }
 
 // HasBlobReference returns true if the result is stored in blob storage

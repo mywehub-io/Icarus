@@ -10,6 +10,9 @@ import (
 // JsonOpsNode implements JSON actions (parse and produce) for embedded
 type JsonOpsNode struct {
 	runtime.BaseNode
+
+	// cfgCache holds the parsed configuration, read-only, shared by every worker of the unit.
+	cfgCache runtime.ConfigCache[Config]
 }
 
 // NewJsonOpsNode creates a new jsonops node instance
@@ -24,13 +27,19 @@ func NewJsonOpsNode(config runtime.EmbeddedNodeConfig) (runtime.EmbeddedNode, er
 	}, nil
 }
 
+// Prepare implements runtime.ConfigPreparer: the configuration is parsed once for the unit.
+func (n *JsonOpsNode) Prepare(rawConfig json.RawMessage) {
+	_, _ = n.cfgCache.Get(rawConfig, runtime.ParseJSON[Config])
+}
+
 // Process executes the JSON action (parse or produce)
 func (n *JsonOpsNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
 	// Parse configuration
-	var cfg Config
-	if err := json.Unmarshal(input.RawConfig, &cfg); err != nil {
+	cfgp, err := n.cfgCache.Get(input.RawConfig, runtime.ParseJSON[Config])
+	if err != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "failed to parse configuration", err))
 	}
+	cfg := *cfgp
 
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {

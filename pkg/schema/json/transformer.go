@@ -17,6 +17,15 @@ func NewTransformer() *Transformer {
 // ApplyDefaults applies default values from schema to data
 // Only applies to fields that are missing (doesn't override existing values)
 func (t *Transformer) ApplyDefaults(data interface{}, schema *Schema) (interface{}, error) {
+	return t.ApplyDefaultsWith(data, schema, nil)
+}
+
+// ByteDefaultFunc turns the base64 default of a BYTE property into the value the property carries.
+type ByteDefaultFunc func(property, base64Value string) (interface{}, error)
+
+// ApplyDefaultsWith is ApplyDefaults with a hook for BYTE defaults: where a BYTE property takes
+// its default, byteDefault's result is used in place of the base64 string. A nil hook keeps it.
+func (t *Transformer) ApplyDefaultsWith(data interface{}, schema *Schema, byteDefault ByteDefaultFunc) (interface{}, error) {
 	switch schema.Type {
 	case TypeArray:
 		if data == nil {
@@ -37,11 +46,11 @@ func (t *Transformer) ApplyDefaults(data interface{}, schema *Schema) (interface
 		Properties: schema.Properties,
 		Items:      schema.Items,
 	}
-	return t.applyDefaultsToValue(data, prop)
+	return t.applyDefaultsToValue(data, prop, byteDefault)
 }
 
 // applyDefaultsToValue recursively applies defaults to a value
-func (t *Transformer) applyDefaultsToValue(data interface{}, prop *Property) (interface{}, error) {
+func (t *Transformer) applyDefaultsToValue(data interface{}, prop *Property, byteDefault ByteDefaultFunc) (interface{}, error) {
 	switch prop.Type {
 	case TypeObject:
 		obj, ok := data.(map[string]interface{})
@@ -60,6 +69,13 @@ func (t *Transformer) applyDefaultsToValue(data interface{}, prop *Property) (in
 				// A copy: the transform below may fill nested defaults into it, and the schema
 				// (cached and shared, see schema.Engine) must never change.
 				obj[propName] = copyDefault(propDef.Default)
+				if byteDefault != nil && propDef.Type == TypeByte {
+					if b64, ok := obj[propName].(string); ok {
+						if v, err := byteDefault(propName, b64); err == nil {
+							obj[propName] = v
+						}
+					}
+				}
 			} else if !exists && propDef.Type == TypeUUID {
 				generated := uuid.New().String()
 				prefix := ""
@@ -73,12 +89,12 @@ func (t *Transformer) applyDefaultsToValue(data interface{}, prop *Property) (in
 				obj[propName] = prefix + generated + postfix
 			} else if exists {
 				if propDef.Type == TypeObject && propDef.Properties != nil {
-					obj[propName], _ = t.applyDefaultsToValue(value, propDef)
+					obj[propName], _ = t.applyDefaultsToValue(value, propDef, byteDefault)
 				} else if propDef.Type == TypeArray && propDef.Items != nil {
-					obj[propName], _ = t.applyDefaultsToValue(value, propDef)
+					obj[propName], _ = t.applyDefaultsToValue(value, propDef, byteDefault)
 				}
 			} else if !exists && propDef.Type == TypeObject && propDef.Properties != nil {
-				nestedObj, _ := t.applyDefaultsToValue(nil, propDef)
+				nestedObj, _ := t.applyDefaultsToValue(nil, propDef, byteDefault)
 				if nestedMap, ok := nestedObj.(map[string]interface{}); ok && len(nestedMap) > 0 {
 					obj[propName] = nestedObj
 				}
@@ -94,7 +110,7 @@ func (t *Transformer) applyDefaultsToValue(data interface{}, prop *Property) (in
 
 		if prop.Items != nil {
 			for i, item := range arr {
-				processedItem, _ := t.applyDefaultsToValue(item, prop.Items)
+				processedItem, _ := t.applyDefaultsToValue(item, prop.Items, byteDefault)
 				arr[i] = processedItem
 			}
 		}
@@ -102,6 +118,29 @@ func (t *Transformer) applyDefaultsToValue(data interface{}, prop *Property) (in
 	}
 
 	return data, nil
+}
+
+// TransformItem applies defaults and structure to one item of a root array whose items follow
+// items, exactly as ApplyDefaults and StructureData treat each element of the whole array, so a
+// caller can transform a streamed array one item at a time.
+func (t *Transformer) TransformItem(item interface{}, items *Property, applyDefaults, structure bool) interface{} {
+	return t.TransformItemWith(item, items, applyDefaults, structure, nil)
+}
+
+// TransformItemWith is TransformItem with a hook for BYTE defaults (see ApplyDefaultsWith).
+func (t *Transformer) TransformItemWith(item interface{}, items *Property, applyDefaults, structure bool, byteDefault ByteDefaultFunc) interface{} {
+	if items == nil {
+		return item
+	}
+	if applyDefaults {
+		item, _ = t.applyDefaultsToValue(item, items, byteDefault)
+	}
+	if structure {
+		if structured, err := t.structureValue(item, items, true); err == nil {
+			item = structured
+		}
+	}
+	return item
 }
 
 // StructureData ensures data conforms to schema structure

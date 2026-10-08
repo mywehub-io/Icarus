@@ -218,35 +218,6 @@ func (a *Reader) Flat(keys []string) (map[string]interface{}, error) {
 // resolves to.
 func (a *Reader) FlatAll() (map[string]interface{}, error) { return a.Flat(a.names) }
 
-// IsRaw reports whether the archive carries one opaque payload rather than an addressable
-// key space. Read from the manifest, never inferred from the entry set.
-func (a *Reader) IsRaw() bool { return a.manifest.Raw }
-
-// Raw returns an opaque archive's payload bytes, exactly as they were given to the writer.
-func (a *Reader) Raw() ([]byte, error) {
-	if !a.manifest.Raw {
-		return nil, fmt.Errorf("archive: not an opaque archive")
-	}
-	f, ok := a.byName[RawEntryName]
-	if !ok {
-		return nil, fmt.Errorf("archive: manifest declares an opaque payload but entry %q is missing", RawEntryName)
-	}
-	return readFile(f)
-}
-
-// Payload returns what a whole-payload read expects: an opaque archive's bytes verbatim,
-// or a document archive re-materialised into the document it was built from.
-//
-// The two are not interchangeable and the manifest is what tells them apart. Re-marshalling
-// an opaque HL7 message would be nonsense; handing a plugin the raw entry of a document
-// archive would hand it nothing.
-func (a *Reader) Payload() ([]byte, error) {
-	if a.manifest.Raw {
-		return a.Raw()
-	}
-	return a.Document()
-}
-
 // Document re-materialises the archive as the flat JSON document it was built from. Used
 // by the differential harness to assert the container swap is lossless.
 func (a *Reader) Document() ([]byte, error) {

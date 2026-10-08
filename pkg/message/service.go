@@ -434,9 +434,8 @@ var ErrResultNotPublished = errors.New("result not published")
 var ErrAckAfterPublish = errors.New("result published, ack failed")
 
 // ReportSuccess publishes unit execution result to JetStream result stream.
-// For results below the resolver's inline threshold (resolver.DefaultMaxInlineBytes,
-// 500KB), includes full payload inline. For larger results, stores in
-// blob storage and includes blob reference.
+// The result is always a blob: the payload must carry the blob reference the unit's output was
+// written to, and the result message carries it on.
 func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Message, msg jetstream.Msg) error {
 	startTime := time.Now()
 
@@ -514,34 +513,19 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 		resultMsg.WithEvents(json.RawMessage(eventsJSON))
 	}
 
-	// Respect resolver's decision - use whatever it returned (blob or inline)
-	if resultMessage.Payload.BlobReference != nil {
-		// Resolver decided to use blob storage
-		s.logger.Debug("Publishing result with blob reference from resolver",
-			zap.String("execution_id", executionID),
-			zap.String("blob_url", resultMessage.Payload.BlobReference.URL),
-			zap.Int("size_bytes", resultMessage.Payload.BlobReference.SizeBytes))
-
-		resultMsg.WithBlobReference(resultMessage.Payload.BlobReference)
-		resultMsg.ResultSize = resultMessage.Payload.BlobReference.SizeBytes
-	} else if resultMessage.Payload.HasInlineData() {
-		// Resolver decided to use inline data
-		inlineData := resultMessage.Payload.GetInlineData()
-		resultSize := len(inlineData)
-
-		s.logger.Debug("Publishing result with inline data from resolver",
-			zap.String("execution_id", executionID),
-			zap.Int("size_bytes", resultSize))
-
-		resultMsg.WithInlineResult(json.RawMessage(inlineData))
-		resultMsg.ResultSize = resultSize
-	} else {
-		s.logger.Error("Payload has neither blob reference nor inline data")
+	if resultMessage.Payload.BlobReference == nil || resultMessage.Payload.BlobReference.URL == "" {
+		s.logger.Error("Payload has no blob reference")
 		if msg != nil {
 			_ = msg.Nak()
 		}
-		return fmt.Errorf("invalid payload: no data or blob reference")
+		return fmt.Errorf("invalid payload: no blob reference")
 	}
+	s.logger.Debug("Publishing result with blob reference",
+		zap.String("execution_id", executionID),
+		zap.String("blob_url", resultMessage.Payload.BlobReference.URL),
+		zap.Int64("size_bytes", resultMessage.Payload.BlobReference.SizeBytes))
+	resultMsg.WithBlobReference(resultMessage.Payload.BlobReference)
+	resultMsg.ResultSize = int(resultMessage.Payload.BlobReference.SizeBytes)
 
 	// Publish result to JetStream
 	if err := s.PublishResult(ctx, resultMsg); err != nil {
@@ -562,8 +546,7 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 		zap.String("run_id", runID),
 		zap.String("execution_id", executionID),
 		zap.Duration("publish_duration", publishDuration),
-		zap.Int("payload_size", resultMsg.ResultSize),
-		zap.Bool("used_blob_reference", resultMsg.HasBlobReference()))
+		zap.Int("payload_size", resultMsg.ResultSize))
 
 	// Acknowledge the source message
 	if msg != nil {

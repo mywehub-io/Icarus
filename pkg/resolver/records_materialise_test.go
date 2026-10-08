@@ -32,7 +32,7 @@ func TestMaterialisedRecordsMapLikeAnArray(t *testing.T) {
 	ctx, refVal := recordsFixture(t)
 	results := map[string]*SourceResult{"csv": {NodeID: "csv", Status: "success",
 		RawFlatKeys: map[string]interface{}{"csv-/data": refVal}}}
-	s := NewService(nil, 0)
+	s := NewService(nil)
 	if err := s.materialiseRecords(ctx, recordsMapping, results); err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestMaterialisedRecordsMapLikeAnArray(t *testing.T) {
 func TestRecordsAboveTheCapAreRefused(t *testing.T) {
 	ctx, refVal := recordsFixture(t)
 	results := map[string]*SourceResult{"csv": {RawFlatKeys: map[string]interface{}{"csv-/data": refVal}}}
-	err := NewService(nil, 0).WithRecordsMaterialiseMax(10).materialiseRecords(ctx, recordsMapping, results)
+	err := NewService(nil).WithRecordsMaterialiseMax(10).materialiseRecords(ctx, recordsMapping, results)
 	if !errors.Is(err, ErrRecordsTooLarge) {
 		t.Fatalf("want RECORDS_TOO_LARGE_TO_MATERIALISE, got %v", err)
 	}
@@ -66,7 +66,7 @@ func TestRecordsAboveTheCapAreRefused(t *testing.T) {
 func TestNoStoreLeavesReferences(t *testing.T) {
 	_, refVal := recordsFixture(t)
 	results := map[string]*SourceResult{"csv": {RawFlatKeys: map[string]interface{}{"csv-/data": refVal}}}
-	if err := NewService(nil, 0).materialiseRecords(context.Background(), recordsMapping, results); err != nil {
+	if err := NewService(nil).materialiseRecords(context.Background(), recordsMapping, results); err != nil {
 		t.Fatal(err)
 	}
 	if !fileref.IsRef(results["csv"].RawFlatKeys["csv-/data"]) {
@@ -80,7 +80,7 @@ func TestUntypedMappingLeavesTheReference(t *testing.T) {
 	results := map[string]*SourceResult{"csv": {RawFlatKeys: map[string]interface{}{"csv-/data": refVal},
 		ProjectedFields: map[string]map[string]interface{}{"csv": {"data": refVal}}}}
 	untyped := []message.FieldMapping{{SourceNodeID: "csv", SourceEndpoint: "/data", DestinationEndpoints: []string{"/rows"}}}
-	if err := NewService(nil, 0).materialiseRecords(ctx, untyped, results); err != nil {
+	if err := NewService(nil).materialiseRecords(ctx, untyped, results); err != nil {
 		t.Fatal(err)
 	}
 	if !fileref.IsRef(results["csv"].RawFlatKeys["csv-/data"]) || !fileref.IsRef(results["csv"].ProjectedFields["csv"]["data"]) {
@@ -105,7 +105,7 @@ func TestStreamingConsumerKeepsTheReference(t *testing.T) {
 		ValueType: message.ValueTypeRecords}}
 	results := map[string]*SourceResult{"csv": {NodeID: "csv", Status: "success",
 		RawFlatKeys: map[string]interface{}{"csv-/data": refVal}}}
-	s := NewService(nil, 0)
+	s := NewService(nil)
 	if err := s.materialiseRecords(ctx, whole, results); err != nil {
 		t.Fatal(err)
 	}
