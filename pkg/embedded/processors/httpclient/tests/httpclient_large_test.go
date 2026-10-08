@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -94,7 +93,7 @@ func TestProcess_LargeFilesStreamBothWays(t *testing.T) {
 	defer debug.SetMemoryLimit(debug.SetMemoryLimit(48 << 20))
 
 	var received atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n, _ := io.Copy(io.Discard, r.Body)
 		received.Store(n)
 		w.Header().Set("Content-Type", "text/plain")

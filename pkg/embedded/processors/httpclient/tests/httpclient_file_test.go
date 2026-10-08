@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -20,7 +19,7 @@ func TestProcess_PayloadFileIsTheRequestBody(t *testing.T) {
 	content := `{"resourceType":"Patient","id":"synthetic"}`
 	var gotBody string
 	var gotLength int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		gotBody, gotLength = string(b), r.ContentLength
 		w.WriteHeader(http.StatusOK)
@@ -48,7 +47,7 @@ func TestProcess_PayloadFileIsTheRequestBody(t *testing.T) {
 
 // When every consumer of /body reads files, the response is streamed into a file.
 func TestProcess_ResponseBodyIsAFile(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/csv")
 		_, _ = w.Write([]byte("a,b\n1,2\n"))
 	}))
@@ -73,7 +72,7 @@ func TestProcess_ResponseBodyIsAFile(t *testing.T) {
 // 30 s limit of an in-memory exchange is not cut off. Here the limit is shortened by sending a
 // body in two parts with a gap, which an idle timeout of a few seconds would still allow.
 func TestProcess_StreamedResponseIsNotCutByAnOverallTimeout(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("first,"))
 		w.(http.Flusher).Flush()
@@ -99,7 +98,7 @@ func TestProcess_StreamedResponseIsNotCutByAnOverallTimeout(t *testing.T) {
 
 // A payload that is not a file reference is refused: a byte value is a file, never text to decode.
 func TestProcess_PayloadMustBeAFile(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("the request must not be sent")
 	}))
 	defer server.Close()

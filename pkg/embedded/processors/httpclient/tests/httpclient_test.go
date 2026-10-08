@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/wehubfusion/Icarus/pkg/embedded/processors/httpclient"
@@ -82,7 +81,7 @@ func TestProcess_MissingConnection(t *testing.T) {
 }
 
 func TestProcess_Success(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method: got %s", r.Method)
 		}
@@ -135,7 +134,7 @@ func TestProcess_Success(t *testing.T) {
 }
 
 func TestProcess_GETWithNoPayload(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Errorf("method: got %s", r.Method)
 		}
@@ -171,7 +170,7 @@ func TestProcess_GETWithNoPayload(t *testing.T) {
 }
 
 func TestProcess_BearerAuth(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if auth != "Bearer secret-token-123" {
 			t.Errorf("Authorization: got %q", auth)
@@ -207,7 +206,7 @@ func TestProcess_BearerAuth(t *testing.T) {
 }
 
 func TestProcess_URLFromInput_OverridesConnection(t *testing.T) {
-	inputServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	inputServer := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.String() != "/" {
 			// sanity: still hitting our server
 		}
@@ -219,7 +218,7 @@ func TestProcess_URLFromInput_OverridesConnection(t *testing.T) {
 	}))
 	defer inputServer.Close()
 
-	otherServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	otherServer := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatalf("should not have used connection url")
 	}))
 	defer otherServer.Close()
@@ -271,7 +270,7 @@ func TestProcess_URLFromInput_Missing_Fails(t *testing.T) {
 }
 
 func TestProcess_URLFromConfig_Success(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method: got %s", r.Method)
 		}
@@ -321,7 +320,7 @@ func TestProcess_URLFromConfig_MissingMethod_Fails(t *testing.T) {
 }
 
 func TestProcess_HeadersFromInput_DynamicKeys(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if v := r.Header.Get("X-Test"); v != "abc" {
 			t.Errorf("X-Test header: got %q", v)
 		}
@@ -355,7 +354,7 @@ func TestProcess_HeadersFromInput_DynamicKeys(t *testing.T) {
 }
 
 func TestProcess_HeadersMerge_InputOverridesConfig(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if v := r.Header.Get("X-Test"); v != "from-input" {
 			t.Errorf("X-Test header: got %q", v)
 		}
@@ -398,7 +397,7 @@ func TestProcess_HeadersMerge_InputOverridesConfig(t *testing.T) {
 }
 
 func TestProcess_ConfigHeaders_AsArray(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if v := r.Header.Get("X-Arr"); v != "1" {
 			t.Errorf("X-Arr header: got %q", v)
 		}

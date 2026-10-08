@@ -3,8 +3,10 @@ package httpclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -21,10 +23,12 @@ const (
 )
 
 // streamingClient has no overall timeout; dial, TLS and the response headers are still bounded,
-// and idleReader bounds the body.
+// and idleReader bounds the body. Every dial passes the egress policy (egress.go).
 func streamingClient() *http.Client {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.ResponseHeaderTimeout = responseHeaderTimeout
+	// http.DefaultTransport's dialer, plus the policy.
+	t.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: guardDial}).DialContext
 	return &http.Client{Transport: t}
 }
 
@@ -131,6 +135,11 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 	client := streamingClient()
 	resp, err := client.Do(req)
 	if err != nil {
+		// A refused destination is the workflow's configuration, not a fault a retry clears.
+		var egress *EgressError
+		if errors.As(err, &egress) {
+			return runtime.ErrorOutput(NewConfigError(n.NodeId(), "url", egress.Error(), egress))
+		}
 		return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "request failed: "+err.Error(), err, 0, nil))
 	}
 	defer resp.Body.Close()
