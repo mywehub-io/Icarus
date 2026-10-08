@@ -145,7 +145,7 @@ func (s *MessageService) SetInactiveThreshold(d time.Duration) {
 
 // EnsureStream creates the JetStream stream if it doesn't exist, or validates it exists.
 // This is a public method that can be called by runners and other components.
-// Existing streams are never modified.
+// An existing stream is changed only to bring it to the work stream size cap (EnsureSizeCap).
 func (s *MessageService) EnsureStream(ctx context.Context, streamName string) error {
 	// Check if stream exists
 	stream, err := s.js.Stream(ctx, streamName)
@@ -160,14 +160,14 @@ func (s *MessageService) EnsureStream(ctx context.Context, streamName string) er
 				subjects = []string{s.resultSubject}
 			}
 
-			streamConfig := jetstream.StreamConfig{
+			streamConfig := WithSizeCap(jetstream.StreamConfig{
 				Name:     streamName,
 				Subjects: subjects,
 				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
 				Replicas: 1,
-			}
+			}, DefaultWorkStreamMaxBytes)
 
 			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
@@ -191,6 +191,9 @@ func (s *MessageService) EnsureStream(ctx context.Context, streamName string) er
 		s.logger.Info("JetStream stream already exists",
 			zap.String("stream", streamName),
 			zap.Uint64("messages", msgs))
+		if err := s.ensureSizeCap(ctx, stream); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -284,8 +287,8 @@ func (s *MessageService) getMessageIdentifier(msg *Message) string {
 }
 
 // ensureResultStream ensures the configured result stream exists so results can
-// be published to resultSubject. The stream is created on first use and never
-// modified afterwards.
+// be published to resultSubject. The stream is created on first use; an existing one is changed
+// only to bring it to the work stream size cap, once per process.
 func (s *MessageService) ensureResultStream(ctx context.Context) error {
 	if s.resultStreamKnown.Load() {
 		return nil
@@ -293,7 +296,12 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 	streamName := s.resultStream
 
 	// Check if stream exists
-	_, err := s.js.Stream(ctx, streamName)
+	existing, err := s.js.Stream(ctx, streamName)
+	if err == nil {
+		if capErr := s.ensureSizeCap(ctx, existing); capErr != nil {
+			return capErr
+		}
+	}
 	if err != nil {
 		// Stream doesn't exist
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
@@ -302,14 +310,14 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 				zap.String("subject", s.resultSubject),
 				zap.Bool("is_result_stream", true))
 
-			streamConfig := jetstream.StreamConfig{
+			streamConfig := WithSizeCap(jetstream.StreamConfig{
 				Name:     streamName,
 				Subjects: []string{s.resultSubject},
 				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
 				Replicas: 1,
-			}
+			}, DefaultWorkStreamMaxBytes)
 
 			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
@@ -788,7 +796,6 @@ func FinalAttempt() ReportErrorOption {
 	return func(o *reportErrorOptions) { o.final = true }
 }
 
-
 // jetStreamDeliverCountStr returns JetStream NumDelivered for grep-friendly diagnostics, or "".
 func jetStreamDeliverCountStr(msg jetstream.Msg) string {
 	if msg == nil {
@@ -840,4 +847,14 @@ func ExtractNodeIDFromExecutionID(executionID, workflowID string) string {
 
 	// If format doesn't match, return executionID as-is (fallback)
 	return executionID
+}
+
+// ensureSizeCap applies the work stream size cap to an existing stream when the JetStream
+// context can update streams (the real one can; a test double without UpdateStream is skipped).
+func (s *MessageService) ensureSizeCap(ctx context.Context, stream jetstream.Stream) error {
+	u, ok := s.js.(StreamUpdater)
+	if !ok {
+		return nil
+	}
+	return EnsureSizeCap(ctx, u, stream, DefaultWorkStreamMaxBytes, s.logger)
 }

@@ -65,8 +65,9 @@ Your business logic goes here. Return `error` to trigger `ReportError`; return a
 
 ```go
 type Config struct {
-    WorkerCount int // 0 → ICARUS_RUNNER_WORKERS env → ICARUS_RUNNER_WORKER_MULTIPLIER × GOMAXPROCS → GOMAXPROCS
-    QueueSize   int // ignored since v0.28.0
+    WorkerCount  int           // 0 → ICARUS_RUNNER_WORKERS env → ICARUS_RUNNER_WORKER_MULTIPLIER × GOMAXPROCS → GOMAXPROCS
+    QueueSize    int           // ignored since v0.28.0
+    StallTimeout time.Duration // 0 → ICARUS_RUNNER_STALL_TIMEOUT env → 2m; negative disables the watchdog
 }
 ```
 
@@ -80,6 +81,22 @@ Environment overrides:
 |---|---|
 | `ICARUS_RUNNER_WORKERS` | Exact worker count |
 | `ICARUS_RUNNER_WORKER_MULTIPLIER` | Multiplied by `GOMAXPROCS` |
+| `ICARUS_RUNNER_STALL_TIMEOUT` | Watchdog stall timeout, a Go duration (e.g. `2m`); used when `Config.StallTimeout` is 0 |
+
+### Stall watchdog and `Health`
+
+`Run` starts a watchdog. If the runner goes `StallTimeout` without a successful fetch while a
+worker is idle and the NATS connection is up, or a worker holds one unit for longer than
+`processTimeout` plus 15 minutes, it logs at Error with the idle slots, in-flight count and
+consumer, and resolves the consumer again. `Runner.Health()` returns an error for as long as the
+stall lasts, and nil before `Run`, after its context ends and while NATS is disconnected. Wire it
+into the host's liveness probe, so a runner that cannot recover is restarted.
+
+The fetch loop also resolves the consumer again when the client's connection is replaced or a
+fetch fails with a transport error, and creates the consumer again if it no longer exists. A
+consumer handle stays bound to the connection it was resolved on; previously a fetch on a
+closed connection (`nats.ErrConnectionClosed`) kept the old handle, so the loop failed every
+fetch without sending a pull after the client reconnected.
 
 (`pkg/runner/runner.go:104`)
 
