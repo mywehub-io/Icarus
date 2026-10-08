@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/wehubfusion/Icarus/pkg/fileref"
 	"github.com/wehubfusion/Icarus/pkg/filestore"
 	"github.com/wehubfusion/Icarus/pkg/filestore/memfs"
+	"github.com/wehubfusion/Icarus/pkg/records"
 )
 
 // recordsFileInput delivers an .ndjson file (records) or a JSON array file to the field "data".
@@ -156,5 +158,32 @@ func TestBYTEDefaultIsWrittenAsAFile(t *testing.T) {
 	tight := &Config{Action: "parse", Schema: json.RawMessage(strings.Replace(sch, `"maxLength":10`, `"maxLength":3`, 1))}
 	if out := n.executeParse(fileInput(t, memfs.New(), doc, fileref.ContentTypeJSON, -1), tight); out.Error == nil {
 		t.Fatal("a default file above maxLength must fail validation")
+	}
+}
+
+// A root-array input above the limit is refused with RECORDS_TOO_LARGE_TO_MATERIALISE, since every
+// item is kept for the output. A file is refused before it is read (the reference carries its size).
+// Below the limit nothing changes.
+func TestParseRootArrayAboveTheLimitIsRefused(t *testing.T) {
+	n := &JsonOpsNode{}
+	cfg := &Config{Action: "parse", Schema: json.RawMessage(rootArraySchema)}
+	lines := ndjson(40)
+	asArray := "[" + strings.Join(strings.Split(strings.TrimSpace(lines), "\n"), ",") + "]"
+	SetMaxArrayInputBytes(int64(len(lines)) - 1)
+	defer SetMaxArrayInputBytes(0)
+
+	for name, in := range map[string]runtime.ProcessInput{
+		"ndjson":     fileInput(t, memfs.New(), lines, fileref.ContentTypeNDJSON, 40),
+		"json array": fileInput(t, memfs.New(), asArray, fileref.ContentTypeJSON, -1),
+	} {
+		out := n.executeParse(in, cfg)
+		if out.Error == nil || !errors.Is(out.Error, records.ErrTooLargeToMaterialise) {
+			t.Fatalf("%s: want RECORDS_TOO_LARGE_TO_MATERIALISE, got %v", name, out.Error)
+		}
+	}
+
+	SetMaxArrayInputBytes(int64(len(asArray)) + 1)
+	if out := n.executeParse(fileInput(t, memfs.New(), lines, fileref.ContentTypeNDJSON, 40), cfg); out.Error != nil {
+		t.Fatalf("under the limit: %v", out.Error)
 	}
 }

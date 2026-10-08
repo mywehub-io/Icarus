@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync/atomic"
 
 	"github.com/wehubfusion/Icarus/pkg/embedded/runtime"
 	"github.com/wehubfusion/Icarus/pkg/records"
@@ -13,8 +14,32 @@ import (
 )
 
 // maxParseFileBytes caps a JSON object document read from a file: the schema engine processes an
-// object whole. A root array is streamed and has no cap.
+// object whole. A root array is capped separately (maxArrayInputBytes).
 const maxParseFileBytes = 64 << 20
+
+// DefaultMaxArrayInputBytes caps the input of a schema whose root is an ARRAY. The input is read one
+// item at a time, but every transformed item is kept for the output, so the input size bounds the
+// memory. A host overrides it with SetMaxArrayInputBytes (Elysium: ICARUS_RECORDS_MATERIALISE_MAX_BYTES,
+// the same limit as a records file built in memory).
+const DefaultMaxArrayInputBytes = 64 << 20
+
+var maxArrayInputBytes atomic.Int64
+
+func init() { maxArrayInputBytes.Store(DefaultMaxArrayInputBytes) }
+
+// SetMaxArrayInputBytes sets the largest root-array input; n <= 0 restores the default.
+func SetMaxArrayInputBytes(n int64) {
+	if n <= 0 {
+		n = DefaultMaxArrayInputBytes
+	}
+	maxArrayInputBytes.Store(n)
+}
+
+// arrayInputTooLarge is the error for a root-array input above maxArrayInputBytes.
+func arrayInputTooLarge(size, max int64) error {
+	return fmt.Errorf("%w: the input is %d bytes, above the %d byte limit for a JSON array parsed in memory",
+		records.ErrTooLargeToMaterialise, size, max)
+}
 
 // executeParse validates and transforms incoming JSON data against a schema
 // Input: ProcessInput.Data["data"] - a file reference (byte port) or a JSON value
@@ -44,9 +69,16 @@ func (n *JsonOpsNode) executeParse(input runtime.ProcessInput, cfg *Config) runt
 
 	engine := schema.Shared()
 	if parsed, err := engine.ParseJSONSchema(cfg.Schema); err == nil && parsed.Type == schema.TypeArray {
+		max := maxArrayInputBytes.Load()
 		rc, ref, isFile, err := input.OpenTrustedFile("data")
 		if err != nil {
 			return runtime.ErrorOutput(NewProcessingError(n.NodeId(), "parse", "failed to open data file", input.ItemIndex, err))
+		}
+		if isFile && ref.Size > max {
+			// Refused before a byte is read: the reference carries the size, and the store never
+			// reads past it.
+			rc.Close()
+			return runtime.ErrorOutput(NewProcessingError(n.NodeId(), "parse", "input too large", input.ItemIndex, arrayInputTooLarge(ref.Size, max)))
 		}
 		if isFile && ref.IsRecords() {
 			// An .ndjson file is the records of the array, one item per line (raw payloads D7): each
@@ -58,6 +90,9 @@ func (n *JsonOpsNode) executeParse(input runtime.ProcessInput, cfg *Config) runt
 			data, errOut := n.parseInputBytes(input, dataField)
 			if errOut != nil {
 				return *errOut
+			}
+			if int64(len(data)) > max {
+				return runtime.ErrorOutput(NewProcessingError(n.NodeId(), "parse", "input too large", input.ItemIndex, arrayInputTooLarge(int64(len(data)), max)))
 			}
 			rc = io.NopCloser(bytes.NewReader(data))
 		}
