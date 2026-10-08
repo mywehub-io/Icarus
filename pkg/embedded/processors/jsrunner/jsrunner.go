@@ -147,19 +147,23 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 		return nil, NewExecutionError(n.NodeId(), "failed to set input variable", input.ItemIndex, 0, 0, err)
 	}
 
+	// The configuration is shared by every worker of the unit (cfgCache), and goja hands a Go map
+	// to the script as a live object that writes through. Each VM therefore gets its own copy, so a
+	// script that changes one of these cannot race another item or leak into the next.
+
 	// Inject input schema if provided (for reference in JS)
 	if inputSchema := cfg.GetInputSchema(); inputSchema != nil {
-		vm.Set("inputSchema", inputSchema)
+		vm.Set("inputSchema", copyJSONMap(inputSchema))
 	}
 
 	// Inject output schema if provided (for reference in JS)
 	if outputSchema := cfg.GetOutputSchema(); outputSchema != nil {
-		vm.Set("outputSchema", outputSchema)
+		vm.Set("outputSchema", copyJSONMap(outputSchema))
 	}
 
 	// Inject manual inputs if provided
 	if len(cfg.ManualInputs) > 0 {
-		vm.Set("manualInputs", cfg.ManualInputs)
+		vm.Set("manualInputs", copyJSONMap(cfg.ManualInputs))
 	}
 
 	// Wrap script for execution

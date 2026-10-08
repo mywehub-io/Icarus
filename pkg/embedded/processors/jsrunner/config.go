@@ -160,3 +160,31 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 
 	return nil
 }
+
+// copyJSONMap returns a deep copy of a JSON-shaped map (nested maps and slices are copied; other
+// values are immutable scalars), so a script's VM never holds the cached configuration's own maps.
+func copyJSONMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = copyJSONValue(v)
+	}
+	return out
+}
+
+func copyJSONValue(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		return copyJSONMap(t)
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			out[i] = copyJSONValue(e)
+		}
+		return out
+	default:
+		return v
+	}
+}

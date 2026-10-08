@@ -42,6 +42,47 @@ func TestConcurrentItemsShareOneNode(t *testing.T) {
 	}
 }
 
+// The parsed configuration is shared by every worker, so a script that writes to manualInputs (or a
+// schema, given the same copy) must change only its own copy: no concurrent map write (run with -race) and nothing seen by
+// a later item.
+func TestScriptWritesToConfigStayInItsItem(t *testing.T) {
+	node, err := jsrunner.NewJSRunnerNode(runtime.EmbeddedNodeConfig{NodeId: "js", PluginType: "plugin-js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]interface{}{
+		"script": `var seen = manualInputs.mark, seenNested = manualInputs.nested.mark;
+			manualInputs.mark = input.n; manualInputs.nested.mark = input.n;
+			return { seen: seen === undefined ? "none" : seen, seenNested: seenNested === undefined ? "none" : seenNested };`,
+		"timeout":       "5s",
+		"manual_inputs": map[string]interface{}{"nested": map[string]interface{}{"kept": true}},
+	})
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			out := node.Process(runtime.ProcessInput{Ctx: context.Background(), Data: map[string]interface{}{"n": i}, RawConfig: raw, ItemIndex: i})
+			if out.Error != nil {
+				errs <- out.Error
+				return
+			}
+			if got := fmt.Sprint(out.Data["seen"]); got != "none" {
+				errs <- fmt.Errorf("item %d saw another item's write: %v", i, got)
+			}
+			if got := fmt.Sprint(out.Data["seenNested"]); got != "none" {
+				errs <- fmt.Errorf("item %d saw another item's nested write: %v", i, got)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
 // A setTimeout callback runs on the VM's goroutine after the synchronous script, before the result
 // is taken (it used to run on the timer's goroutine while the VM was in use).
 func TestTimerCallbackRunsAfterTheScript(t *testing.T) {

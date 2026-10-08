@@ -2,7 +2,9 @@ package resolver
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/wehubfusion/Icarus/pkg/fileref"
@@ -16,15 +18,20 @@ func refValue() map[string]interface{} {
 	})
 }
 
-func buildOne(t *testing.T, m message.FieldMapping, fields map[string]interface{}) map[string]interface{} {
+func buildOneErr(t *testing.T, m message.FieldMapping, fields map[string]interface{}) ([]byte, error) {
 	t.Helper()
-	out, err := buildInputFromMappings(BuildInputParams{
+	return buildInputFromMappings(BuildInputParams{
 		UnitNodeID:    "target",
 		FieldMappings: []message.FieldMapping{m},
 		SourceResults: map[string]*SourceResult{
 			"src": {NodeID: "src", Status: "success", ProjectedFields: map[string]map[string]interface{}{"src": fields}},
 		},
 	})
+}
+
+func buildOne(t *testing.T, m message.FieldMapping, fields map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	out, err := buildOneErr(t, m, fields)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,14 +89,28 @@ func TestFileKeyInDataIsJustData(t *testing.T) {
 	}
 }
 
-// Bridge until the cut: a byte mapping whose value is still a base64 string takes the old path.
-func TestByteMappingWithLegacyStringStillWorks(t *testing.T) {
-	data := buildOne(t, message.FieldMapping{
+// A byte mapping whose source still holds a string (a producer writing base64 or text) is refused
+// with ErrByteValueNotAFile, naming the source, instead of reaching the consumer as data.
+func TestByteMappingWithAStringIsRefused(t *testing.T) {
+	_, err := buildOneErr(t, message.FieldMapping{
 		SourceNodeID: "src", SourceEndpoint: "/payload", DestinationEndpoints: []string{"/payload"},
 		DataType: "FIELD", ValueType: message.ValueTypeByte,
 	}, map[string]interface{}{"payload": "aGVsbG8="})
-	if data["payload"] != "aGVsbG8=" {
-		t.Fatalf("legacy value lost: %#v", data)
+	if !errors.Is(err, ErrByteValueNotAFile) || !strings.Contains(err.Error(), "src/payload") {
+		t.Fatalf("want ErrByteValueNotAFile naming src/payload, got %v", err)
+	}
+}
+
+// A list under a byte mapping (iterated references, a files list) is not a scalar and still
+// resolves.
+func TestByteMappingWithAListIsNotRefused(t *testing.T) {
+	ref := map[string]interface{}{"$file": map[string]interface{}{"path": "results/w/r/src/payload/0.bin", "size": 1}}
+	data := buildOne(t, message.FieldMapping{
+		SourceNodeID: "src", SourceEndpoint: "/files", DestinationEndpoints: []string{"/files"},
+		DataType: "FIELD", ValueType: message.ValueTypeByte,
+	}, map[string]interface{}{"files": []interface{}{ref}})
+	if _, ok := data["files"]; !ok {
+		t.Fatalf("list lost: %#v", data)
 	}
 }
 

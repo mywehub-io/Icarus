@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -1242,6 +1243,13 @@ func buildInputFromMappings(params BuildInputParams) ([]byte, error) {
 				}
 				continue
 			}
+			// A list (iterated references, a files list) takes the path below. A scalar is never a
+			// byte value since the cut (D1, D10): it is a producer still writing base64 or text, and
+			// passing it on only moves the failure to a consumer that cannot say where it came from.
+			if isScalarValue(sourceData) {
+				return nil, fmt.Errorf("%w: %s%s carries a %T where a file reference is expected",
+					ErrByteValueNotAFile, mapping.SourceNodeID, mapping.SourceEndpoint, sourceData)
+			}
 		}
 
 		if sourceData == nil {
@@ -1758,4 +1766,16 @@ func pluginErrorSectionDefault(sourceEndpoint string) interface{} {
 		return ""
 	}
 	return nil
+}
+
+// ErrByteValueNotAFile is returned when a BYTE mapping's source holds a scalar (a string, number or
+// boolean) rather than a file reference. It fails the same way on every retry, so it is permanent.
+var ErrByteValueNotAFile = errors.New("BYTE_VALUE_NOT_A_FILE")
+
+func isScalarValue(v interface{}) bool {
+	switch v.(type) {
+	case string, bool, float64, float32, int, int64, int32, json.Number:
+		return true
+	}
+	return false
 }
