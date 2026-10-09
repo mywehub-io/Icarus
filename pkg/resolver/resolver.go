@@ -2,7 +2,6 @@ package resolver
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,10 +12,6 @@ import (
 	"github.com/wehubfusion/Icarus/pkg/message"
 	"github.com/wehubfusion/Icarus/pkg/storage"
 )
-
-// DefaultMaxInlineBytes defines the default threshold (500KB) for inline payloads.
-// This is set below NATS 1MB limit to leave room for message metadata and headers.
-const DefaultMaxInlineBytes = 500 * 1024 // 500KB
 
 // DefaultMaxConcurrentBlobDownloads bounds how many source blobs a single resolve
 // pulls at once.
@@ -36,29 +31,28 @@ type ResultMeta struct {
 	ExecutionID string
 }
 
-// Result describes the outcome of CreateResult.
+// Result describes the outcome of CreateResult: the blob the result was written to.
 type Result struct {
-	InlineData    []byte
 	BlobReference *message.BlobReference
-	UsedBlob      bool
 }
 
 // Service wraps blob-related helpers so plugins stay blob-agnostic.
 type Service struct {
 	blobClient         storage.BlobStorageClient
-	maxInlineBytes     int
 	maxConcurrentBlobs int
 	logger             *zap.Logger
+	// recordsMaterialiseMax caps building a records file in memory (see WithRecordsMaterialiseMax).
+	recordsMaterialiseMax int64
+	// recordsBatchAbove is the records file size above which an iterated consumer reads it in
+	// batches instead of building the array (see WithRecordsBatchAbove).
+	recordsBatchAboveMax int64
 }
 
-// NewService builds a resolver service. If blobClient is nil, only inline resolution works.
-func NewService(blobClient storage.BlobStorageClient, maxInlineBytes int) *Service {
-	if maxInlineBytes <= 0 {
-		maxInlineBytes = DefaultMaxInlineBytes
-	}
+// NewService builds a resolver service. Every result and every source it reads is a blob, so a
+// nil blobClient can resolve nothing; it exists for tests of code that never reaches storage.
+func NewService(blobClient storage.BlobStorageClient) *Service {
 	return &Service{
 		blobClient:         blobClient,
-		maxInlineBytes:     maxInlineBytes,
 		maxConcurrentBlobs: DefaultMaxConcurrentBlobDownloads,
 	}
 }
@@ -87,14 +81,10 @@ func (s *Service) blobDownloadLimit() int {
 	return s.maxConcurrentBlobs
 }
 
-// ResolveInput returns inline data or downloads it from blob storage when a reference is provided.
-func (s *Service) ResolveInput(ctx context.Context, inline []byte, blobRef *message.BlobReference) ([]byte, error) {
-	if len(inline) > 0 {
-		return inline, nil
-	}
-
+// ResolveInput downloads the blob a reference names.
+func (s *Service) ResolveInput(ctx context.Context, blobRef *message.BlobReference) ([]byte, error) {
 	if blobRef == nil || blobRef.URL == "" {
-		return nil, fmt.Errorf("resolver: no inline data or blob reference provided")
+		return nil, fmt.Errorf("resolver: no blob reference provided")
 	}
 
 	if s.blobClient == nil {
@@ -129,26 +119,25 @@ type IterationContext struct {
 	ArrayLength int
 }
 
-// ResolveMappedInput resolves the payload (inline or blob) and applies field mappings when provided.
-// Priority: BlobRef > Inline
+// ResolveMappedInput resolves the payload blob, when there is one, and applies field mappings when
+// provided.
 func (s *Service) ResolveMappedInput(
 	ctx context.Context,
-	inline []byte,
 	blobRef *message.BlobReference,
 	params *FieldMappingParams,
 ) ([]byte, error) {
 	var base []byte
 	var err error
 
-	// Resolve input from blob reference or inline data
-	if len(inline) > 0 || (blobRef != nil && blobRef.URL != "") {
-		base, err = s.ResolveInput(ctx, inline, blobRef)
+	// Resolve input from the blob reference
+	if blobRef != nil && blobRef.URL != "" {
+		base, err = s.ResolveInput(ctx, blobRef)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return s.buildInputFromFieldMappings(base, params)
+	return s.buildInputFromFieldMappings(ctx, base, params)
 }
 
 // ResolveMappedInputWithConsumerGraph resolves input using consumer graph to download multiple blob files.
@@ -156,19 +145,18 @@ func (s *Service) ResolveMappedInput(
 // If consumerGraph is nil, it falls back to ResolveMappedInput behavior.
 func (s *Service) ResolveMappedInputWithConsumerGraph(
 	ctx context.Context,
-	inline []byte,
 	blobRef *message.BlobReference,
 	params *FieldMappingParams,
 	consumerGraph *ConsumerGraph,
 ) ([]byte, error) {
 	// If no consumer graph provided, fall back to standard behavior
 	if consumerGraph == nil {
-		return s.ResolveMappedInput(ctx, inline, blobRef, params)
+		return s.ResolveMappedInput(ctx, blobRef, params)
 	}
 
-	// If we have inline data or blob ref, and no field mappings, use standard resolution
-	if (len(inline) > 0 || (blobRef != nil && blobRef.URL != "")) && (params == nil || len(params.FieldMappings) == 0) {
-		return s.ResolveMappedInput(ctx, inline, blobRef, params)
+	// If we have a blob ref and no field mappings, use standard resolution
+	if (blobRef != nil && blobRef.URL != "") && (params == nil || len(params.FieldMappings) == 0) {
+		return s.ResolveMappedInput(ctx, blobRef, params)
 	}
 
 	// If no field mappings but we have a consumer graph, try to use it
@@ -201,7 +189,7 @@ func (s *Service) ResolveMappedInputWithConsumerGraph(
 		}
 
 		// No files in consumer graph - fall back to standard resolution
-		return s.ResolveMappedInput(ctx, inline, blobRef, params)
+		return s.ResolveMappedInput(ctx, blobRef, params)
 	}
 
 	// Determine which blob files are needed
@@ -225,78 +213,15 @@ func (s *Service) ResolveMappedInputWithConsumerGraph(
 		params.SourceResults[nodeID] = result
 	}
 
-	// Check ResultLocations for nodes with inline data that aren't in source results yet
-	if consumerGraph.ResultLocations != nil {
-		// Extract source node IDs from field mappings
-		sourceNodeIDs := make(map[string]bool)
-		for _, mapping := range params.FieldMappings {
-			if !mapping.IsEventTrigger && mapping.SourceNodeID != "" {
-				sourceNodeIDs[mapping.SourceNodeID] = true
-			}
-		}
-
-		for nodeID := range sourceNodeIDs {
-			// Skip if we already have this node in source results
-			if _, exists := params.SourceResults[nodeID]; exists {
-				continue
-			}
-
-			// Check if this node has inline data in ResultLocations
-			if location, exists := consumerGraph.ResultLocations[nodeID]; exists && location != nil {
-				if location.HasInlineData && len(location.InlineData) > 0 {
-					// Parse inline data
-					var inlineData map[string]interface{}
-					if err := json.Unmarshal(location.InlineData, &inlineData); err == nil {
-						var nodeFields map[string]interface{}
-						var rawFlatKeys map[string]interface{}
-
-						// Check if this is StandardUnitOutput format (flat map with "nodeId-/" prefixed keys)
-						isStandardUnitOutput := isStandardUnitOutputFormat(inlineData)
-
-						if isStandardUnitOutput {
-							// Store raw flat keys for direct extraction in field mapping
-							rawFlatKeys = inlineData
-
-							// Extract and restructure data from StandardUnitOutput format
-							nodeFields = extractNodeDataFromStandardOutputFlat(inlineData, nodeID)
-							// Handle empty extraction case
-							if len(nodeFields) == 0 {
-								if len(inlineData) == 0 {
-									// Empty StandardUnitOutput - use inlineData as fallback
-									nodeFields = inlineData
-								} else {
-									// Has data but no keys for this nodeID
-									nodeFields = make(map[string]interface{})
-								}
-							}
-						} else {
-							// Not StandardUnitOutput - use as-is
-							nodeFields = inlineData
-						}
-
-						// Create SourceResult with extracted/restructured data
-						params.SourceResults[nodeID] = &SourceResult{
-							NodeID:            nodeID,
-							Status:            "success", // Assume success for inline data
-							ProjectedFields:   map[string]map[string]interface{}{nodeID: nodeFields},
-							IterationMetadata: nil,
-							RawFlatKeys:       rawFlatKeys,
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Build input using field mappings with all source results
+	// Build input using field mappings with all source results; records references become the
+	// arrays they hold, for this (non-streaming) consumer.
 	buildParams := BuildInputParams{
 		UnitNodeID:    params.BlobSourceNodeID,
 		FieldMappings: params.FieldMappings,
 		SourceResults: params.SourceResults,
 		TriggerData:   params.TriggerData,
 	}
-
-	return buildInputFromMappings(buildParams)
+	return s.materialiseAndBuild(ctx, buildParams)
 }
 
 // downloadAndParseBlobFiles downloads multiple blob files in parallel and extracts SourceResults.
@@ -374,6 +299,7 @@ func (s *Service) downloadAndParseBlobFiles(
 
 // buildInputFromFieldMappings centralizes the logic for constructing unit inputs using field mappings.
 func (s *Service) buildInputFromFieldMappings(
+	ctx context.Context,
 	base []byte,
 	params *FieldMappingParams,
 ) ([]byte, error) {
@@ -387,19 +313,16 @@ func (s *Service) buildInputFromFieldMappings(
 		return []byte("{}"), nil
 	}
 
-	sourceResults := params.SourceResults
 	// Note: When using consumer graph, sourceResults should already be populated
 	// from downloadAndParseBlobFiles. If not, we can't extract from base blob
 	// without knowing which nodes are in the file (requires ContainsNodes).
-
 	buildParams := BuildInputParams{
 		UnitNodeID:    params.BlobSourceNodeID,
 		FieldMappings: params.FieldMappings,
-		SourceResults: sourceResults,
+		SourceResults: params.SourceResults,
 		TriggerData:   params.TriggerData,
 	}
-
-	return buildInputFromMappings(buildParams)
+	return s.materialiseAndBuild(ctx, buildParams)
 }
 
 // sourceResultsFromContent builds SourceResults from a flat map.
@@ -520,39 +443,38 @@ func BuildPriorUnitOutputsFromFlat(flat map[string]interface{}) map[string]map[s
 	return out
 }
 
-// BuildPriorUnitOutputsFromConsumerGraph builds priorUnitOutputs from ConsumerGraph ResultLocations
-// so a downstream unit's subflow can reference prior unit node IDs. For each ResultLocation with
-// inline data, if the data is StandardUnitOutput flat form, extracts all node outputs; otherwise
-// treats it as that single node's output.
-func BuildPriorUnitOutputsFromConsumerGraph(cg *ConsumerGraph) map[string]map[string]interface{} {
-	if cg == nil || cg.ResultLocations == nil {
-		return nil
+// PriorUnitOutputs reads the result blobs that hold nodeIDs and returns each node's output, so a
+// downstream unit's subflow can seed its store and reference prior unit node IDs in field
+// mappings. Every result is a blob, so this downloads: only the files that hold the named nodes,
+// and only those nodes' entries.
+func (s *Service) PriorUnitOutputs(ctx context.Context, cg *ConsumerGraph, nodeIDs []string) (map[string]map[string]interface{}, error) {
+	if cg == nil || len(nodeIDs) == 0 {
+		return nil, nil
+	}
+	mappings := make([]message.FieldMapping, 0, len(nodeIDs))
+	for _, id := range nodeIDs {
+		mappings = append(mappings, message.FieldMapping{SourceNodeID: id, SourceEndpoint: "/"})
+	}
+	files := cg.DetermineRequiredFiles(mappings)
+	if len(files) == 0 {
+		return nil, nil
+	}
+	results, err := s.downloadAndParseBlobFiles(ctx, files, mappings)
+	if err != nil {
+		return nil, err
 	}
 	var prior map[string]map[string]interface{}
-	for nodeID, loc := range cg.ResultLocations {
-		if loc == nil || !loc.HasInlineData || len(loc.InlineData) == 0 {
+	for _, id := range nodeIDs {
+		sr := results[id]
+		if sr == nil || len(sr.RawFlatKeys) == 0 {
 			continue
 		}
-		var data map[string]interface{}
-		if err := json.Unmarshal(loc.InlineData, &data); err != nil {
-			continue
+		if prior == nil {
+			prior = make(map[string]map[string]interface{})
 		}
-		if isStandardUnitOutputFormat(data) {
-			flatPrior := BuildPriorUnitOutputsFromFlat(data)
-			if prior == nil {
-				prior = make(map[string]map[string]interface{})
-			}
-			for nid, out := range flatPrior {
-				prior[nid] = out
-			}
-		} else {
-			if prior == nil {
-				prior = make(map[string]map[string]interface{})
-			}
-			prior[nodeID] = data
-		}
+		prior[id] = extractNodeDataFromStandardOutputFlat(sr.RawFlatKeys, id)
 	}
-	return prior
+	return prior, nil
 }
 
 // extractNodeDataFromStandardOutputFlat extracts and restructures data from flat StandardUnitOutput format.
@@ -803,35 +725,19 @@ func setNestedValue(m map[string]interface{}, path string, value interface{}) {
 	}
 }
 
-// CreateResult decides whether to return inline data or upload it to blob storage.
+// CreateResult writes a unit's output document, a marshalled StandardUnitOutput, to blob storage as
+// an addressable archive and returns the blob's reference. Every result is a blob: there is no
+// size below which it stays in the message.
 func (s *Service) CreateResult(ctx context.Context, data []byte, meta ResultMeta) (*Result, error) {
-	if len(data) == 0 {
-		return &Result{InlineData: data}, nil
+	if s.blobClient == nil {
+		return nil, fmt.Errorf("resolver: blob storage is not configured, so the result cannot be written")
 	}
-
-	if len(data) <= s.maxInlineBytes || s.blobClient == nil {
-		return &Result{
-			InlineData: data,
-		}, nil
-	}
-
 	blobPath, metadata, err := resultBlobLocation(meta)
 	if err != nil {
 		return nil, err
 	}
 
-	// The inline decision above was made on the payload as given, before any format
-	// choice, so an archive is only ever built on the blob branch. A payload sitting near
-	// the threshold can never be pushed over it by the container's framing.
-	//
-	// Everything written here is an archive, and there is no branch left at this call
-	// site. CreateResult is not only a node-output writer — Artemis's MLLP ingest offloads
-	// a raw HL7 message through it and an HTTP trigger offloads whatever body arrived —
-	// so BuildPayload decides between an addressable document archive and an opaque one
-	// from the payload's own shape. Neither can fail on shape, which matters because the
-	// trigger upload completes before the acknowledgement is written: a refusal here would
-	// cost a message rather than a field.
-	payload, stats, err := archive.BuildPayload(data)
+	payload, stats, err := archive.Build(data)
 	if err != nil {
 		return nil, fmt.Errorf("resolver: failed to build result archive: %w", err)
 	}
@@ -846,17 +752,11 @@ func (s *Service) CreateResult(ctx context.Context, data []byte, meta ResultMeta
 			zap.String("blob_url", blobURL),
 			zap.Int("total_bytes", len(payload)),
 			zap.Int("document_bytes", len(data)),
-			zap.Bool("used_blob", true),
-			// entry_count is what says whether the high-key-count shape is real in this
-			// deployment. That shape costs heap on open and makes the archive larger than
-			// the document it replaced; both are accepted rather than designed around, on
-			// the basis that this number decides whether a remedy is ever needed.
+			// entry_count says whether the high-key-count shape is real in this deployment. That
+			// shape costs heap on open and makes the archive larger than the document it replaced;
+			// both are accepted rather than designed around.
 			zap.Int("entry_count", stats.EntryCount),
 			zap.Int("array_entry_count", stats.ArrayEntryCount),
-			// An opaque write on a node-output path would mean the document failed the
-			// flat-key shape test and silently lost selective fetch, so it is worth being
-			// able to see the two apart in the logs.
-			zap.Bool("opaque", stats.Opaque),
 		)
 	}
 
@@ -866,14 +766,13 @@ func (s *Service) CreateResult(ctx context.Context, data []byte, meta ResultMeta
 			// The size of what was actually written. Opening an archive over ranged reads
 			// needs the blob's exact length, and a stale or wrong value here surfaces as a
 			// hard 416 rather than a short read.
-			SizeBytes: len(payload),
+			SizeBytes: int64(len(payload)),
 		},
-		UsedBlob: true,
 	}, nil
 }
 
 // resultBlobLocation is where a unit's result blob goes and the metadata it carries. Shared
-// by CreateResult and CreateResultStream so both write to the same path for the same unit.
+// by CreateResult.
 func resultBlobLocation(meta ResultMeta) (string, map[string]string, error) {
 	if meta.WorkflowID == "" || meta.RunID == "" {
 		return "", nil, fmt.Errorf("resolver: workflow metadata required for blob result")

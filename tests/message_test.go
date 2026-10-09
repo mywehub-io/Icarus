@@ -35,7 +35,7 @@ func TestMessageCreation(t *testing.T) {
 func TestMessageWithComponents(t *testing.T) {
 	msg := message.NewMessage().
 		WithNode("node-123", map[string]interface{}{"type": "processor"}).
-		WithPayload( "test data").
+		WithPayload().
 		WithOutput("stream")
 
 	if msg.Node.NodeID != "node-123" {
@@ -45,8 +45,8 @@ func TestMessageWithComponents(t *testing.T) {
 		t.Errorf("Expected node config type 'processor', got %v", msg.Node.Configuration)
 	}
 	// Source field removed - plugin type available in Metadata["plugin_type"]
-	if msg.Payload.GetInlineData() != "test data" {
-		t.Errorf("Expected payload data 'test data', got %s", msg.Payload.GetInlineData())
+	if msg.Payload == nil {
+		t.Error("Expected a payload")
 	}
 	if msg.Output.DestinationType != "stream" {
 		t.Errorf("Expected output destination 'stream', got %s", msg.Output.DestinationType)
@@ -56,7 +56,7 @@ func TestMessageWithComponents(t *testing.T) {
 func TestMessageSerialization(t *testing.T) {
 	original := message.NewWorkflowMessage("workflow-123", "run-456").
 		WithNode("node-789", map[string]interface{}{"priority": "high"}).
-		WithPayload( "test data content").
+		WithPayload().
 		WithOutput("stream")
 
 	// Serialize to bytes
@@ -82,8 +82,8 @@ func TestMessageSerialization(t *testing.T) {
 		t.Errorf("Node ID mismatch: expected %s, got %s", original.Node.NodeID, deserialized.Node.NodeID)
 	}
 	// Source field removed - plugin type available in Metadata["plugin_type"]
-	if deserialized.Payload.GetInlineData() != original.Payload.GetInlineData() {
-		t.Errorf("Payload data mismatch: expected %s, got %s", original.Payload.GetInlineData(), deserialized.Payload.GetInlineData())
+	if (deserialized.Payload == nil) != (original.Payload == nil) {
+		t.Error("Payload presence mismatch")
 	}
 	if deserialized.Output.DestinationType != original.Output.DestinationType {
 		t.Errorf("Output destination mismatch: expected %s, got %s", original.Output.DestinationType, deserialized.Output.DestinationType)
@@ -215,7 +215,7 @@ func TestMessageAckNakTerm(t *testing.T) {
 func TestFromNATSMsg(t *testing.T) {
 	// Create a test message
 	originalMsg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload( "test data")
+		WithPayload()
 
 	data, err := originalMsg.ToBytes()
 	if err != nil {
@@ -241,16 +241,15 @@ func TestFromNATSMsg(t *testing.T) {
 			originalMsg.Workflow.WorkflowID, convertedMsg.Workflow.WorkflowID)
 	}
 
-	if convertedMsg.Payload.GetInlineData() != originalMsg.Payload.GetInlineData() {
-		t.Errorf("Payload data mismatch: expected %s, got %s",
-			originalMsg.Payload.GetInlineData(), convertedMsg.Payload.GetInlineData())
+	if (convertedMsg.Payload == nil) != (originalMsg.Payload == nil) {
+		t.Error("Payload presence mismatch")
 	}
 }
 
 func TestFromJetStreamMsg(t *testing.T) {
 	// Create a test message
 	originalMsg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload("test data")
+		WithPayload()
 
 	data, err := originalMsg.ToBytes()
 	if err != nil {
@@ -519,7 +518,7 @@ func TestMessage_HasSchema(t *testing.T) {
 func TestMessage_SerializationWithEmbeddedNodes(t *testing.T) {
 	original := message.NewWorkflowMessage("workflow-123", "run-456").
 		WithNode("parent-node", nil).
-		WithPayload( "test data")
+		WithPayload()
 
 	embeddedNodes := []message.EmbeddedNode{
 		{
@@ -593,7 +592,7 @@ func TestMessage_WithEmbeddedNodes_Fluent(t *testing.T) {
 	msg := message.NewMessage().
 		WithNode("parent", nil).
 		WithEmbeddedNodes(embeddedNodes).
-		WithPayload( "data")
+		WithPayload()
 
 	if !msg.HasEmbeddedNodes() {
 		t.Error("Message should be a unit after WithEmbeddedNodes")

@@ -41,7 +41,7 @@ func (m *mockProcessor) Process(ctx context.Context, msg *message.Message) (mess
 	}
 	// Return a default result message
 	resultMessage := message.NewMessage().
-		WithPayload(`{"status":"processed"}`)
+		WithPayload()
 
 	// Copy workflow information if it exists
 	if msg.Workflow != nil {
@@ -157,13 +157,13 @@ func TestRunnerRunWithSuccessfulProcessor(t *testing.T) {
 
 	// Add test messages
 	testMsg := message.NewMessage().
-		WithPayload("test data")
+		WithPayload()
 	mockClient.addMessage(testMsg)
 
 	mockProc := &mockProcessor{
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
 			// Simulate successful processing
-			resultMessage := message.NewMessage().WithPayload(`{"status":"success"}`)
+			resultMessage := message.NewMessage().WithPayload()
 			if msg.Workflow != nil {
 				resultMessage.Workflow = msg.Workflow
 				resultMessage.WithMetadata("temporal_workflow_id", msg.Workflow.WorkflowID)
@@ -204,7 +204,7 @@ func TestRunnerRunWithFailingProcessor(t *testing.T) {
 
 	// Add test messages
 	testMsg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload("test data")
+		WithPayload()
 	mockClient.addMessage(testMsg)
 
 	mockProc := &mockProcessor{
@@ -245,7 +245,7 @@ func TestRunnerRunWithMultipleMessages(t *testing.T) {
 	// Add multiple test messages
 	for i := 0; i < 3; i++ {
 		testMsg := message.NewMessage().
-			WithPayload("test data")
+			WithPayload()
 		mockClient.addMessage(testMsg)
 	}
 
@@ -253,7 +253,7 @@ func TestRunnerRunWithMultipleMessages(t *testing.T) {
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
 			// Simulate successful processing with small delay
 			time.Sleep(10 * time.Millisecond)
-			resultMessage := message.NewMessage().WithPayload(`{"status":"success"}`)
+			resultMessage := message.NewMessage().WithPayload()
 			if msg.Workflow != nil {
 				resultMessage.Workflow = msg.Workflow
 				resultMessage.WithMetadata("temporal_workflow_id", msg.Workflow.WorkflowID)
@@ -301,7 +301,7 @@ func TestRunner_recoversFromConsumerFailure(t *testing.T) {
 
 	mockClient.setConsumerErrorBudget(errors.New("consumer info: nats: connection closed"), 3)
 
-	testMsg := message.NewMessage().WithPayload("test data")
+	testMsg := message.NewMessage().WithPayload()
 	mockClient.addMessage(testMsg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -331,7 +331,7 @@ func TestRunner_resolvesConsumerAgainAfterFetchFailure(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Run(ctx) }()
 
-	mockClient.addMessage(message.NewMessage().WithPayload("after-failure"))
+	mockClient.addMessage(message.NewMessage().WithPayload())
 	deadline := time.Now().Add(5 * time.Second)
 	for mockProc.getCallCount() < 1 {
 		if time.Now().After(deadline) {
@@ -363,7 +363,7 @@ func TestRunner_fetchesOnlyForIdleWorkers(t *testing.T) {
 		t.Fatalf("NewRunner failed: %v", err)
 	}
 	for i := 0; i < 6; i++ {
-		mockClient.addMessage(message.NewMessage().WithPayload("job"))
+		mockClient.addMessage(message.NewMessage().WithPayload())
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -458,7 +458,7 @@ func TestRunnerRunWithReportError(t *testing.T) {
 
 	// Add test messages
 	testMsg := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload("test data")
+		WithPayload()
 	mockClient.addMessage(testMsg)
 
 	// Set up report error
@@ -504,7 +504,7 @@ func TestRunnerRunContextCancellation(t *testing.T) {
 	// Add multiple messages to ensure processing takes some time
 	for i := 0; i < 10; i++ {
 		testMsg := message.NewMessage().
-			WithPayload("test data")
+			WithPayload()
 		mockClient.addMessage(testMsg)
 	}
 
@@ -512,7 +512,7 @@ func TestRunnerRunContextCancellation(t *testing.T) {
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
 			// Simulate slow processing
 			time.Sleep(50 * time.Millisecond)
-			resultMessage := message.NewMessage().WithPayload(`{"status":"success"}`)
+			resultMessage := message.NewMessage().WithPayload()
 			if msg.Workflow != nil {
 				resultMessage.Workflow = msg.Workflow
 				resultMessage.WithMetadata("temporal_workflow_id", msg.Workflow.WorkflowID)
@@ -608,7 +608,7 @@ func TestRunnerProcessFailureObserverPermanentError(t *testing.T) {
 		WithMetadata("execution_id", "wf-1-node-1-123").
 		WithMetadata("client_id", "client-1").
 		WithNode("parent-node", map[string]interface{}{}).
-		WithPayload(`{}`)
+		WithPayload()
 	mockClient.addMessage(testMsg)
 
 	mockProc := &mockProcessor{
@@ -646,7 +646,7 @@ func TestRunnerProcessFailureObserverInternalError(t *testing.T) {
 		WithMetadata("execution_id", "wf-1-node-1-123").
 		WithMetadata("client_id", "client-1").
 		WithNode("parent-node", map[string]interface{}{}).
-		WithPayload(`{}`)
+		WithPayload()
 	mockClient.mockJS.addMessageOnAttempt(testMsg, 5) // the last attempt reports
 
 	mockProc := &mockProcessor{
@@ -684,7 +684,7 @@ func TestRunnerTransientFailureRetriesWithoutReporting(t *testing.T) {
 	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
 		WithMetadata("execution_id", "wf-1-node-1-123").
 		WithNode("parent-node", map[string]interface{}{}).
-		WithPayload(`{}`)
+		WithPayload()
 	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 1)
 
 	mockProc := &mockProcessor{
@@ -726,7 +726,7 @@ func TestRunnerTransientFailureOnLastAttemptReportsFinal(t *testing.T) {
 	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
 		WithMetadata("execution_id", "wf-1-node-1-123").
 		WithNode("parent-node", map[string]interface{}{}).
-		WithPayload(`{}`)
+		WithPayload()
 	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 5)
 
 	mockProc := &mockProcessor{
@@ -764,13 +764,13 @@ func TestRunnerResultPublishFailureRetriesWithoutReporting(t *testing.T) {
 	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
 		WithMetadata("execution_id", "wf-1-node-1-123").
 		WithNode("parent-node", map[string]interface{}{}).
-		WithPayload(`{}`)
+		WithPayload()
 	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 1)
 	mockClient.setReportError(errors.New("results stream unavailable"))
 
 	mockProc := &mockProcessor{
 		processFunc: func(ctx context.Context, msg *message.Message) (message.Message, error) {
-			out := message.NewWorkflowMessage("wf-1", "run-1").WithPayload(`{"ok":true}`)
+			out := withResultBlob(message.NewWorkflowMessage("wf-1", "run-1").WithPayload())
 			out.Payload.ExecutionID = "wf-1-node-1-123"
 			return *out, nil
 		},
@@ -808,7 +808,7 @@ func TestRunnerUnclassifiedFailureReportsAtOnce(t *testing.T) {
 	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
 		WithMetadata("execution_id", "wf-1-node-1-123").
 		WithNode("parent-node", map[string]interface{}{}).
-		WithPayload(`{}`)
+		WithPayload()
 	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 1)
 
 	mockProc := &mockProcessor{
@@ -842,7 +842,7 @@ func TestRunnerProcessTimeoutReportsAtOnce(t *testing.T) {
 	testMsg := message.NewWorkflowMessage("wf-1", "run-1").
 		WithMetadata("execution_id", "wf-1-node-1-123").
 		WithNode("parent-node", map[string]interface{}{}).
-		WithPayload(`{}`)
+		WithPayload()
 	jsMsg := mockClient.mockJS.addMessageOnAttempt(testMsg, 1)
 
 	mockProc := &mockProcessor{
@@ -874,7 +874,7 @@ func TestRunnerProcessFailureObserverPlainError(t *testing.T) {
 		WithMetadata("execution_id", "wf-1-node-1-123").
 		WithMetadata("client_id", "client-1").
 		WithNode("parent-node", map[string]interface{}{}).
-		WithPayload(`{}`)
+		WithPayload()
 	mockClient.mockJS.addMessageOnAttempt(testMsg, 5) // the last attempt reports
 
 	mockProc := &mockProcessor{

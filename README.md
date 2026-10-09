@@ -101,15 +101,19 @@ Result messages are published through `c.Messages.PublishResult` /
 type MyProcessor struct{}
 
 func (p *MyProcessor) Process(ctx context.Context, msg *message.Message) (message.Message, error) {
-    var content string
-    if msg.Payload != nil {
-        content = msg.Payload.GetInlineData()
-    }
-    fmt.Printf("Processing: %s (Workflow: %s)\n", content, msg.Workflow.WorkflowID)
+    fmt.Printf("Processing (Workflow: %s)\n", msg.Workflow.WorkflowID)
 
-    // Create result message with processing outcome
-    resultMessage := message.NewMessage().
-        WithPayload("processor", "Successfully processed", "result-ref")
+    // Write the unit's output document to blob storage (every result is a blob) and
+    // carry the reference in the result message
+    res, err := resolverSvc.CreateResult(ctx, outputDocument, resolver.ResultMeta{
+        WorkflowID: msg.Workflow.WorkflowID, RunID: msg.Workflow.RunID,
+        NodeID: msg.Node.NodeID, ExecutionID: msg.Metadata["execution_id"],
+    })
+    if err != nil {
+        return message.Message{}, err
+    }
+    resultMessage := message.NewMessage().WithPayload()
+    resultMessage.Payload.BlobReference = res.BlobReference
 
     // Copy workflow information for callback reporting
     if msg.Workflow != nil {
@@ -404,15 +408,17 @@ Note: `runner.NewRunner` calls `Messages.EnsureStream` and `Messages.EnsureConsu
 automatically, so manual setup is only needed for custom configurations. Both are
 create-only: existing streams and durables are never modified.
 
-### BlobReference for Large Payloads
+### BlobReference: every result is a blob
 
-Messages can contain a `BlobReference` in the payload for large data that exceeds inline limits (>1.5MB):
+A unit's result is always a blob: an archive of its output document, written with
+`resolver.Service.CreateResult`. The result message carries a `BlobReference` and
+`ReportSuccess` refuses a result without one. Nothing travels inline: there is no inline
+data field on the payload and no size threshold below which a result stays in the message.
 
 ```go
-// Payload with blob reference (set by Zeus when publishing large inputs)
 type Payload struct {
-    InlineData    *string        `json:"inlineData,omitempty"`   // Inline data (for small payloads) - nullable
-    BlobReference *BlobReference `json:"blobReference,omitempty"` // Reference to blob storage
+    BlobReference *BlobReference `json:"blobReference,omitempty"` // The unit's result blob
+    FieldMappings []FieldMapping `json:"fieldMappings,omitempty"` // Field mappings for extracting input from blobs
     // Execution context fields (automatically populated by WithPayload)
     ExecutionID string `json:"execution_id"` // Unique identifier for this execution
     WorkflowID  string `json:"workflow_id"`  // Workflow identifier
@@ -420,18 +426,15 @@ type Payload struct {
     NodeID      string `json:"node_id"`      // Node identifier
 }
 
-// Helper methods:
-// GetData() returns the inline data as string, or empty string if nil
-// HasData() returns true if inline data is present
-
 type BlobReference struct {
-    URL       string `json:"url"`       // Direct blob URL (for logging)
-    SizeBytes int    `json:"sizeBytes"` // Original data size in bytes
+    URL       string `json:"url"`       // Direct blob URL
+    SizeBytes int64  `json:"sizeBytes"` // Size of the blob in bytes
 }
 ```
 
-On the result side, `MessageService` (with `SetBlobStorage` configured) uploads
-oversized result payloads to blob storage automatically before publishing.
+A byte value inside a document is a file reference (`pkg/fileref`), never base64 text: the
+file is written once, through `filestore`, and the value passed on is
+`{"$file":{"path":...,"size":...,"contentType":...}}`.
 
 ### Tracing Integration
 
@@ -716,7 +719,7 @@ cc, err := consumer.Consume(func(jsMsg jetstream.Msg) {
     } else {
         logger.Error("Processing failed",
             zap.String("execution_id", resultMsg.ExecutionID),
-            zap.String("error", string(resultMsg.Result.InlineResult)))
+            zap.String("error", resultMsg.Error.Message))
     }
 
     jsMsg.Ack()
@@ -1004,7 +1007,7 @@ cc, err := consumer.Consume(func(jsMsg jetstream.Msg) {
         jsMsg.Nak()
         return
     }
-    fmt.Printf("Consumed message: %s\n", msg.Payload.GetInlineData())
+    fmt.Printf("Consumed message (Workflow: %s)\n", msg.Workflow.WorkflowID)
     msg.Ack()
 })
 defer cc.Stop()
@@ -1144,7 +1147,7 @@ type Message struct {
 
 - **Workflow**: Contains `WorkflowID` and `RunID` for tracking workflow executions
 - **Node**: Contains `NodeID` and `Configuration` for workflow node information
-- **Payload**: Contains `InlineData` for the message content (execution ID is stored in `Metadata["execution_id"]`, plugin type in `Metadata["plugin_type"]`)
+- **Payload**: Contains the field mappings and, on a result, the `BlobReference` (execution ID is stored in `Metadata["execution_id"]`, plugin type in `Metadata["plugin_type"]`)
 - **Output**: Contains `DestinationType` for routing information
 - **Metadata**: Flexible key-value pairs for additional information
 - **EmbeddedNodes**: Array of child nodes to execute within the parent node (for unit processing)
@@ -1990,8 +1993,7 @@ func main() {
             jsMsg.Nak()
             return
         }
-        fmt.Printf("Consumed: %s (Workflow: %s)\n",
-            consumed.Payload.GetInlineData(), consumed.Workflow.WorkflowID)
+        fmt.Printf("Consumed (Workflow: %s)\n", consumed.Workflow.WorkflowID)
         consumed.Ack()
     })
     if err != nil {
@@ -2010,11 +2012,7 @@ func main() {
 type RunnerProcessor struct{}
 
 func (RunnerProcessor) Process(ctx context.Context, msg *message.Message) (message.Message, error) {
-    var content string
-    if msg.Payload != nil {
-        content = msg.Payload.GetInlineData()
-    }
-    fmt.Printf("Processing: %s (Workflow: %s)\n", content, msg.Workflow.WorkflowID)
+    fmt.Printf("Processing (Workflow: %s)\n", msg.Workflow.WorkflowID)
     // Simulate processing work
     time.Sleep(100 * time.Millisecond)
 

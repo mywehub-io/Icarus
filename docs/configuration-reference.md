@@ -6,6 +6,7 @@
 |---|---|---|
 | `ICARUS_RUNNER_WORKERS` | `pkg/runner` | Exact worker goroutine count. Overrides `Config.WorkerCount` |
 | `ICARUS_RUNNER_WORKER_MULTIPLIER` | `pkg/runner` | Multiplied by `GOMAXPROCS` to derive worker count. Applied when `ICARUS_RUNNER_WORKERS` is unset |
+| `ICARUS_RUNNER_STALL_TIMEOUT` | `pkg/runner` | Go duration, default `2m`, negative turns it off. How long a runner may go without a successful fetch while a worker is idle and NATS is connected before its watchdog logs an error and resolves the consumer again, and `Runner.Health` reports it stalled. Overridden by `Config.StallTimeout` |
 
 Resolution order for worker count: `Config.WorkerCount` (if > 0) → `ICARUS_RUNNER_WORKERS` → `ICARUS_RUNNER_WORKER_MULTIPLIER × GOMAXPROCS` → `GOMAXPROCS`.
 

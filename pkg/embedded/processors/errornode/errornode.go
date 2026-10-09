@@ -25,6 +25,9 @@ type Config struct {
 // - a generic fallback when both are empty
 type ErrorNode struct {
 	runtime.BaseNode
+
+	// cfgCache holds the parsed configuration, read-only, shared by every worker of the unit.
+	cfgCache runtime.ConfigCache[Config]
 }
 
 // NewErrorNode creates a new ErrorNode instance.
@@ -39,6 +42,11 @@ func NewErrorNode(config runtime.EmbeddedNodeConfig) (runtime.EmbeddedNode, erro
 	}, nil
 }
 
+// Prepare implements runtime.ConfigPreparer: the configuration is parsed once for the unit.
+func (n *ErrorNode) Prepare(rawConfig json.RawMessage) {
+	_, _ = n.cfgCache.Get(rawConfig, runtime.ParseJSON[Config])
+}
+
 // Process evaluates the configuration and input data, then returns
 // an error output with the resolved message.
 //
@@ -50,8 +58,8 @@ func NewErrorNode(config runtime.EmbeddedNodeConfig) (runtime.EmbeddedNode, erro
 //   - When there is no pluginError listener, the error bubbled from
 //     this node will cause the unit/workflow to fail.
 func (n *ErrorNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
-	var cfg Config
-	if err := json.Unmarshal(input.RawConfig, &cfg); err != nil {
+	cfgp, err := n.cfgCache.Get(input.RawConfig, runtime.ParseJSON[Config])
+	if err != nil {
 		configErr := runtime.NewProcessingError(
 			input.NodeId,
 			input.Label,
@@ -62,6 +70,7 @@ func (n *ErrorNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
 		)
 		return runtime.ErrorOutput(configErr)
 	}
+	cfg := *cfgp
 
 	message := resolveMessage(input.Data, cfg.DefaultErrorMessage)
 	if message == "" {

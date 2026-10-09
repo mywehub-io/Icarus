@@ -87,7 +87,7 @@ func TestArchiveReadMatchesDocumentRead(t *testing.T) {
 
 	// The archive path, over ranged reads against a fake that serves byte ranges.
 	fake, url := serveArchive(t, doc)
-	svc := NewService(fake, 0)
+	svc := NewService(fake)
 	files := []*RequiredBlobFile{{BlobURL: url, ContainsNodes: nodes}}
 
 	gotResults, err := svc.downloadAndParseBlobFiles(context.Background(), files, mappings)
@@ -143,7 +143,7 @@ func TestArchiveReadFetchesOnlyTheSelectedKeys(t *testing.T) {
 	doc := buildFixtureDoc(t)
 	fake, url := serveArchive(t, doc)
 
-	svc := NewService(fake, 0)
+	svc := NewService(fake)
 	files := []*RequiredBlobFile{{BlobURL: url, ContainsNodes: []string{"solo", "iter", "child"}}}
 
 	// One scalar from one node. solo-/blob is 30KB of the payload and must not be moved.
@@ -168,89 +168,58 @@ func TestArchiveReadFetchesOnlyTheSelectedKeys(t *testing.T) {
 	}
 }
 
-// The end-to-end property of "everything in blob is an archive": whatever CreateResult is
-// handed, what comes back out of downloadPayload is what went in.
-//
-// The two payload kinds fail in different ways if this is wrong, and neither is loud. A
-// node output that came back as raw bytes would hand a plugin an empty document; an HL7
-// message that came back re-serialised, or as a ZIP, would break trigger ingest — and the
-// MLLP upload completes before the acknowledgement is written, so the cost is an MSA|AA
-// never sent for a message whose body did become durable.
-func TestCreateResultAndDownloadPayloadRoundTripEveryPayloadKind(t *testing.T) {
+// CreateResult writes the unit's output document as an archive the field-mapping read path
+// opens, and the document comes back out of it unchanged in JSON terms. A payload that is not a
+// node output (not flat keys) is refused rather than written in a form nothing reads.
+func TestCreateResultWritesAReadableArchive(t *testing.T) {
 	doc := buildFixtureDoc(t)
 
-	cases := []struct {
-		name    string
-		nodeID  string
-		payload []byte
-		// document is set where the payload is a StandardUnitOutput and so is compared as
-		// JSON rather than byte for byte: its entries are re-marshalled into an object, and
-		// key order and whitespace are then the writer's.
-		document bool
-	}{
-		{name: "node output", nodeID: "up", payload: doc, document: true},
-		{
-			name:    "mllp hl7",
-			nodeID:  "mllp-trigger",
-			payload: []byte("MSH|^~\\&|SENDER|FAC|RECV|FAC|20260928||ADT^A01|MSG0001|P|2.5\rPID|1||12345^^^FAC^MR||SMITH^JOHN\r"),
-		},
-		// An HTTP trigger body is very often a JSON object, and it is not a node output. It
-		// must survive verbatim: a plugin is handed the bytes the caller sent, so sorting
-		// its keys or stripping its whitespace would silently change what every oversized
-		// trigger delivers.
-		{
-			name:    "http json body",
-			nodeID:  "http-trigger",
-			payload: []byte("{ \"patient\" : { \"id\" : \"1\" },\n  \"zebra\": 1, \"apple\": 2 }"),
-		},
-		{name: "http csv body", nodeID: "http-trigger", payload: []byte("id,name\r\n1,david\r\n")},
+	fake := &fakeBlobClient{bodies: map[string]string{}, uploads: map[string][]byte{}}
+	svc := NewService(fake)
+	res, err := svc.CreateResult(context.Background(), doc, ResultMeta{
+		WorkflowID: "wf", RunID: "run", NodeID: "up", ExecutionID: "exec",
+	})
+	if err != nil {
+		t.Fatalf("CreateResult: %v", err)
+	}
+	if res.BlobReference == nil {
+		t.Fatal("the result did not go to blob")
+	}
+	if !strings.HasSuffix(res.BlobReference.URL, archive.Extension) {
+		t.Fatalf("stored at %s, want an %s path", res.BlobReference.URL, archive.Extension)
+	}
+	stored := fake.uploads[res.BlobReference.URL]
+	if !archive.IsArchive(stored) {
+		t.Fatal("what reached storage is not an archive")
+	}
+	if res.BlobReference.SizeBytes != int64(len(stored)) {
+		t.Fatal("SizeBytes is not the length of what was written, so a ranged open would 416")
 	}
 
-	for _, tc := range cases {
-		fake := &fakeBlobClient{bodies: map[string]string{}, uploads: map[string][]byte{}}
-		svc := NewService(fake, 1) // force the blob branch
+	r, err := archive.NewReader(bytes.NewReader(stored), int64(len(stored)))
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	got, err := r.Document()
+	if err != nil {
+		t.Fatalf("re-materialise: %v", err)
+	}
+	var want, have map[string]interface{}
+	if err := json.Unmarshal(doc, &want); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(got, &have); err != nil {
+		t.Fatalf("archive did not re-materialise into a document: %v (%s)", err, got)
+	}
+	if !reflect.DeepEqual(want, have) {
+		t.Fatal("re-materialised document differs from the one the archive was built from")
+	}
 
-		res, err := svc.CreateResult(context.Background(), tc.payload, ResultMeta{
-			WorkflowID: "wf", RunID: "run", NodeID: tc.nodeID, ExecutionID: "exec-" + tc.name,
-		})
-		if err != nil {
-			t.Fatalf("%s: CreateResult: %v", tc.name, err)
-		}
-		if res.BlobReference == nil {
-			t.Fatalf("%s: payload did not go to blob", tc.name)
-		}
-		if !strings.HasSuffix(res.BlobReference.URL, archive.Extension) {
-			t.Fatalf("%s: stored at %s, want an %s path", tc.name, res.BlobReference.URL, archive.Extension)
-		}
-		if stored := fake.uploads[res.BlobReference.URL]; !archive.IsArchive(stored) {
-			t.Fatalf("%s: what reached storage is not an archive", tc.name)
-		}
-		if res.BlobReference.SizeBytes != len(fake.uploads[res.BlobReference.URL]) {
-			t.Fatalf("%s: SizeBytes is not the length of what was written, so a ranged open would 416", tc.name)
-		}
-
-		got, err := svc.downloadPayload(context.Background(), res.BlobReference.URL)
-		if err != nil {
-			t.Fatalf("%s: downloadPayload: %v", tc.name, err)
-		}
-
-		if !tc.document {
-			if !bytes.Equal(got, tc.payload) {
-				t.Fatalf("%s: payload changed on the way through\n got %q\nwant %q", tc.name, got, tc.payload)
-			}
-			continue
-		}
-
-		var want, have map[string]interface{}
-		if err := json.Unmarshal(tc.payload, &want); err != nil {
-			t.Fatalf("%s: parse source document: %v", tc.name, err)
-		}
-		if err := json.Unmarshal(got, &have); err != nil {
-			t.Fatalf("%s: archive did not re-materialise into a document: %v (%s)", tc.name, err, got)
-		}
-		if !reflect.DeepEqual(want, have) {
-			t.Fatalf("%s: re-materialised document differs from the one the archive was built from", tc.name)
-		}
+	if _, err := svc.CreateResult(context.Background(), []byte("MSH|^~\\&|S"), ResultMeta{WorkflowID: "wf", RunID: "run", NodeID: "n"}); err == nil {
+		t.Fatal("a payload that is not a JSON object was written as a result")
+	}
+	if _, err := NewService(nil).CreateResult(context.Background(), doc, ResultMeta{WorkflowID: "wf", RunID: "run"}); err == nil {
+		t.Fatal("a result was accepted with no blob storage")
 	}
 }
 
@@ -270,7 +239,7 @@ func TestDownloadPayloadAdmitsConsumerGraphJSONAndRejectsAnythingElse(t *testing
 		graphURL: graph,
 		staleURL: "MSH|^~\\&|S|F|R|F|20260928||ADT^A01|1|P|2.5\r",
 	}}
-	svc := NewService(fake, 0)
+	svc := NewService(fake)
 
 	got, err := svc.downloadPayload(context.Background(), graphURL)
 	if err != nil {
@@ -282,27 +251,5 @@ func TestDownloadPayloadAdmitsConsumerGraphJSONAndRejectsAnythingElse(t *testing
 
 	if _, err := svc.downloadPayload(context.Background(), staleURL); err == nil {
 		t.Fatal("a blob that is neither an archive nor JSON was passed through silently")
-	}
-}
-
-// An opaque archive has no key space, so every mapping against it resolves to nothing. That
-// would run the unit on empty input with no error anywhere, which is the failure mode this
-// whole design is most concerned with, so the read path refuses it by name instead.
-func TestFieldMappingReadRefusesAnOpaqueArchive(t *testing.T) {
-	opaque, _, err := archive.BuildOpaque([]byte("MSH|^~\\&|S|F|R|F|20260928||ADT^A01|1|P|2.5\r"))
-	if err != nil {
-		t.Fatalf("BuildOpaque: %v", err)
-	}
-	const url = "https://acct/c/results/wf/run/trigger.zip"
-	fake := &fakeBlobClient{bodies: map[string]string{url: string(opaque)}}
-
-	files := []*RequiredBlobFile{{BlobURL: url, ContainsNodes: []string{"mllp-trigger"}}}
-	_, err = NewService(fake, 0).downloadAndParseBlobFiles(
-		context.Background(), files, mappingsFor("mllp-trigger"))
-	if err == nil {
-		t.Fatal("an opaque archive resolved to an empty key set instead of failing")
-	}
-	if !strings.Contains(err.Error(), "opaque") {
-		t.Fatalf("error does not identify the cause: %v", err)
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/wehubfusion/Icarus/pkg/embedded/processors/internal/compiled"
 )
 
 // executeFormat performs date format conversion with optional timezone transformation.
@@ -40,7 +42,7 @@ func executeFormat(nodeID string, itemIndex int, input map[string]interface{}, c
 
 	// Convert to output timezone if specified.
 	if cfg.OutTimezone != "" {
-		location, tzErr := time.LoadLocation(cfg.OutTimezone)
+		location, tzErr := compiled.Location(cfg.OutTimezone)
 		if tzErr != nil {
 			return nil, NewTimezoneError(nodeID, itemIndex, cfg.OutTimezone, "invalid output timezone", tzErr)
 		}
@@ -64,7 +66,7 @@ func parseDateTime(nodeID string, itemIndex int, dateStr, layout, timezone strin
 	var err error
 
 	if timezone != "" {
-		location, locErr := time.LoadLocation(timezone)
+		location, locErr := compiled.Location(timezone)
 		if locErr != nil {
 			return time.Time{}, NewTimezoneError(nodeID, itemIndex, timezone, "invalid input timezone", locErr)
 		}

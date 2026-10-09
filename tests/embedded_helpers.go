@@ -38,3 +38,13 @@ func buildConsumerGraphForMessage(msg *message.Message) map[string][]string {
 
 	return graph
 }
+
+// withResultBlob gives a processor's result message the blob reference ReportSuccess requires:
+// every unit result is a blob, so a result with none is refused.
+func withResultBlob(m *message.Message) *message.Message {
+	if m.Payload == nil {
+		m.WithPayload()
+	}
+	m.Payload.BlobReference = &message.BlobReference{URL: "https://acct/results/wf/run/exec.zip", SizeBytes: 100}
+	return m
+}

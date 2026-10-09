@@ -1,16 +1,53 @@
 package json
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"regexp"
+	"sync"
 
+	"github.com/wehubfusion/Icarus/pkg/fileref"
 	"github.com/wehubfusion/Icarus/pkg/schema/contracts"
 )
 
 // Validator validates data against schemas
 type Validator struct {
 	formatValidators map[string]FormatValidator
+	// patterns caches each compiled `pattern` rule by its source string, so a pattern is compiled
+	// once and not once per value. Safe for concurrent use; the zero value is ready.
+	patterns sync.Map // string -> compiledPattern
+}
+
+// compiledPattern is a cached regexp.Compile result; err is kept so an invalid pattern reports the
+// same INVALID_PATTERN error on every value without being recompiled.
+type compiledPattern struct {
+	re  *regexp.Regexp
+	err error
+}
+
+// compilePattern returns the compiled pattern, compiling it on first use.
+func (v *Validator) compilePattern(pattern string) (*regexp.Regexp, error) {
+	if c, ok := v.patterns.Load(pattern); ok {
+		cp := c.(compiledPattern)
+		return cp.re, cp.err
+	}
+	re, err := regexp.Compile(pattern)
+	c, _ := v.patterns.LoadOrStore(pattern, compiledPattern{re: re, err: err})
+	cp := c.(compiledPattern)
+	return cp.re, cp.err
+}
+
+// itemDigest is the uniqueItems key of an array item: SHA-256 of its canonical JSON (json.Marshal
+// sorts map keys). Validate and ValidateStream both use it, so they agree on what a duplicate is.
+func itemDigest(item interface{}) [sha256.Size]byte {
+	b, err := json.Marshal(item)
+	if err != nil {
+		// Not reachable for decoded JSON; fall back to the Go representation.
+		b = []byte(fmt.Sprintf("%T:%v", item, item))
+	}
+	return sha256.Sum256(b)
 }
 
 // NewValidator creates a new schema validator
@@ -183,7 +220,14 @@ func (v *Validator) validateValueIntoState(value interface{}, prop *Property, pa
 				}
 			}
 		default:
-			if state.add(contracts.ValidationError{Path: path, Message: fmt.Sprintf("expected string or bytes, got %T", value), Code: "TYPE_MISMATCH"}) {
+			if ref, ok := fileref.Parse(value); ok {
+				// A byte value is a file reference: its length is the file's size, not a decoded string.
+				for _, e := range v.validateByteLength(ref.Size, prop.Validation, path) {
+					if state.add(e) {
+						return
+					}
+				}
+			} else if state.add(contracts.ValidationError{Path: path, Message: fmt.Sprintf("expected string or bytes, got %T", value), Code: "TYPE_MISMATCH"}) {
 				return
 			}
 		}
@@ -228,9 +272,9 @@ func (v *Validator) validateArrayIntoState(arr []interface{}, prop *Property, pa
 			}
 		}
 		if prop.Validation.UniqueItems != nil && *prop.Validation.UniqueItems {
-			seen := make(map[string]bool)
+			seen := make(map[[sha256.Size]byte]bool)
 			for i, item := range arr {
-				key := fmt.Sprintf("%v", item)
+				key := itemDigest(item)
 				if seen[key] {
 					if state.add(contracts.ValidationError{Path: fmt.Sprintf("%s[%d]", path, i), Message: "duplicate item found", Code: "DUPLICATE_ITEM"}) {
 						return
@@ -376,11 +420,16 @@ func (v *Validator) validateValue(value interface{}, prop *Property, path string
 		case []byte:
 			errors = append(errors, v.validateByte(string(val), prop.Validation, path)...)
 		default:
-			errors = append(errors, contracts.ValidationError{
-				Path:    path,
-				Message: fmt.Sprintf("expected string or bytes, got %T", value),
-				Code:    "TYPE_MISMATCH",
-			})
+			if ref, ok := fileref.Parse(value); ok {
+				// A byte value is a file reference: its length is the file's size, not a decoded string.
+				errors = append(errors, v.validateByteLength(ref.Size, prop.Validation, path)...)
+			} else {
+				errors = append(errors, contracts.ValidationError{
+					Path:    path,
+					Message: fmt.Sprintf("expected string or bytes, got %T", value),
+					Code:    "TYPE_MISMATCH",
+				})
+			}
 		}
 
 	case TypeUUID:
@@ -430,14 +479,14 @@ func (v *Validator) validateDateRange(value string, rules *ValidationRules, path
 	if rules.MinDate != nil && value < *rules.MinDate {
 		errors = append(errors, contracts.ValidationError{
 			Path:    path,
-			Message: fmt.Sprintf("date %s is before minimum %s", value, *rules.MinDate),
+			Message: fmt.Sprintf("date is before minimum %s", *rules.MinDate), // the value is not echoed: it can be a date of birth
 			Code:    "MIN_DATE",
 		})
 	}
 	if rules.MaxDate != nil && value > *rules.MaxDate {
 		errors = append(errors, contracts.ValidationError{
 			Path:    path,
-			Message: fmt.Sprintf("date %s is after maximum %s", value, *rules.MaxDate),
+			Message: fmt.Sprintf("date is after maximum %s", *rules.MaxDate),
 			Code:    "MAX_DATE",
 		})
 	}
@@ -475,14 +524,14 @@ func (v *Validator) validateString(value string, rules *ValidationRules, path st
 	}
 
 	if rules.Pattern != nil && *rules.Pattern != "" {
-		matched, err := regexp.MatchString(*rules.Pattern, value)
+		re, err := v.compilePattern(*rules.Pattern)
 		if err != nil {
 			errors = append(errors, contracts.ValidationError{
 				Path:    path,
 				Message: fmt.Sprintf("invalid regex pattern: %v", err),
 				Code:    "INVALID_PATTERN",
 			})
-		} else if !matched {
+		} else if !re.MatchString(value) {
 			errors = append(errors, contracts.ValidationError{
 				Path:    path,
 				Message: fmt.Sprintf("value does not match pattern '%s'", *rules.Pattern),
@@ -578,7 +627,17 @@ func (v *Validator) validateByte(value string, rules *ValidationRules, path stri
 		}
 	}
 
-	byteLength := len(decoded)
+	return v.validateByteLength(int64(len(decoded)), rules, path)
+}
+
+// validateByteLength applies minLength and maxLength to a byte value's length in bytes: the
+// decoded length of a base64 string, or the size of a file reference.
+func (v *Validator) validateByteLength(length int64, rules *ValidationRules, path string) []contracts.ValidationError {
+	var errors []contracts.ValidationError
+	if rules == nil {
+		return errors
+	}
+	byteLength := int(length)
 
 	if rules.MinLength != nil {
 		minL := int(*rules.MinLength)
@@ -633,9 +692,9 @@ func (v *Validator) validateArray(arr []interface{}, prop *Property, path string
 		}
 
 		if prop.Validation.UniqueItems != nil && *prop.Validation.UniqueItems {
-			seen := make(map[string]bool)
+			seen := make(map[[sha256.Size]byte]bool)
 			for i, item := range arr {
-				key := fmt.Sprintf("%v", item)
+				key := itemDigest(item)
 				if seen[key] {
 					errors = append(errors, contracts.ValidationError{
 						Path:    fmt.Sprintf("%s[%d]", path, i),

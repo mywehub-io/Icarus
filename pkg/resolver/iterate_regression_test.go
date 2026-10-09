@@ -154,7 +154,7 @@ func TestDownloadAndParseMatchesPreviousAlgorithm(t *testing.T) {
 	// pass could get lucky.
 	for i := 0; i < 40; i++ {
 		fake := &fakeBlobClient{bodies: bodies}
-		svc := NewService(fake, 0).WithMaxConcurrentBlobDownloads(3)
+		svc := NewService(fake).WithMaxConcurrentBlobDownloads(3)
 
 		got, err := svc.downloadAndParseBlobFiles(context.Background(), files, mappingsFor(nodes...))
 		if err != nil {
@@ -162,7 +162,7 @@ func TestDownloadAndParseMatchesPreviousAlgorithm(t *testing.T) {
 		}
 
 		refFake := &fakeBlobClient{bodies: bodies}
-		refSvc := NewService(refFake, 0)
+		refSvc := NewService(refFake)
 		want, err := sequentialReference(context.Background(), refSvc, files, mappingsFor(nodes...))
 		if err != nil {
 			t.Fatalf("iteration %d: reference: %v", i, err)
@@ -197,7 +197,7 @@ func TestIteratedArrayIsCompleteAfterConcurrentDownload(t *testing.T) {
 
 	for i := 0; i < 25; i++ {
 		fake := &fakeBlobClient{bodies: bodies}
-		svc := NewService(fake, 0).WithMaxConcurrentBlobDownloads(2)
+		svc := NewService(fake).WithMaxConcurrentBlobDownloads(2)
 
 		results, err := svc.downloadAndParseBlobFiles(context.Background(), files, mappingsFor(nodes...))
 		if err != nil {
@@ -355,7 +355,7 @@ func TestResolvedInputBytesAreStableAcrossRuns(t *testing.T) {
 	var first string
 	for i := 0; i < 30; i++ {
 		fake := &fakeBlobClient{bodies: bodies}
-		svc := NewService(fake, 0).WithMaxConcurrentBlobDownloads(3)
+		svc := NewService(fake).WithMaxConcurrentBlobDownloads(3)
 
 		results, err := svc.downloadAndParseBlobFiles(context.Background(), files, mappings)
 		if err != nil {

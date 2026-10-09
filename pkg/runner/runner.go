@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	icarusnats "github.com/wehubfusion/Icarus/internal/nats"
 	internaltracing "github.com/wehubfusion/Icarus/internal/tracing"
@@ -106,6 +107,29 @@ func WithProcessFailureObserver(obs ProcessFailureObserver) RunnerOption {
 	}
 }
 
+// UnitObserver is told when each unit enters and leaves Process, for metrics. runner is the
+// stream name, a small bounded set; never pass ids as labels. Calls are made on the worker
+// goroutine and must not block.
+type UnitObserver interface {
+	UnitStarted(runner string, queueWait time.Duration, inputBytes int64)
+	UnitFinished(runner string, d time.Duration, err error, outputBytes int64)
+}
+
+// WithUnitObserver registers a UnitObserver.
+func WithUnitObserver(obs UnitObserver) RunnerOption {
+	return func(r *Runner) {
+		r.unitObserver = obs
+	}
+}
+
+// payloadBytes is the size a message reports for its payload: the blob reference's.
+func payloadBytes(p *message.Payload) int64 {
+	if p == nil || p.BlobReference == nil {
+		return 0
+	}
+	return p.BlobReference.SizeBytes
+}
+
 // WithConsumerFilterSubject sets the JetStream consumer FilterSubject (tenant/default routing).
 func WithConsumerFilterSubject(filterSubject string) RunnerOption {
 	return func(r *Runner) {
@@ -154,11 +178,28 @@ type Runner struct {
 	// whether a transient failure is retried or reported as final (see retryPolicy).
 	maxDeliver             atomic.Int64
 	processFailureObserver ProcessFailureObserver
+	unitObserver           UnitObserver
 	// heartbeatKV is the EXECUTION_HEARTBEATS bucket used for the liveness heartbeat and the
 	// claim-per-execution-unit idempotency check (see startAckHeartbeat and claimExecutionUnit).
 	// nil when the bucket could not be created/reached at startup; both mechanisms degrade to
 	// no-ops (heartbeat) or fail-open (claim) when nil rather than blocking processing.
 	heartbeatKV jetstream.KeyValue
+
+	// busySince holds, per worker, the UnixNano time it took its current message, or 0 while it
+	// is idle. The watchdog reads it to tell a runner whose workers are all busy (nothing to
+	// fetch for) from one that has stopped fetching, and to spot a worker that never returns.
+	busySince []atomic.Int64
+	// lastProgress is the UnixNano time of the last successful fetch or finished unit.
+	lastProgress atomic.Int64
+	// running is true from the start of Run until its context ends; Health reports no stall
+	// outside it, so a pod that is draining is not restarted for not fetching.
+	running atomic.Bool
+	// dropConsumer asks the fetch loop to resolve the consumer again on its next iteration. Set
+	// by the watchdog.
+	dropConsumer atomic.Bool
+	// connected reports whether the NATS connection is up; nil means r.client.IsConnected.
+	// A seam for tests, which have no real connection.
+	connected func() bool
 }
 
 // Config controls runner worker pool behavior.
@@ -173,7 +214,19 @@ type Config struct {
 	//
 	// Deprecated: no effect since v0.28.0.
 	QueueSize int
+
+	// StallTimeout is how long the runner may go without a successful fetch, while it has an
+	// idle worker and its NATS connection is up, before the watchdog logs an error, resolves the
+	// consumer again and Health reports the runner stalled. If 0, it is resolved from the
+	// ICARUS_RUNNER_STALL_TIMEOUT env (a Go duration, e.g. "2m"), else defaultStallTimeout.
+	// Negative disables the watchdog.
+	StallTimeout time.Duration
 }
+
+// defaultStallTimeout is the StallTimeout used when neither Config nor env sets one. An idle
+// runner completes a fetch every fetchMaxWait (1 s), so two minutes without one is far outside
+// normal operation.
+const defaultStallTimeout = 2 * time.Minute
 
 // DefaultConfig provides baseline values resolved at runtime.
 func DefaultConfig() Config {
@@ -185,9 +238,22 @@ func DefaultConfig() Config {
 
 func (c Config) withDefaults() Config {
 	return Config{
-		WorkerCount: resolveWorkerCount(c.WorkerCount),
-		QueueSize:   c.QueueSize,
+		WorkerCount:  resolveWorkerCount(c.WorkerCount),
+		QueueSize:    c.QueueSize,
+		StallTimeout: resolveStallTimeout(c.StallTimeout),
 	}
+}
+
+func resolveStallTimeout(configured time.Duration) time.Duration {
+	if configured != 0 {
+		return configured
+	}
+	if v := os.Getenv("ICARUS_RUNNER_STALL_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d != 0 {
+			return d
+		}
+	}
+	return defaultStallTimeout
 }
 
 func resolveWorkerCount(configured int) int {
@@ -276,6 +342,7 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 		config:         config,
 		jobChan:        make(chan *message.Message, config.WorkerCount),
 		idle:           make(chan struct{}, config.WorkerCount),
+		busySince:      make([]atomic.Int64, config.WorkerCount),
 	}
 	for i := 0; i < config.WorkerCount; i++ {
 		runner.idle <- struct{}{}
@@ -367,8 +434,10 @@ func (r *Runner) Close() error {
 }
 
 // fetchMaxWait bounds one fetch request. A fetch that finds no messages returns after it, so
-// the loop notices shutdown and freed workers within this time.
-var fetchMaxWait = 5 * time.Second
+// the loop notices shutdown and freed workers within this time. A worker that frees up while a
+// fetch is open waits up to this long for new work, so it is kept short (it was 5 s); an idle
+// runner pays one cheap pull request per second for it.
+var fetchMaxWait = 1 * time.Second
 
 // Run starts the message processing pipeline and blocks until shutdown completes.
 //
@@ -384,8 +453,14 @@ var fetchMaxWait = 5 * time.Second
 // nak'd so another replica can take it at once. Each Process call is bounded by processTimeout,
 // which bounds the drain.
 //
-// Error handling on fetch failures: a deleted or missing consumer is resolved again, and a
-// dead transport reconnects, with exponential backoff (100 ms → 5 s).
+// Error handling on fetch failures: a deleted or missing consumer is resolved again (and
+// created again if it no longer exists), and a dead transport reconnects, with exponential
+// backoff (100 ms → 5 s). The consumer is also resolved again whenever the client's connection
+// is replaced, since a consumer handle stays bound to the connection it was resolved on.
+//
+// Watchdog: while Config.StallTimeout is positive, a goroutine checks that the loop keeps
+// fetching. A stall is logged at Error, the consumer is resolved again, and Health reports it
+// until fetching resumes (see Health).
 //
 // Return values:
 //   - context.Canceled / context.DeadlineExceeded — normal shutdown path when
@@ -398,6 +473,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		backgroundWG sync.WaitGroup
 		processWG    sync.WaitGroup
 	)
+
+	r.lastProgress.Store(time.Now().UnixNano())
+	r.running.Store(true)
 
 	// Start workers
 	for i := 0; i < r.config.WorkerCount; i++ {
@@ -443,6 +521,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
+	backgroundWG.Add(1)
+	go func() {
+		defer backgroundWG.Done()
+		r.watchdog(ctx)
+	}()
+
 	// Start the fetch goroutine.
 	backgroundWG.Add(1)
 	go func() {
@@ -465,14 +549,33 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 		}
 
-		var cons jetstream.Consumer
+		var (
+			cons jetstream.Consumer
+			// consConn is the client's connection when cons was resolved. A consumer handle
+			// fetches over that connection for as long as it lives, so once the client replaces
+			// it (tryReconnectNATS, from this loop, a worker or another runner sharing the
+			// client) cons is resolved again, or it keeps fetching over a connection that is
+			// closed or abandoned.
+			consConn *nats.Conn
+		)
 		for {
 			if ctx.Err() != nil {
 				r.logger.Info("Shutting down message processor...")
 				return
 			}
 
+			if r.dropConsumer.Swap(false) && cons != nil {
+				cons = nil
+			}
+			if cons != nil && r.client.Connection() != consConn {
+				r.logger.Info("NATS connection was replaced; resolving the JetStream consumer again",
+					zap.String("stream", r.stream),
+					zap.String("consumer", r.consumer))
+				cons = nil
+			}
+
 			if cons == nil {
+				conn := r.client.Connection()
 				c, err := r.client.Messages.GetConsumer(ctx, r.stream, r.consumer)
 				if err != nil {
 					if ctx.Err() != nil {
@@ -480,7 +583,22 @@ func (r *Runner) Run(ctx context.Context) error {
 						return
 					}
 					r.logger.Error("Error resolving JetStream consumer", zap.Error(err))
-					if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
+					if errors.Is(err, jetstream.ErrConsumerNotFound) {
+						// Deleted while the runner was up (lost in a server restart, or removed by
+						// its InactiveThreshold): resolving it again can never succeed, so create it
+						// the way NewRunner did.
+						if ensureErr := r.client.Messages.EnsureConsumer(ctx, r.stream, r.consumer, r.consumerFilterSubject); ensureErr != nil {
+							r.logger.Error("Failed to create the missing JetStream consumer again",
+								zap.String("stream", r.stream),
+								zap.String("consumer", r.consumer),
+								zap.Error(ensureErr))
+						} else {
+							r.logger.Warn("JetStream consumer was missing; created it again",
+								zap.String("stream", r.stream),
+								zap.String("consumer", r.consumer))
+						}
+					}
+					if icarusnats.IsTransportError(err) || !r.isConnected() {
 						if r.tryReconnectNATS() {
 							backoffDelay = 100 * time.Millisecond
 						}
@@ -491,6 +609,7 @@ func (r *Runner) Run(ctx context.Context) error {
 					continue
 				}
 				cons = c
+				consConn = conn
 				r.recordMaxDeliver(cons)
 				r.logger.Info("JetStream fetch started",
 					zap.String("stream", r.stream),
@@ -536,6 +655,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				continue
 			}
+			r.lastProgress.Store(time.Now().UnixNano())
 			backoffDelay = 100 * time.Millisecond
 		}
 	}()
@@ -596,8 +716,13 @@ func (r *Runner) returnIdle(n int) {
 // handleFetchError logs a fetch failure and prepares the next attempt: a deleted or missing
 // consumer is resolved again and a dead transport is reconnected. It reports whether the loop
 // should back off before fetching again.
+//
+// A transport failure also drops the consumer. The handle is bound to the connection it was
+// resolved on, and when that connection is closed tryReconnectNATS gives the client a new one,
+// so keeping the handle would fail every fetch from then on without ever sending a pull.
 func (r *Runner) handleFetchError(err error, cons *jetstream.Consumer) bool {
-	if isFatalConsumeError(err) {
+	transport := icarusnats.IsTransportError(err) || !r.isConnected()
+	if isFatalConsumeError(err) || transport {
 		r.logger.Error("JetStream fetch failure; resolving the consumer again",
 			zap.String("stream", r.stream),
 			zap.String("consumer", r.consumer),
@@ -609,10 +734,136 @@ func (r *Runner) handleFetchError(err error, cons *jetstream.Consumer) bool {
 			zap.String("consumer", r.consumer),
 			zap.Error(err))
 	}
-	if icarusnats.IsTransportError(err) || !r.client.IsConnected() {
+	if transport {
 		r.tryReconnectNATS()
 	}
 	return true
+}
+
+// workerStuckGrace is how long a worker may hold one unit past processTimeout before the
+// watchdog counts it as stuck. It covers the bounded calls after Process returns: reporting the
+// result (up to 10 minutes) and the heartbeat, retry and observer calls after it. A Process
+// that ignores its context never returns, and its worker never takes another message. A var
+// so tests can shorten it.
+var workerStuckGrace = 15 * time.Minute
+
+// Health reports whether the runner is pulling work. It returns nil while it is, before Run
+// starts, once Run's context ends (a draining runner is not stalled), and while the NATS
+// connection is down (an outage is the connection's to report, and restarting every replica
+// for it would not help). Otherwise it returns an error naming the stall:
+//   - no successful fetch for Config.StallTimeout while a worker was idle; or
+//   - a worker holding one unit for longer than processTimeout plus workerStuckGrace.
+//
+// Hosts wire it into their liveness probe: the watchdog first resolves the consumer again, so a
+// stall that clears within the probe's failure threshold does not restart the pod. Safe for
+// concurrent use.
+func (r *Runner) Health() error {
+	if reason := r.stallReason(time.Now()); reason != "" {
+		return fmt.Errorf("runner for stream %q consumer %q is stalled: %s", r.stream, r.consumer, reason)
+	}
+	return nil
+}
+
+// stallReason describes why the runner counts as stalled at now, or returns "" if it does not.
+func (r *Runner) stallReason(now time.Time) string {
+	if r.config.StallTimeout <= 0 || !r.running.Load() {
+		return ""
+	}
+	busy, oldest := r.busyWorkers(now)
+	if limit := r.processTimeout + workerStuckGrace; oldest > limit {
+		return fmt.Sprintf("a worker has held one unit for %s, past processTimeout (%s) plus %s",
+			oldest.Round(time.Second), r.processTimeout, workerStuckGrace)
+	}
+	if busy >= len(r.busySince) {
+		return "" // every worker is busy within its deadline: there is nothing to fetch for
+	}
+	if !r.isConnected() {
+		return ""
+	}
+	if since := now.Sub(time.Unix(0, r.lastProgress.Load())); since > r.config.StallTimeout {
+		return fmt.Sprintf("no successful fetch for %s with %d of %d workers idle",
+			since.Round(time.Second), len(r.busySince)-busy, len(r.busySince))
+	}
+	return ""
+}
+
+// busyWorkers returns how many workers hold a message and how long the oldest has held its own.
+func (r *Runner) busyWorkers(now time.Time) (busy int, oldest time.Duration) {
+	for i := range r.busySince {
+		since := r.busySince[i].Load()
+		if since == 0 {
+			continue
+		}
+		busy++
+		if d := now.Sub(time.Unix(0, since)); d > oldest {
+			oldest = d
+		}
+	}
+	return busy, oldest
+}
+
+func (r *Runner) isConnected() bool {
+	if r.connected != nil {
+		return r.connected()
+	}
+	return r.client != nil && r.client.IsConnected()
+}
+
+// watchdog checks stallReason every quarter of StallTimeout until ctx ends. On a stall it logs
+// the runner's state at Error and asks the fetch loop to resolve the consumer again, at most once
+// per StallTimeout while the stall lasts. It only observes the fetch loop: a loop blocked for
+// good is reported through Health, for the host to restart the pod.
+func (r *Runner) watchdog(ctx context.Context) {
+	defer r.running.Store(false)
+	if r.config.StallTimeout <= 0 {
+		<-ctx.Done()
+		return
+	}
+	interval := r.config.StallTimeout / 4
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var stalledAt, lastAction time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			reason := r.stallReason(now)
+			if reason == "" {
+				if !stalledAt.IsZero() {
+					r.logger.Info("Runner is pulling again after a stall",
+						zap.String("stream", r.stream),
+						zap.String("consumer", r.consumer),
+						zap.Duration("stalled_for", now.Sub(stalledAt)))
+				}
+				stalledAt, lastAction = time.Time{}, time.Time{}
+				continue
+			}
+			if stalledAt.IsZero() {
+				stalledAt = now
+			}
+			if !lastAction.IsZero() && now.Sub(lastAction) < r.config.StallTimeout {
+				continue
+			}
+			lastAction = now
+			busy, oldest := r.busyWorkers(now)
+			r.logger.Error("Runner stalled: not pulling messages; resolving the JetStream consumer again",
+				zap.String("stream", r.stream),
+				zap.String("consumer", r.consumer),
+				zap.String("reason", reason),
+				zap.Int("idle_slots", len(r.idle)),
+				zap.Int("in_flight", busy),
+				zap.Int("worker_count", len(r.busySince)),
+				zap.Duration("oldest_in_flight", oldest),
+				zap.Duration("since_last_progress", now.Sub(time.Unix(0, r.lastProgress.Load()))),
+				zap.Duration("stall_timeout", r.config.StallTimeout))
+			r.dropConsumer.Store(true)
+		}
+	}
 }
 
 // nakUnstarted naks any message still waiting in jobChan after the workers stopped, so another
@@ -637,9 +888,16 @@ func (r *Runner) worker(ctx context.Context, id int) {
 				r.logger.Debug("runner worker stopping, job channel closed", zap.Int("worker_id", id))
 				return
 			}
+			if id < len(r.busySince) {
+				r.busySince[id].Store(time.Now().UnixNano())
+			}
 			if err := r.processMessage(ctx, msg); err != nil {
 				r.logger.Error("Message processing failed", zap.Error(err))
 			}
+			if id < len(r.busySince) {
+				r.busySince[id].Store(0)
+			}
+			r.lastProgress.Store(time.Now().UnixNano())
 			r.idle <- struct{}{}
 		}
 	}
@@ -675,6 +933,12 @@ const executionHeartbeatBucket = "EXECUTION_HEARTBEATS"
 // writes (executionHeartbeatEveryNTicks x ackHeartbeatInterval x 3 = 90s) before expiry, so a
 // single missed KV write does not read as a dead pod.
 const executionHeartbeatTTL = 90 * time.Second
+
+// heartbeatKVTimeout bounds each EXECUTION_HEARTBEATS call (claim, heartbeat write, state
+// write). They used to run on the process context, which for a long unit (esr-operation allows
+// 30 minutes) let one KV request whose reply was lost in a NATS restart hold a worker for the
+// rest of processTimeout after Process had returned. A var so tests can shorten it.
+var heartbeatKVTimeout = 10 * time.Second
 
 // executionHeartbeatEveryNTicks makes the KV write fire every 3rd ack-extension tick (10s x 3 =
 // 30s), per the design doc: one ticker, two cadences, rather than a second time.Ticker.
@@ -828,7 +1092,9 @@ func (r *Runner) claimOrNak(ctx context.Context, msg *message.Message, workflowI
 		StartedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 		State:       heartbeatRunning,
 	}
-	outcome, claimErr := claimExecutionUnit(ctx, r.heartbeatKV, key, hb, time.Now())
+	claimCtx, cancel := context.WithTimeout(ctx, heartbeatKVTimeout)
+	defer cancel()
+	outcome, claimErr := claimExecutionUnit(claimCtx, r.heartbeatKV, key, hb, time.Now())
 	if claimErr != nil {
 		// KV unreachable: fail OPEN. A KV outage must not halt all processing platform-wide —
 		// a broken heartbeat/claim mechanism already looks identical to "every pod is dead"
@@ -893,7 +1159,7 @@ func (r *Runner) setHeartbeatState(msg *message.Message, workflowID, runID, node
 	if err != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), heartbeatKVTimeout)
 	defer cancel()
 	if _, err := r.heartbeatKV.Put(ctx, executionHeartbeatKey(workflowID, runID, nodeID), payload); err != nil {
 		r.logger.Warn("Failed to write execution heartbeat state",
@@ -1018,7 +1284,8 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 		return func() {} // Core NATS or a synthesised message: nothing to extend.
 	}
 
-	done := make(chan struct{})
+	// hbCtx ends when stop is called, so stop never waits on a KV write in flight.
+	hbCtx, hbCancel := context.WithCancel(ctx)
 	stopped := make(chan struct{})
 
 	executionID := ""
@@ -1036,9 +1303,7 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 		tick := 0
 		for {
 			select {
-			case <-done:
-				return
-			case <-ctx.Done():
+			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
 				if err := msg.InProgress(); err != nil {
@@ -1079,7 +1344,10 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 				}
 				// Put, not Create: the claim in processMessage already Created this key before
 				// this ticker started, so this pod owns it. Every write here is a refresh.
-				if _, err := r.heartbeatKV.Put(ctx, key, payload); err != nil {
+				putCtx, putCancel := context.WithTimeout(hbCtx, heartbeatKVTimeout)
+				_, err := r.heartbeatKV.Put(putCtx, key, payload)
+				putCancel()
+				if err != nil {
 					r.logger.Warn("Failed to write execution heartbeat; Zeus's sweeper may see this unit as stalled while it is actually running",
 						zap.String("workflow_id", workflowID),
 						zap.String("run_id", runID),
@@ -1090,9 +1358,8 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 		}
 	}()
 
-	var once sync.Once
 	return func() {
-		once.Do(func() { close(done) })
+		hbCancel()
 		<-stopped
 	}
 }
@@ -1130,7 +1397,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 			}
 		}
 	}
-	r.logger.Info("Runner processMessage start",
+	r.logger.Debug("Runner processMessage start",
 		zap.String("stream", r.stream),
 		zap.String("consumer", r.consumer),
 		zap.String("workflow_id", workflowID),
@@ -1184,7 +1451,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	}
 
 	start := time.Now()
-	r.logger.Info("Processing message",
+	r.logger.Debug("Processing message",
 		zap.String("workflowID", workflowID),
 		zap.String("runID", runID),
 		zap.String("correlationID", correlationID))
@@ -1235,10 +1502,18 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	// see startAckHeartbeat.
 	stopHeartbeat := r.startAckHeartbeat(processCtx, msg, workflowID, runID, nodeID)
 
+	if r.unitObserver != nil {
+		r.unitObserver.UnitStarted(r.stream, time.Duration(queueWaitMs)*time.Millisecond, payloadBytes(msg.Payload))
+	}
+
 	// Process the message
+	processStart := time.Now()
 	resultMessage, processErr := r.processor.Process(processCtx, msg)
 	stopHeartbeat()
 	processingTime := time.Since(start)
+	if r.unitObserver != nil {
+		r.unitObserver.UnitFinished(r.stream, time.Since(processStart), processErr, payloadBytes(resultMessage.Payload))
+	}
 
 	// Add processing time to spans
 	span.SetAttributes(attribute.Int64("processing.duration_ms", processingTime.Milliseconds()))
@@ -1454,11 +1729,16 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	if msg.Metadata != nil {
 		jetstreamDeliverEnd = msg.Metadata[message.MetaJetStreamDeliverCount]
 	}
-	r.logger.Info("Successfully processed message",
+	// The one Info line per unit (phase 12 step 1): the per-step lines before it are Debug.
+	r.logger.Info("Unit processed",
+		zap.String("stream", r.stream),
 		zap.String("workflowID", workflowID),
 		zap.String("runID", runID),
+		zap.String("node_id", nodeID),
+		zap.String("execution_id", executionID),
 		zap.String("correlationID", correlationID),
 		zap.String("jetstream_deliver_count", jetstreamDeliverEnd),
+		zap.Int64("queue_wait_ms", queueWaitMs),
 		zap.Duration("processingTime", processingTime))
 	// Report success if we have workflow information
 	// Use a longer timeout for large blob uploads (10 minutes to handle very large files)
@@ -1486,16 +1766,21 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	return nil
 }
 
-// isFatalConsumeError reports whether an error surfaced by the JetStream
-// ConsumeErrHandler requires tearing down and restarting the Consume loop
-// (as opposed to transient errors the library retries internally).
+// isFatalConsumeError reports whether a fetch error means the consumer handle is unusable and
+// must be resolved again.
+//
+// Fetch on a closed connection fails with nats.ErrConnectionClosed, from subscribing to its
+// reply inbox; jetstream.ErrConnectionClosed is a different value that only the Consume and
+// Messages iterators return, so both are listed.
 func isFatalConsumeError(err error) bool {
 	if err == nil {
 		return false
 	}
 	return errors.Is(err, jetstream.ErrConsumerDeleted) ||
 		errors.Is(err, jetstream.ErrConsumerNotFound) ||
-		errors.Is(err, jetstream.ErrConnectionClosed)
+		errors.Is(err, jetstream.ErrConnectionClosed) ||
+		errors.Is(err, nats.ErrConnectionClosed) ||
+		errors.Is(err, nats.ErrConnectionDraining)
 }
 
 // tryReconnectNATS attempts to restore a dead NATS connection. Returns true on success.

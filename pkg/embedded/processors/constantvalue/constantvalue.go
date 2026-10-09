@@ -12,6 +12,9 @@ const pluginType = "plugin-constant-value-generator"
 // ConstantValueNode produces a fixed set of typed constant values as output fields.
 type ConstantValueNode struct {
 	runtime.BaseNode
+
+	// cfgCache holds the parsed configuration, read-only, shared by every worker of the unit.
+	cfgCache runtime.ConfigCache[Config]
 }
 
 // NewConstantValueNode creates a new constant value generator node.
@@ -24,13 +27,19 @@ func NewConstantValueNode(config runtime.EmbeddedNodeConfig) (runtime.EmbeddedNo
 	}, nil
 }
 
+// Prepare implements runtime.ConfigPreparer: the configuration is parsed once for the unit.
+func (n *ConstantValueNode) Prepare(rawConfig json.RawMessage) {
+	_, _ = n.cfgCache.Get(rawConfig, runtime.ParseJSON[Config])
+}
+
 // Process emits each configured constant as an output field keyed by name.
 // Input data is ignored; this node has no inputs.
 func (n *ConstantValueNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
-	var cfg Config
-	if err := json.Unmarshal(input.RawConfig, &cfg); err != nil {
+	cfgp, err := n.cfgCache.Get(input.RawConfig, runtime.ParseJSON[Config])
+	if err != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "configuration", fmt.Sprintf("failed to parse configuration: %v", err)))
 	}
+	cfg := *cfgp
 
 	if err := cfg.Validate(); err != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "configuration", fmt.Sprintf("invalid configuration: %v", err)))

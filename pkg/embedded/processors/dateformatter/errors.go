@@ -30,21 +30,16 @@ type ParseError struct {
 	Err       error
 }
 
+// Error never echoes the value, nor the wrapped time.ParseError, which quotes it: a date can be
+// a date of birth, and this text reaches node output and logs. The value's length is enough to
+// tell an empty or truncated input from a wrong format.
 func (e *ParseError) Error() string {
 	if e.ItemIndex >= 0 {
-		if e.Err != nil {
-			return fmt.Sprintf("node %s: parse error at item %d: failed to parse '%s' with format '%s': %s (%v)",
-				e.NodeID, e.ItemIndex, e.Input, e.Format, e.Message, e.Err)
-		}
-		return fmt.Sprintf("node %s: parse error at item %d: failed to parse '%s' with format '%s': %s",
-			e.NodeID, e.ItemIndex, e.Input, e.Format, e.Message)
+		return fmt.Sprintf("node %s: parse error at item %d: failed to parse a %d-character value with format '%s': %s",
+			e.NodeID, e.ItemIndex, len(e.Input), e.Format, e.Message)
 	}
-	if e.Err != nil {
-		return fmt.Sprintf("node %s: parse error: failed to parse '%s' with format '%s': %s (%v)",
-			e.NodeID, e.Input, e.Format, e.Message, e.Err)
-	}
-	return fmt.Sprintf("node %s: parse error: failed to parse '%s' with format '%s': %s",
-		e.NodeID, e.Input, e.Format, e.Message)
+	return fmt.Sprintf("node %s: parse error: failed to parse a %d-character value with format '%s': %s",
+		e.NodeID, len(e.Input), e.Format, e.Message)
 }
 
 func (e *ParseError) Unwrap() error { return e.Err }

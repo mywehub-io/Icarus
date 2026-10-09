@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/dop251/goja"
 	"github.com/wehubfusion/Icarus/pkg/embedded/runtime"
@@ -14,6 +15,28 @@ import (
 // JSRunnerNode implements JavaScript execution for embedded
 type JSRunnerNode struct {
 	runtime.BaseNode
+
+	// cfgCache holds the parsed configuration, read-only, shared by every worker of the unit.
+	cfgCache runtime.ConfigCache[Config]
+
+	// programs caches the compiled script (D20: compile once per node, new VM per item). The key
+	// is the wrapped script; a node's script does not change, so this holds one entry. Workers
+	// share the node, and a *goja.Program is safe to run on many VMs at once.
+	programs sync.Map // string -> *compiledScript
+}
+
+type compiledScript struct {
+	once sync.Once
+	prog *goja.Program
+	err  error
+}
+
+// program returns the compiled form of script, compiling it on first use.
+func (n *JSRunnerNode) program(script string) (*goja.Program, error) {
+	v, _ := n.programs.LoadOrStore(script, &compiledScript{})
+	c := v.(*compiledScript)
+	c.once.Do(func() { c.prog, c.err = goja.Compile("script.js", script, false) })
+	return c.prog, c.err
 }
 
 // NewJSRunnerNode creates a new jsrunner node instance
@@ -28,13 +51,19 @@ func NewJSRunnerNode(config runtime.EmbeddedNodeConfig) (runtime.EmbeddedNode, e
 	}, nil
 }
 
+// Prepare implements runtime.ConfigPreparer: the configuration is parsed once for the unit.
+func (n *JSRunnerNode) Prepare(rawConfig json.RawMessage) {
+	_, _ = n.cfgCache.Get(rawConfig, runtime.ParseJSON[Config])
+}
+
 // Process executes the JavaScript code
 func (n *JSRunnerNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
 	// Parse configuration
-	var cfg Config
-	if err := json.Unmarshal(input.RawConfig, &cfg); err != nil {
+	cfgp, err := n.cfgCache.Get(input.RawConfig, runtime.ParseJSON[Config])
+	if err != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "failed to parse configuration", err))
 	}
+	cfg := *cfgp
 
 	// Apply defaults
 	cfg.ApplyDefaults()
@@ -98,6 +127,11 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 		return nil, NewConfigError(n.NodeId(), "failed to register utilities", err)
 	}
 
+	// The file helpers read and write the run's files (raw payloads).
+	if err := registerFileHelpers(vm, input); err != nil {
+		return nil, NewConfigError(n.NodeId(), "failed to register file helpers", err)
+	}
+
 	// Inject input data as 'input' global
 	// Auto-unwrap: if input.Data is a map with single key "input" containing an array,
 	// unwrap it to provide better UX for users writing JS scripts
@@ -108,24 +142,28 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 			inputData = nestedInput
 		}
 	}
-	
+
 	if err := vm.Set("input", inputData); err != nil {
 		return nil, NewExecutionError(n.NodeId(), "failed to set input variable", input.ItemIndex, 0, 0, err)
 	}
 
+	// The configuration is shared by every worker of the unit (cfgCache), and goja hands a Go map
+	// to the script as a live object that writes through. Each VM therefore gets its own copy, so a
+	// script that changes one of these cannot race another item or leak into the next.
+
 	// Inject input schema if provided (for reference in JS)
 	if inputSchema := cfg.GetInputSchema(); inputSchema != nil {
-		vm.Set("inputSchema", inputSchema)
+		vm.Set("inputSchema", copyJSONMap(inputSchema))
 	}
 
 	// Inject output schema if provided (for reference in JS)
 	if outputSchema := cfg.GetOutputSchema(); outputSchema != nil {
-		vm.Set("outputSchema", outputSchema)
+		vm.Set("outputSchema", copyJSONMap(outputSchema))
 	}
 
 	// Inject manual inputs if provided
 	if len(cfg.ManualInputs) > 0 {
-		vm.Set("manualInputs", cfg.ManualInputs)
+		vm.Set("manualInputs", copyJSONMap(cfg.ManualInputs))
 	}
 
 	// Wrap script for execution
@@ -146,7 +184,16 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 			}
 		}()
 
-		val, err := vm.RunString(wrappedScript)
+		prog, err := n.program(wrappedScript)
+		if err != nil {
+			errChan <- NewExecutionError(n.NodeId(), err.Error(), input.ItemIndex, 0, 0, err)
+			return
+		}
+		val, err := vm.RunProgram(prog)
+		if err == nil {
+			// Timer callbacks run here, on the VM's goroutine, after the synchronous script.
+			utilityRegistry.RunDueTimers()
+		}
 		if err != nil {
 			if gojaErr, ok := err.(*goja.Exception); ok {
 				errChan <- NewExecutionError(n.NodeId(), gojaErr.Error(), input.ItemIndex, 0, 0, gojaErr)

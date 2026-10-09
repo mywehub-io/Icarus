@@ -55,7 +55,7 @@ func TestMessageServiceReportSuccess(t *testing.T) {
 
 	// Create a result message
 	resultMessage := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload("success result")
+		WithPayload()
 
 	// Create a mock JetStream message for acknowledgment
 	jsMsg := newMockMsg("test.subject", []byte("test data"))
@@ -81,10 +81,10 @@ func TestMessageServiceReportSuccessAcksAfterPublish(t *testing.T) {
 
 	// Build a fully-populated result message (Payload carries execution context;
 	// inline result data must be valid JSON)
-	resultMessage := message.NewWorkflowMessage("workflow-123", "run-456").
+	resultMessage := withResultBlob(message.NewWorkflowMessage("workflow-123", "run-456").
 		WithMetadata("execution_id", "workflow-123-node-1-1700000000000").
 		WithNode("node-1", nil).
-		WithPayload(`{"status":"success"}`)
+		WithPayload())
 
 	jsMsg := newMockMsg("test.subject", []byte("test data"))
 
@@ -172,7 +172,7 @@ func TestMessageServiceReportSuccessValidation(t *testing.T) {
 	ctx := context.Background()
 
 	// Test with invalid message (missing workflow)
-	invalidMessage := message.NewMessage().WithPayload("data")
+	invalidMessage := message.NewMessage().WithPayload()
 	err := c.Messages.ReportSuccess(ctx, *invalidMessage, nil)
 	if err == nil {
 		t.Error("Expected validation error for message without workflow")
@@ -180,11 +180,8 @@ func TestMessageServiceReportSuccessValidation(t *testing.T) {
 
 	// Test with message missing execution metadata
 	invalidMessage2 := &message.Message{
-		Workflow: &message.Workflow{WorkflowID: "test", RunID: "test"},
-		Payload: func() *message.Payload {
-			data := "data"
-			return &message.Payload{InlineData: &data}
-		}(),
+		Workflow:  &message.Workflow{WorkflowID: "test", RunID: "test"},
+		Payload:   &message.Payload{BlobReference: &message.BlobReference{URL: "https://acct/c/results/wf/run/x.zip", SizeBytes: 4}},
 		UpdatedAt: time.Now().Format(time.RFC3339),
 	}
 	err = c.Messages.ReportSuccess(ctx, *invalidMessage2, nil)
@@ -195,11 +192,8 @@ func TestMessageServiceReportSuccessValidation(t *testing.T) {
 
 	// Test with message missing UpdatedAt and execution metadata
 	invalidMessage3 := &message.Message{
-		Workflow: &message.Workflow{WorkflowID: "test", RunID: "test"},
-		Payload: func() *message.Payload {
-			data := "data"
-			return &message.Payload{InlineData: &data}
-		}(),
+		Workflow:  &message.Workflow{WorkflowID: "test", RunID: "test"},
+		Payload:   &message.Payload{BlobReference: &message.BlobReference{URL: "https://acct/c/results/wf/run/x.zip", SizeBytes: 4}},
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
 	err = c.Messages.ReportSuccess(ctx, *invalidMessage3, nil)
@@ -272,7 +266,7 @@ func TestMessageServiceReportWithPublishError(t *testing.T) {
 	resultMessage := message.NewWorkflowMessage("workflow-123", "run-456").
 		WithMetadata("execution_id", "workflow-123-node-1-1700000000000").
 		WithNode("node-1", nil).
-		WithPayload("success result")
+		WithPayload()
 
 	err := c.Messages.ReportSuccess(ctx, *resultMessage, nil)
 	if err == nil {
@@ -297,7 +291,7 @@ func TestMessageServiceContextCancellation(t *testing.T) {
 
 	// Test ReportSuccess with cancelled context
 	resultMessage := message.NewWorkflowMessage("workflow-123", "run-456").
-		WithPayload("success result")
+		WithPayload()
 
 	err := c.Messages.ReportSuccess(ctx, *resultMessage, nil)
 	if err == nil {

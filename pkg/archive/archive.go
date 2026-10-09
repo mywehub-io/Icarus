@@ -32,10 +32,6 @@ const (
 	// key contains "-/" after its node id.
 	ManifestName = "_wehub/manifest.json"
 
-	// RawEntryName holds an opaque payload's bytes in an archive built by BuildOpaque.
-	// Reserved like the manifest, so it is never mistaken for a payload key.
-	RawEntryName = "_wehub/raw"
-
 	// ReservedPrefix marks entries that belong to the format rather than the payload.
 	ReservedPrefix = "_wehub/"
 
@@ -56,21 +52,6 @@ const (
 // the deferred iteration work.
 type Manifest struct {
 	Version int `json:"version"`
-
-	// Raw marks an archive whose payload is one opaque byte string under RawEntryName
-	// rather than a set of addressable flat keys.
-	//
-	// It exists so that everything written to blob storage is an archive, including the
-	// payloads that are not StandardUnitOutput documents and never could be: Artemis's
-	// MLLP ingest offloads a raw HL7 message, and an HTTP trigger offloads whatever body
-	// arrived. Those have no key space to address, so the archive carries them whole and
-	// hands them back byte for byte.
-	//
-	// The flag lives in the manifest rather than being inferred from the entry set
-	// because inference would be a guess: an empty document and an opaque payload of
-	// zero bytes are indistinguishable by entries alone, and a reader that guesses wrong
-	// returns a plausible, well-formed, wrong answer.
-	Raw bool `json:"raw,omitempty"`
 
 	// ArrayEntries names the entries whose value is a JSON array.
 	//
@@ -153,34 +134,6 @@ func isJSONArray(raw []byte) bool {
 		}
 	}
 	return false
-}
-
-// isStandardUnitOutput reports whether a decoded JSON object is a node-output document
-// rather than some other object that merely happens to parse.
-//
-// The test is the flat-key shape itself: FlattenMap writes "<nodeId>-/<path>" for every
-// key it emits ([flatten.go:35-68]), so a document's keys all carry "-/" after a non-empty
-// node id, and the resolver already splits them on exactly that separator.
-//
-// The discrimination matters because the two forms round trip differently. A document is
-// stored as one entry per key and re-materialised by marshalling those keys back into an
-// object, which is lossless in JSON terms but not byte for byte: key order and whitespace
-// are the writer's. That is correct for a node output, whose consumer is the field-mapping
-// extractor and which was itself produced by a marshal. It is wrong for a trigger body,
-// whose consumer is a plugin handed the bytes a caller actually sent — so an arbitrary
-// JSON object is carried opaquely and comes back unchanged.
-func isStandardUnitOutput(flat map[string]json.RawMessage) bool {
-	if len(flat) == 0 {
-		// Nothing to judge by. Treated as opaque so the bytes survive untouched, which is
-		// the safer answer when the shape cannot be established.
-		return false
-	}
-	for key := range flat {
-		if i := strings.Index(key, "-/"); i <= 0 {
-			return false
-		}
-	}
-	return true
 }
 
 // decodeFlat parses a StandardUnitOutput document into its flat keys, keeping each value's

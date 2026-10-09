@@ -13,6 +13,8 @@ import (
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
+
+	"github.com/wehubfusion/Icarus/pkg/embedded/processors/internal/compiled"
 )
 
 func executeAction(nodeID string, itemIndex int, action string, params map[string]interface{}, input map[string]interface{}) (interface{}, error) {
@@ -235,13 +237,18 @@ func regexExtract(s, pattern string) ([][]string, error) {
 	return re.FindAllStringSubmatch(s, -1), nil
 }
 
+// format fills "${key}" and "{key}" placeholders in one pass. It used to replace key by key in
+// random map order, so a value containing another key's placeholder could be replaced again or not,
+// run to run; a single pass replaces only what the template itself contains.
 func format(template string, data map[string]string) string {
-	result := template
-	for k, v := range data {
-		result = stdstrings.ReplaceAll(result, "${"+k+"}", v)
-		result = stdstrings.ReplaceAll(result, "{"+k+"}", v)
+	if len(data) == 0 {
+		return template
 	}
-	return result
+	pairs := make([]string, 0, len(data)*4)
+	for k, v := range data {
+		pairs = append(pairs, "${"+k+"}", v, "{"+k+"}", v)
+	}
+	return stdstrings.NewReplacer(pairs...).Replace(template)
 }
 
 func base64Encode(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
@@ -264,7 +271,7 @@ func normalize(s string) string { return removeDiacritics(s) }
 type regex struct{ r *regexp.Regexp }
 
 func compileRegex(pattern string) (*regex, error) {
-	r, err := regexp.Compile(pattern)
+	r, err := compiled.Regexp(pattern)
 	if err != nil {
 		return nil, err
 	}

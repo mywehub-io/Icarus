@@ -100,14 +100,14 @@ Messages without these fields will cycle through the consumer indefinitely until
 
 `resolver.ResolveInput` returns an error when:
 
-- Both `inline` and `blobRef` are empty — the caller passed an empty payload.
+- `blobRef` is nil or has no URL — the caller passed no reference.
 - `blobRef.URL` is set but the blob client is nil — storage was not injected.
 - The blob download fails — storage is unavailable or the blob was deleted.
 
 Pattern for handling resolver errors gracefully:
 
 ```go
-inputBytes, err := resolver.ResolveInput(ctx, inline, blobRef)
+inputBytes, err := resolver.ResolveInput(ctx, blobRef)
 if err != nil {
     return message.Message{}, errors.NewInternalError(
         "resolver", "failed to resolve input", "INPUT_RESOLVE_FAILED", err)

@@ -1,12 +1,12 @@
 package httpclient
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -15,12 +15,58 @@ import (
 )
 
 const (
-	defaultRequestTimeout = 30 * time.Second
+	// streamIdleTimeout ends a streamed exchange that moves no bytes for this long, and
+	// responseHeaderTimeout bounds the wait for response headers once the request is sent. A
+	// streamed body has no overall limit, because a large file on a slow link is not a fault.
+	streamIdleTimeout     = 30 * time.Second
+	responseHeaderTimeout = 30 * time.Second
 )
+
+// streamingClient has no overall timeout; dial, TLS and the response headers are still bounded,
+// and idleReader bounds the body. Every dial passes the egress policy (egress.go).
+func streamingClient() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = responseHeaderTimeout
+	// http.DefaultTransport's dialer, plus the policy.
+	t.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: guardDial}).DialContext
+	return &http.Client{Transport: t}
+}
+
+// idleReader cancels its context when no Read returns for idle, so a stalled peer fails the
+// request instead of holding the unit for ever. Every Read that returns resets the timer.
+type idleReader struct {
+	r      io.Reader
+	timer  *time.Timer
+	idle   time.Duration
+	cancel context.CancelFunc
+}
+
+func newIdleReader(r io.Reader, idle time.Duration, cancel context.CancelFunc) *idleReader {
+	ir := &idleReader{r: r, idle: idle, cancel: cancel}
+	ir.timer = time.AfterFunc(idle, cancel)
+	return ir
+}
+
+func (ir *idleReader) Read(p []byte) (int, error) {
+	n, err := ir.r.Read(p)
+	if err != nil {
+		// End of the body, or a failure: nothing is moving, and nothing is waiting on this reader.
+		ir.timer.Stop()
+		return n, err
+	}
+	ir.timer.Reset(ir.idle)
+	return n, err
+}
+
+// stop ends the idle watch; call it when the body is done.
+func (ir *idleReader) stop() { ir.timer.Stop() }
 
 // HTTPClientNode implements HTTP client requests for embedded processing.
 type HTTPClientNode struct {
 	runtime.BaseNode
+
+	// cfgCache holds the parsed configuration, read-only, shared by every worker of the unit.
+	cfgCache runtime.ConfigCache[Config]
 }
 
 // NewHTTPClientNode creates a new HTTP client node.
@@ -31,45 +77,88 @@ func NewHTTPClientNode(config runtime.EmbeddedNodeConfig) (runtime.EmbeddedNode,
 	return &HTTPClientNode{BaseNode: runtime.NewBaseNode(config)}, nil
 }
 
+// Prepare implements runtime.ConfigPreparer: the configuration is parsed once for the unit.
+func (n *HTTPClientNode) Prepare(rawConfig json.RawMessage) {
+	_, _ = n.cfgCache.Get(rawConfig, runtime.ParseJSON[Config])
+}
+
 // Process executes the HTTP request.
 func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
-	var cfg Config
-	if err := json.Unmarshal(input.RawConfig, &cfg); err != nil {
+	cfgp, err := n.cfgCache.Get(input.RawConfig, runtime.ParseJSON[Config])
+	if err != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "configuration", fmt.Sprintf("failed to parse configuration: %v", err), err))
 	}
+	cfg := *cfgp
 
 	if err := cfg.Validate(n.NodeId()); err != nil {
 		return runtime.ErrorOutput(err)
 	}
 
+	// A file a BYTE mapping delivered to "payload" is streamed as the request body, with its
+	// length.
+	var fileBody io.ReadCloser
+	var fileSize int64
+	if ref, ok := input.TrustedFile("payload"); ok {
+		if input.Files == nil {
+			return runtime.ErrorOutput(NewConfigError(n.NodeId(), "payload", "payload is a file but file storage is not configured", nil))
+		}
+		rc, openErr := input.Files.Open(input.Ctx, ref)
+		if openErr != nil {
+			return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "failed to open payload file: "+openErr.Error(), openErr, 0, nil))
+		}
+		defer rc.Close()
+		fileBody, fileSize = rc, ref.Size
+	} else if v, present := input.Data["payload"]; present && v != nil {
+		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "payload", "payload must be a file: map a byte port (a file reference) into payload", nil))
+	}
+	if !input.WritesFile("body") {
+		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "body", "the response body is written as a file but file storage is not configured", nil))
+	}
+
+	// A streamed exchange has no overall timeout, only an idle one.
+	ctx, cancel := context.WithCancel(input.Ctx)
+	defer cancel()
+	var reqBody io.Reader
+	if fileBody != nil {
+		ir := newIdleReader(fileBody, streamIdleTimeout, cancel)
+		defer ir.stop()
+		reqBody = ir
+	}
+
 	// Build request
-	req, err := n.buildRequest(input.Ctx, &cfg, input.Data)
+	req, err := n.buildRequest(ctx, &cfg, input.Data, reqBody, fileSize)
 	if err != nil {
 		return runtime.ErrorOutput(err)
 	}
 
 	// Execute request
-	client := &http.Client{Timeout: defaultRequestTimeout}
+	client := streamingClient()
 	resp, err := client.Do(req)
 	if err != nil {
+		// A refused destination is the workflow's configuration, not a fault a retry clears.
+		var egress *EgressError
+		if errors.As(err, &egress) {
+			return runtime.ErrorOutput(NewConfigError(n.NodeId(), "url", egress.Error(), egress))
+		}
 		return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "request failed: "+err.Error(), err, 0, nil))
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "failed to read response body: "+err.Error(), err, resp.StatusCode, nil))
+	// The response streams into a file with its Content-Type; nothing is read into memory.
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
 	}
-
-	// Output: status (number), body (byte - base64 encoded for JSON serialization)
-	output := map[string]interface{}{
-		"status": resp.StatusCode,
-		"body":   base64.StdEncoding.EncodeToString(body),
+	respReader := newIdleReader(resp.Body, streamIdleTimeout, cancel)
+	defer respReader.stop()
+	ref, werr := input.WriteOutputFile("body", ct, respReader)
+	if werr != nil {
+		return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "failed to store response body: "+werr.Error(), werr, resp.StatusCode, nil))
 	}
-	return runtime.SuccessOutput(output)
+	return runtime.SuccessOutput(map[string]interface{}{"status": resp.StatusCode, "body": ref})
 }
 
-func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}) (*http.Request, error) {
+func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}, fileBody io.Reader, fileSize int64) (*http.Request, error) {
 	urlStr, usingConnection, conn, err := n.resolveURL(cfg, data)
 	if err != nil {
 		return nil, err
@@ -80,16 +169,19 @@ func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map
 		return nil, err
 	}
 
-	payloadBytes := n.extractPayload(data)
-
 	var body io.Reader
-	if len(payloadBytes) > 0 && method != "GET" && method != "HEAD" {
-		body = bytes.NewReader(payloadBytes)
+	if method != "GET" && method != "HEAD" {
+		if fileBody != nil {
+			body = fileBody
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, body)
 	if err != nil {
 		return nil, NewConfigError(n.NodeId(), "url", "invalid URL: "+err.Error(), err)
+	}
+	if fileBody != nil && body != nil {
+		req.ContentLength = fileSize
 	}
 
 	if err := n.applyHeaders(req, cfg, data); err != nil {
@@ -302,30 +394,6 @@ func (n *HTTPClientNode) applyAuth(req *http.Request, conn map[string]interface{
 	}
 	if token := getString(conn, "bearer_token", ""); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
-	}
-}
-
-func (n *HTTPClientNode) extractPayload(data map[string]interface{}) []byte {
-	if data == nil {
-		return nil
-	}
-	v, ok := data["payload"]
-	if !ok || v == nil {
-		return nil
-	}
-	switch val := v.(type) {
-	case []byte:
-		return val
-	case string:
-		decoded, err := base64.StdEncoding.DecodeString(val)
-		if err == nil {
-			return decoded
-		}
-		return []byte(val)
-	default:
-		// Try JSON marshal for other types
-		b, _ := json.Marshal(v)
-		return b
 	}
 }
 

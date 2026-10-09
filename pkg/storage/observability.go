@@ -22,6 +22,8 @@ const (
 	spanBlobGet        = "blob.get"
 	spanBlobGetRange   = "blob.get_range"
 	spanBlobProperties = "blob.properties"
+	spanBlobDelete     = "blob.delete"
+	spanBlobCopy       = "blob.copy"
 )
 
 // blobOp instruments one storage operation with a span and a structured log line

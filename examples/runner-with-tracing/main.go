@@ -55,9 +55,6 @@ func (p *SimpleProcessor) Process(ctx context.Context, msg *message.Message) (me
 	if msg.Node != nil {
 		fields = append(fields, zap.String("node_id", msg.Node.NodeID))
 	}
-	if msg.Payload != nil {
-		fields = append(fields, zap.String("payload_data", msg.Payload.GetInlineData()))
-	}
 
 	p.logger.Info("Processor received message", fields...)
 	p.logger.Info("Processor starting work", zap.String("processor", p.name), zap.Duration("processing_time", processingTime))
@@ -80,7 +77,7 @@ func (p *SimpleProcessor) Process(ctx context.Context, msg *message.Message) (me
 
 	// Create a response message
 	resultMsg := message.NewMessage()
-	resultMsg.WithPayload( fmt.Sprintf("Processed by %s at %s", p.name, time.Now().Format(time.RFC3339)))
+	resultMsg.WithPayload()
 	resultMsg.WithNode("result-node", map[string]interface{}{
 		"processor":      p.name,
 		"processingTime": processingTime.String(),
@@ -283,9 +280,7 @@ func produceMessages(ctx context.Context, js jetstream.JetStream, logger *zap.Lo
 			uuid.New().String(),
 		)
 
-		msg.WithPayload(
-			fmt.Sprintf("Test data %d - %s", i, time.Now().Format(time.RFC3339)),
-		)
+		msg.WithPayload()
 
 		msg.WithNode(
 			fmt.Sprintf("node-%d", i%5),

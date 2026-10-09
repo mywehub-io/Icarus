@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/wehubfusion/Icarus/pkg/archive"
 	"github.com/wehubfusion/Icarus/pkg/message"
 	"github.com/wehubfusion/Icarus/pkg/resolver"
 	"github.com/wehubfusion/Icarus/pkg/storage"
@@ -306,8 +305,7 @@ func TestAzuriteResultArchiveRoundTripThroughTheResolver(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	// maxInlineBytes of 1 forces the blob branch regardless of payload size.
-	svc := resolver.NewService(client, 1)
+	svc := resolver.NewService(client)
 
 	res, err := svc.CreateResult(ctx, raw, resolver.ResultMeta{
 		WorkflowID:  "wf1",
@@ -335,7 +333,7 @@ func TestAzuriteResultArchiveRoundTripThroughTheResolver(t *testing.T) {
 	graph := resolver.NewConsumerGraph()
 	graph.AddRequiredFile("exec1", res.BlobReference.URL, "", []string{"up"})
 
-	out, err := svc.ResolveMappedInputWithConsumerGraph(ctx, nil, nil, &resolver.FieldMappingParams{
+	out, err := svc.ResolveMappedInputWithConsumerGraph(ctx, nil, &resolver.FieldMappingParams{
 		FieldMappings: mappings,
 		ConsumerGraph: graph,
 	}, graph)
@@ -363,86 +361,6 @@ func TestAzuriteResultArchiveRoundTripThroughTheResolver(t *testing.T) {
 	}
 	if len(out) > 64*1024 {
 		t.Fatalf("resolved input is %d bytes for four small fields; the large value was pulled in", len(out))
-	}
-}
-
-// The trigger path, end to end against real storage: an MLLP message offloaded through
-// CreateResult is an archive like everything else, and what a plugin is handed back is the
-// message byte for byte.
-//
-// This is the case that makes "everything in blob is an archive" safe to say. Artemis
-// uploads the body BEFORE writing the acknowledgement, precisely so no MSA|AA is sent for a
-// message that is not yet durable, so a refusal or a corruption here costs a message rather
-// than a field — and an HL7 message re-serialised as JSON, or handed over as a ZIP, is not
-// something the parser downstream would report cleanly.
-func TestAzuriteTriggerPayloadsRoundTripThroughTheArchive(t *testing.T) {
-	client, _ := newAzuriteClient(t)
-	ctx := context.Background()
-
-	// A realistic oversized MLLP body: repeated OBX segments, carriage returns and all.
-	var hl7 bytes.Buffer
-	hl7.WriteString("MSH|^~\\&|SENDER|FAC|RECV|FAC|20260928||ORU^R01|MSG0001|P|2.5\r")
-	hl7.WriteString("PID|1||12345^^^FAC^MR||SMITH^JOHN||19700101|M\r")
-	for i := 0; i < 40000; i++ {
-		fmt.Fprintf(&hl7, "OBX|%d|NM|GLU^Glucose||%d.2|mmol/L|||||F\r", i+1, i%20)
-	}
-
-	cases := []struct {
-		name    string
-		nodeID  string
-		payload []byte
-	}{
-		{"mllp hl7", "mllp-trigger", hl7.Bytes()},
-		// An HTTP trigger body is not a node output even when it is a JSON object, and its
-		// bytes are the caller's: key order and whitespace must survive untouched.
-		{"http json body", "http-trigger", []byte("{ \"zebra\" : 1,\n  \"apple\": 2, \"pad\": \"" + strings.Repeat("p", 1<<20) + "\" }")},
-	}
-
-	// maxInlineBytes of 1 forces the blob branch regardless of payload size.
-	svc := resolver.NewService(client, 1)
-
-	for _, tc := range cases {
-		res, err := svc.CreateResult(ctx, tc.payload, resolver.ResultMeta{
-			WorkflowID:  "wf-trigger",
-			RunID:       "run-" + tc.nodeID,
-			NodeID:      tc.nodeID,
-			ExecutionID: "trigger-" + tc.nodeID,
-		})
-		if err != nil {
-			t.Fatalf("%s: CreateResult: %v", tc.name, err)
-		}
-		if res.BlobReference == nil {
-			t.Fatalf("%s: trigger payload did not go to blob", tc.name)
-		}
-		if !strings.HasSuffix(res.BlobReference.URL, ".zip") {
-			t.Fatalf("%s: stored at %q, want an archive", tc.name, res.BlobReference.URL)
-		}
-
-		// What is actually in the container is a ZIP, not the bare payload.
-		stored, err := client.DownloadResult(ctx, res.BlobReference.URL)
-		if err != nil {
-			t.Fatalf("%s: download stored blob: %v", tc.name, err)
-		}
-		if !archive.IsArchive(stored) {
-			t.Fatalf("%s: what reached storage is not an archive", tc.name)
-		}
-		if len(stored) != res.BlobReference.SizeBytes {
-			t.Fatalf("%s: SizeBytes %d but %d bytes stored; a ranged open would 416",
-				tc.name, res.BlobReference.SizeBytes, len(stored))
-		}
-
-		// And what a plugin receives is the body the caller sent.
-		got, err := svc.ResolveInput(ctx, nil, &message.BlobReference{
-			URL:       res.BlobReference.URL,
-			SizeBytes: res.BlobReference.SizeBytes,
-		})
-		if err != nil {
-			t.Fatalf("%s: ResolveInput: %v", tc.name, err)
-		}
-		if !bytes.Equal(got, tc.payload) {
-			t.Fatalf("%s: payload changed between write and read (%d bytes out, %d back)",
-				tc.name, len(tc.payload), len(got))
-		}
 	}
 }
 

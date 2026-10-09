@@ -10,6 +10,9 @@ import (
 // DateFormatterNode implements date formatting for embedded.
 type DateFormatterNode struct {
 	runtime.BaseNode
+
+	// cfgCache holds the parsed configuration, read-only, shared by every worker of the unit.
+	cfgCache runtime.ConfigCache[Config]
 }
 
 // NewDateFormatterNode creates a new date formatter node.
@@ -20,12 +23,18 @@ func NewDateFormatterNode(config runtime.EmbeddedNodeConfig) (runtime.EmbeddedNo
 	return &DateFormatterNode{BaseNode: runtime.NewBaseNode(config)}, nil
 }
 
+// Prepare implements runtime.ConfigPreparer: the configuration is parsed once for the unit.
+func (n *DateFormatterNode) Prepare(rawConfig json.RawMessage) {
+	_, _ = n.cfgCache.Get(rawConfig, runtime.ParseJSON[Config])
+}
+
 // Process formats dates according to config and input.
 func (n *DateFormatterNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
-	var cfg Config
-	if err := json.Unmarshal(input.RawConfig, &cfg); err != nil {
+	cfgp, err := n.cfgCache.Get(input.RawConfig, runtime.ParseJSON[Config])
+	if err != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "configuration", fmt.Sprintf("failed to parse configuration: %v", err)))
 	}
+	cfg := *cfgp
 
 	if err := cfg.Validate(n.NodeId()); err != nil {
 		return runtime.ErrorOutput(err)

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	sdkerrors "github.com/wehubfusion/Icarus/pkg/errors"
 	"go.opentelemetry.io/otel"
@@ -60,6 +62,10 @@ type MessageService struct {
 	// configured idle period (no pulls/acks). Intended for tenant pods whose lifecycle
 	// is shorter than the platform's; central/shared consumers should leave this at 0.
 	inactiveThreshold time.Duration
+	// resultStreamKnown is set once the result stream has been confirmed or created, so a
+	// result publish does not pay a STREAM.INFO round trip each time. Cleared when a publish finds
+	// the stream gone, which recreates it before the next attempt.
+	resultStreamKnown atomic.Bool
 }
 
 // BlobStorageClient interface for storing large results
@@ -139,7 +145,7 @@ func (s *MessageService) SetInactiveThreshold(d time.Duration) {
 
 // EnsureStream creates the JetStream stream if it doesn't exist, or validates it exists.
 // This is a public method that can be called by runners and other components.
-// Existing streams are never modified.
+// An existing stream is changed only to bring it to the work stream size cap (EnsureSizeCap).
 func (s *MessageService) EnsureStream(ctx context.Context, streamName string) error {
 	// Check if stream exists
 	stream, err := s.js.Stream(ctx, streamName)
@@ -154,14 +160,14 @@ func (s *MessageService) EnsureStream(ctx context.Context, streamName string) er
 				subjects = []string{s.resultSubject}
 			}
 
-			streamConfig := jetstream.StreamConfig{
+			streamConfig := WithSizeCap(jetstream.StreamConfig{
 				Name:     streamName,
 				Subjects: subjects,
 				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
 				Replicas: 1,
-			}
+			}, DefaultWorkStreamMaxBytes)
 
 			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
@@ -185,6 +191,9 @@ func (s *MessageService) EnsureStream(ctx context.Context, streamName string) er
 		s.logger.Info("JetStream stream already exists",
 			zap.String("stream", streamName),
 			zap.Uint64("messages", msgs))
+		if err := s.ensureSizeCap(ctx, stream); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -278,13 +287,21 @@ func (s *MessageService) getMessageIdentifier(msg *Message) string {
 }
 
 // ensureResultStream ensures the configured result stream exists so results can
-// be published to resultSubject. The stream is created on first use and never
-// modified afterwards.
+// be published to resultSubject. The stream is created on first use; an existing one is changed
+// only to bring it to the work stream size cap, once per process.
 func (s *MessageService) ensureResultStream(ctx context.Context) error {
+	if s.resultStreamKnown.Load() {
+		return nil
+	}
 	streamName := s.resultStream
 
 	// Check if stream exists
-	_, err := s.js.Stream(ctx, streamName)
+	existing, err := s.js.Stream(ctx, streamName)
+	if err == nil {
+		if capErr := s.ensureSizeCap(ctx, existing); capErr != nil {
+			return capErr
+		}
+	}
 	if err != nil {
 		// Stream doesn't exist
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
@@ -293,14 +310,14 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 				zap.String("subject", s.resultSubject),
 				zap.Bool("is_result_stream", true))
 
-			streamConfig := jetstream.StreamConfig{
+			streamConfig := WithSizeCap(jetstream.StreamConfig{
 				Name:     streamName,
 				Subjects: []string{s.resultSubject},
 				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
 				Replicas: 1,
-			}
+			}, DefaultWorkStreamMaxBytes)
 
 			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
@@ -316,6 +333,7 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 		}
 	}
 
+	s.resultStreamKnown.Store(true)
 	return nil
 }
 
@@ -368,6 +386,13 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 		if publishErr == nil {
 			break
 		}
+		if errors.Is(publishErr, jetstream.ErrNoStreamResponse) || errors.Is(publishErr, nats.ErrNoResponders) {
+			// The stream was deleted after it was confirmed: recreate it before retrying.
+			s.resultStreamKnown.Store(false)
+			if ensureErr := s.ensureResultStream(ctx); ensureErr != nil {
+				publishErr = ensureErr
+			}
+		}
 
 		if attempt < s.publishMaxRetries {
 			s.logger.Warn("Failed to publish result, retrying",
@@ -396,7 +421,7 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 		seq = pubAck.Sequence
 		stream = pubAck.Stream
 	}
-	s.logger.Info("Successfully published result message",
+	s.logger.Debug("Successfully published result message",
 		zap.String("execution_id", resultMsg.ExecutionID),
 		zap.String("workflow_id", resultMsg.WorkflowID),
 		zap.String("node_id", resultMsg.NodeID),
@@ -417,9 +442,8 @@ var ErrResultNotPublished = errors.New("result not published")
 var ErrAckAfterPublish = errors.New("result published, ack failed")
 
 // ReportSuccess publishes unit execution result to JetStream result stream.
-// For results below the resolver's inline threshold (resolver.DefaultMaxInlineBytes,
-// 500KB), includes full payload inline. For larger results, stores in
-// blob storage and includes blob reference.
+// The result is always a blob: the payload must carry the blob reference the unit's output was
+// written to, and the result message carries it on.
 func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Message, msg jetstream.Msg) error {
 	startTime := time.Now()
 
@@ -497,34 +521,19 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 		resultMsg.WithEvents(json.RawMessage(eventsJSON))
 	}
 
-	// Respect resolver's decision - use whatever it returned (blob or inline)
-	if resultMessage.Payload.BlobReference != nil {
-		// Resolver decided to use blob storage
-		s.logger.Info("Publishing result with blob reference from resolver",
-			zap.String("execution_id", executionID),
-			zap.String("blob_url", resultMessage.Payload.BlobReference.URL),
-			zap.Int("size_bytes", resultMessage.Payload.BlobReference.SizeBytes))
-
-		resultMsg.WithBlobReference(resultMessage.Payload.BlobReference)
-		resultMsg.ResultSize = resultMessage.Payload.BlobReference.SizeBytes
-	} else if resultMessage.Payload.HasInlineData() {
-		// Resolver decided to use inline data
-		inlineData := resultMessage.Payload.GetInlineData()
-		resultSize := len(inlineData)
-
-		s.logger.Info("Publishing result with inline data from resolver",
-			zap.String("execution_id", executionID),
-			zap.Int("size_bytes", resultSize))
-
-		resultMsg.WithInlineResult(json.RawMessage(inlineData))
-		resultMsg.ResultSize = resultSize
-	} else {
-		s.logger.Error("Payload has neither blob reference nor inline data")
+	if resultMessage.Payload.BlobReference == nil || resultMessage.Payload.BlobReference.URL == "" {
+		s.logger.Error("Payload has no blob reference")
 		if msg != nil {
 			_ = msg.Nak()
 		}
-		return fmt.Errorf("invalid payload: no data or blob reference")
+		return fmt.Errorf("invalid payload: no blob reference")
 	}
+	s.logger.Debug("Publishing result with blob reference",
+		zap.String("execution_id", executionID),
+		zap.String("blob_url", resultMessage.Payload.BlobReference.URL),
+		zap.Int64("size_bytes", resultMessage.Payload.BlobReference.SizeBytes))
+	resultMsg.WithBlobReference(resultMessage.Payload.BlobReference)
+	resultMsg.ResultSize = int(resultMessage.Payload.BlobReference.SizeBytes)
 
 	// Publish result to JetStream
 	if err := s.PublishResult(ctx, resultMsg); err != nil {
@@ -540,18 +549,17 @@ func (s *MessageService) ReportSuccess(ctx context.Context, resultMessage Messag
 	}
 
 	publishDuration := time.Since(startTime)
-	s.logger.Info("Successfully published result to JetStream",
+	s.logger.Debug("Successfully published result to JetStream",
 		zap.String("workflow_id", workflowID),
 		zap.String("run_id", runID),
 		zap.String("execution_id", executionID),
 		zap.Duration("publish_duration", publishDuration),
-		zap.Int("payload_size", resultMsg.ResultSize),
-		zap.Bool("used_blob_reference", resultMsg.HasBlobReference()))
+		zap.Int("payload_size", resultMsg.ResultSize))
 
 	// Acknowledge the source message
 	if msg != nil {
 		reportSuccessTotalMs := time.Since(startTime).Milliseconds()
-		s.logger.Info("JetStream source message ack after successful result publish",
+		s.logger.Debug("JetStream source message ack after successful result publish",
 			zap.String("workflow_id", workflowID),
 			zap.String("run_id", runID),
 			zap.String("execution_id", executionID),
@@ -788,7 +796,6 @@ func FinalAttempt() ReportErrorOption {
 	return func(o *reportErrorOptions) { o.final = true }
 }
 
-
 // jetStreamDeliverCountStr returns JetStream NumDelivered for grep-friendly diagnostics, or "".
 func jetStreamDeliverCountStr(msg jetstream.Msg) string {
 	if msg == nil {
@@ -840,4 +847,14 @@ func ExtractNodeIDFromExecutionID(executionID, workflowID string) string {
 
 	// If format doesn't match, return executionID as-is (fallback)
 	return executionID
+}
+
+// ensureSizeCap applies the work stream size cap to an existing stream when the JetStream
+// context can update streams (the real one can; a test double without UpdateStream is skipped).
+func (s *MessageService) ensureSizeCap(ctx context.Context, stream jetstream.Stream) error {
+	u, ok := s.js.(StreamUpdater)
+	if !ok {
+		return nil
+	}
+	return EnsureSizeCap(ctx, u, stream, DefaultWorkStreamMaxBytes, s.logger)
 }

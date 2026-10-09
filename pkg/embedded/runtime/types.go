@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/wehubfusion/Icarus/pkg/filestore"
 )
 
 // FieldMapping represents the mapping configuration between nodes.
@@ -31,6 +33,9 @@ type FieldMapping struct {
 	IsEventTrigger bool `json:"isEventTrigger,omitempty"`
 	// Iterate indicates if this mapping should iterate over array items
 	Iterate bool `json:"iterate"`
+	// ValueType is "" for data, "BYTE" for a file reference, "RECORDS" for a record stream
+	// (message.FieldMapping.ValueType).
+	ValueType string `json:"valueType,omitempty"`
 }
 
 // IsEvent returns true if this mapping is an event trigger
@@ -210,10 +215,10 @@ type EmbeddedNodeStartInfo struct {
 	WorkflowID     string
 	RunID          string
 	ClientID       string
-	ProjectID       string
-	ParentNodeID    string
-	EmbeddedNodeID  string
-	Label           string
+	ProjectID      string
+	ParentNodeID   string
+	EmbeddedNodeID string
+	Label          string
 }
 
 // EmbeddedNodeEndInfo carries lifecycle information for an embedded node completion.
@@ -221,12 +226,12 @@ type EmbeddedNodeEndInfo struct {
 	WorkflowID     string
 	RunID          string
 	ClientID       string
-	ProjectID       string
-	ParentNodeID    string
-	EmbeddedNodeID  string
-	Label           string
-	HasError        bool
-	ErrorMessage    string
+	ProjectID      string
+	ParentNodeID   string
+	EmbeddedNodeID string
+	Label          string
+	HasError       bool
+	ErrorMessage   string
 }
 
 // ParentNodeEndInfo carries contextual information about a parent node whose
@@ -236,8 +241,8 @@ type ParentNodeEndInfo struct {
 	WorkflowID   string
 	RunID        string
 	ClientID     string
-	ProjectID       string
-	ParentNodeID    string
+	ProjectID    string
+	ParentNodeID string
 	// Label is the human-readable node label from the execution plan (for observation events).
 	Label string
 	// HasEmbeddedNodes indicates whether this parent has embedded nodes configured.
@@ -249,12 +254,12 @@ type ParentNodeOutputInfo struct {
 	WorkflowID   string
 	RunID        string
 	ClientID     string
-	ProjectID       string
-	ParentNodeID    string
-	Label           string
-	Output          map[string]interface{}
-	HasError        bool
-	ErrorMessage    string
+	ProjectID    string
+	ParentNodeID string
+	Label        string
+	Output       map[string]interface{}
+	HasError     bool
+	ErrorMessage string
 }
 
 // EmbeddedNodeIOInfo carries input or output data for an embedded node emission.
@@ -262,13 +267,13 @@ type EmbeddedNodeIOInfo struct {
 	WorkflowID     string
 	RunID          string
 	ClientID       string
-	ProjectID       string
-	ParentNodeID    string
-	EmbeddedNodeID  string
-	Label           string
-	Data            map[string]interface{}
-	HasError        bool
-	ErrorMessage    string
+	ProjectID      string
+	ParentNodeID   string
+	EmbeddedNodeID string
+	Label          string
+	Data           map[string]interface{}
+	HasError       bool
+	ErrorMessage   string
 }
 
 // StandardUnitOutput represents the flattened output of a unit as a flat map.
@@ -666,6 +671,17 @@ type ProcessInput struct {
 	IsIteration bool
 	// IterationPath is the array path being iterated (e.g., "data")
 	IterationPath string
+	// Files opens the run's input files and writes output files. Nil when the parent unit runs
+	// without a file store (the old inline path, until the cut).
+	Files filestore.Store
+	// WorkflowID, RunID and ParentNodeID place an output file: fileref.PathFor with
+	// PathOptions.ParentNodeID set to ParentNodeID.
+	WorkflowID   string
+	RunID        string
+	ParentNodeID string
+	// ByteFields are the input fields a BYTE mapping delivered (raw payloads): the only fields a
+	// processor may open as files. See TrustedFile.
+	ByteFields map[string]bool
 }
 
 // ProcessOutput contains the result of embedded node processing.

@@ -3,7 +3,6 @@ package json
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 )
 
 // Parser handles parsing of schema definitions
@@ -143,10 +142,9 @@ func ValidateValidationRulesForType(rules *ValidationRules, fieldType SchemaType
 	}
 	if fieldType == TypeDate && (rules.MinDate != nil || rules.MaxDate != nil) {
 		// Validate format YYYY-MM-DD
-		dateRegex := `^\d{4}-\d{2}-\d{2}$`
 		for _, s := range []*string{rules.MinDate, rules.MaxDate} {
 			if s != nil && *s != "" {
-				if matched, _ := regexp.MatchString(dateRegex, *s); !matched {
+				if !dateRe.MatchString(*s) {
 					return fmt.Errorf("property '%s': minDate/maxDate must be ISO 8601 date (YYYY-MM-DD)", name)
 				}
 			}

@@ -57,9 +57,6 @@ func (p *SimpleProcessor) Process(ctx context.Context, msg *message.Message) (me
 	if msg.Node != nil {
 		fields = append(fields, zap.String("node_id", msg.Node.NodeID))
 	}
-	if msg.Payload != nil {
-		fields = append(fields, zap.String("payload_data", msg.Payload.GetInlineData()))
-	}
 
 	p.logger.Info("Processor received message", fields...)
 	p.logger.Info("Processor starting work", zap.String("processor", p.name), zap.Duration("processing_time", processingTime))
@@ -70,8 +67,7 @@ func (p *SimpleProcessor) Process(ctx context.Context, msg *message.Message) (me
 		p.logger.Info("Processor completed processing", zap.String("processor", p.name))
 
 		// Create a result message with the processing results
-		resultMessage := message.NewMessage().
-			WithPayload( fmt.Sprintf("Processed by %s in %v", p.name, processingTime))
+		resultMessage := message.NewMessage().WithPayload()
 
 		// Copy workflow information if it exists
 		if msg.Workflow != nil {
@@ -378,10 +374,7 @@ func publishTestMessages(ctx context.Context, js jetstream.JetStream) error {
 		})
 
 		// Add payload
-		data := msgData.data
-		msg.Payload = &message.Payload{
-			InlineData: &data,
-		}
+		msg.WithPayload()
 
 		// Add some metadata
 		msg.WithMetadata("messageType", "task")

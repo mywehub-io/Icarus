@@ -2,12 +2,14 @@ package resolver
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/wehubfusion/Icarus/pkg/embedded/runtime"
+	"github.com/wehubfusion/Icarus/pkg/fileref"
 	"github.com/wehubfusion/Icarus/pkg/message"
 )
 
@@ -1228,6 +1230,28 @@ func buildInputFromMappings(params BuildInputParams) ([]byte, error) {
 				mapping.SourceNodeID))
 		}
 
+		// A byte port's value is a file reference: copied as it is to every destination, never
+		// unwrapped, merged into the root or descended into (decisions D4). Nothing is downloaded.
+		if mapping.ValueType == message.ValueTypeByte && sourceData != nil {
+			if _, isRef := fileref.Parse(sourceData); isRef {
+				for _, destEndpoint := range mapping.DestinationEndpoints {
+					dest := destEndpoint
+					if dest == "" || dest == "/" {
+						dest = mapping.SourceEndpoint
+					}
+					setFieldAtPath(inputData, dest, deepCopyValue(sourceData))
+				}
+				continue
+			}
+			// A list (iterated references, a files list) takes the path below. A scalar is never a
+			// byte value since the cut (D1, D10): it is a producer still writing base64 or text, and
+			// passing it on only moves the failure to a consumer that cannot say where it came from.
+			if isScalarValue(sourceData) {
+				return nil, fmt.Errorf("%w: %s%s carries a %T where a file reference is expected",
+					ErrByteValueNotAFile, mapping.SourceNodeID, mapping.SourceEndpoint, sourceData)
+			}
+		}
+
 		if sourceData == nil {
 			// The source field is absent from the upstream output — treat as an optional field
 			// and skip silently. The plugin will fall back to its nodeConfig defaults
@@ -1742,4 +1766,16 @@ func pluginErrorSectionDefault(sourceEndpoint string) interface{} {
 		return ""
 	}
 	return nil
+}
+
+// ErrByteValueNotAFile is returned when a BYTE mapping's source holds a scalar (a string, number or
+// boolean) rather than a file reference. It fails the same way on every retry, so it is permanent.
+var ErrByteValueNotAFile = errors.New("BYTE_VALUE_NOT_A_FILE")
+
+func isScalarValue(v interface{}) bool {
+	switch v.(type) {
+	case string, bool, float64, float32, int, int64, int32, json.Number:
+		return true
+	}
+	return false
 }
