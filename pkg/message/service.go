@@ -687,11 +687,18 @@ func (s *MessageService) ReportError(ctx context.Context, executionID, workflowI
 		resultMsg.WithCorrelationID(correlationID)
 	}
 
+	detail := errorDetailOf(err)
+	if detail != nil && detail.Code != "" {
+		if _, isApp := err.(*sdkerrors.AppError); !isApp {
+			errorCode = detail.Code
+		}
+	}
 	resultMsg.WithError(&ResultError{
 		Code:      errorCode,
 		Message:   errorMsg,
 		Retryable: isTransient && !o.final,
 		Type:      errorType,
+		Detail:    detail,
 	})
 	resultMsg.Attempt = o.attempt
 
@@ -857,4 +864,29 @@ func (s *MessageService) ensureSizeCap(ctx context.Context, stream jetstream.Str
 		return nil
 	}
 	return EnsureSizeCap(ctx, u, stream, DefaultWorkStreamMaxBytes, s.logger)
+}
+
+// errorDetailOf reads the structured detail a failure carries, if any: the failing node (an
+// embedded runtime ProcessingError) and an author's code and message (an Error plugin's
+// CodedError). Both are found through the error chain by interface, so this package does not import
+// the embedded runtime. Returns nil when the chain carries neither.
+func errorDetailOf(err error) *ErrorDetail {
+	var detail ErrorDetail
+	var node interface {
+		FailedNode() (nodeID, label, pluginType string)
+	}
+	if errors.As(err, &node) {
+		detail.NodeID, detail.NodeLabel, detail.PluginType = node.FailedNode()
+	}
+	var coded interface {
+		ErrorCode() string
+		RawMessage() string
+	}
+	if errors.As(err, &coded) {
+		detail.Code, detail.Message = coded.ErrorCode(), coded.RawMessage()
+	}
+	if detail == (ErrorDetail{}) {
+		return nil
+	}
+	return &detail
 }

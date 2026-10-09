@@ -16,6 +16,8 @@ import (
 type Config struct {
 	Label               string `json:"label"`
 	DefaultErrorMessage string `json:"default_error_message"`
+	// ErrorCode is the code when the "code" input is empty (workplans/connector D9).
+	ErrorCode string `json:"error_code"`
 }
 
 // ErrorNode implements an embedded node that always produces an error
@@ -77,7 +79,10 @@ func (n *ErrorNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
 		message = fallbackErrorNodeMessage(cfg.Label, input.Label, input.NodeId)
 	}
 
-	baseErr := errors.New(message)
+	var baseErr error = errors.New(message)
+	if code := resolveCode(input.Data, cfg.ErrorCode); code != "" {
+		baseErr = &runtime.CodedError{Code: code, Message: message}
+	}
 	procErr := runtime.NewProcessingError(
 		input.NodeId,
 		input.Label,
@@ -88,6 +93,17 @@ func (n *ErrorNode) Process(input runtime.ProcessInput) runtime.ProcessOutput {
 	)
 
 	return runtime.ErrorOutput(procErr)
+}
+
+// resolveCode returns the error code: the "code" input when it is a non-empty string, else the
+// configured error_code, else "" (no code, as before codes existed).
+func resolveCode(data map[string]interface{}, configured string) string {
+	if data != nil {
+		if s, ok := data["code"].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return strings.TrimSpace(configured)
 }
 
 // resolveMessage determines the final error message using, in order:

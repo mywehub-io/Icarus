@@ -1,6 +1,7 @@
 package processors
 
 import (
+	"github.com/wehubfusion/Icarus/pkg/embedded/processors/connectorio"
 	"github.com/wehubfusion/Icarus/pkg/embedded/processors/constantvalue"
 	"github.com/wehubfusion/Icarus/pkg/embedded/processors/errornode"
 	"github.com/wehubfusion/Icarus/pkg/embedded/processors/dateformatter"
@@ -40,6 +41,10 @@ func NewProcessorRegistry() runtime.EmbeddedNodeFactory {
 
 	// Register constant value generator processor
 	factory.Register("plugin-constant-value-generator", constantvalue.NewConstantValueNode)
+
+	// Register the two ends of a connector action (Olympus workplans/connector)
+	factory.Register(connectorio.PluginInput, connectorio.NewInputNode)
+	factory.Register(connectorio.PluginResult, connectorio.NewResultNode)
 
 	// Future processors can be registered here...
 

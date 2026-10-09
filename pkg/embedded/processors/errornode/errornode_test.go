@@ -3,6 +3,7 @@ package errornode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -161,3 +162,45 @@ func TestProcess_InvalidConfigReturnsConfigError(t *testing.T) {
 	}
 }
 
+
+// TestErrorNodeReturnsCode pins workplans/connector D9: the code comes from the "code" input, then
+// the error_code setting; the message stays exactly as authored.
+func TestErrorNodeReturnsCode(t *testing.T) {
+	cases := []struct {
+		name     string
+		data     map[string]interface{}
+		cfgCode  string
+		wantCode string
+	}{
+		{"input code wins", map[string]interface{}{"message": "bad order", "code": "E-7"}, "E-42", "E-7"},
+		{"configured code", map[string]interface{}{"message": "bad order"}, "E-42", "E-42"},
+		{"no code", map[string]interface{}{"message": "bad order"}, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			node := createErrorNodeForTest(t, "node-code")
+			rawCfg, _ := json.Marshal(Config{Label: "Reject", ErrorCode: tc.cfgCode})
+			out := node.Process(createProcessInputForTest("node-code", tc.data, rawCfg))
+			if out.Error == nil {
+				t.Fatal("expected an error output")
+			}
+			var coded *runtime.CodedError
+			found := errors.As(out.Error, &coded)
+			if tc.wantCode == "" {
+				if found {
+					t.Fatalf("no code configured, but got %q", coded.Code)
+				}
+				return
+			}
+			if !found {
+				t.Fatalf("expected a CodedError in %v", out.Error)
+			}
+			if coded.Code != tc.wantCode || coded.Message != "bad order" {
+				t.Fatalf("got code %q message %q", coded.Code, coded.Message)
+			}
+			if !strings.Contains(out.Error.Error(), tc.wantCode+": bad order") {
+				t.Fatalf("the code must be visible in the error text: %q", out.Error.Error())
+			}
+		})
+	}
+}
