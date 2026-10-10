@@ -160,14 +160,14 @@ func (s *MessageService) EnsureStream(ctx context.Context, streamName string) er
 				subjects = []string{s.resultSubject}
 			}
 
-			streamConfig := WithSizeCap(jetstream.StreamConfig{
+			streamConfig := WorkStreamConfig(jetstream.StreamConfig{
 				Name:     streamName,
 				Subjects: subjects,
 				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
 				Replicas: 1,
-			}, DefaultWorkStreamMaxBytes)
+			})
 
 			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
@@ -310,14 +310,14 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 				zap.String("subject", s.resultSubject),
 				zap.Bool("is_result_stream", true))
 
-			streamConfig := WithSizeCap(jetstream.StreamConfig{
+			streamConfig := WorkStreamConfig(jetstream.StreamConfig{
 				Name:     streamName,
 				Subjects: []string{s.resultSubject},
 				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
 				Replicas: 1,
-			}, DefaultWorkStreamMaxBytes)
+			})
 
 			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
@@ -381,8 +381,20 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 	// Retry logic for critical result publishing
 	var publishErr error
 	var pubAck *jetstream.PubAck
+	// One dedup id per execution: a retry after a lost acknowledgement, or the same execution
+	// reported twice, is stored once inside the stream's duplicate window.
+	var pubOpts []jetstream.PublishOpt
+	if resultMsg.ExecutionID != "" {
+		pubOpts = append(pubOpts, jetstream.WithMsgID("result:"+resultMsg.ExecutionID))
+	}
 	for attempt := 1; attempt <= s.publishMaxRetries; attempt++ {
-		pubAck, publishErr = s.js.Publish(ctx, publishSubject, data)
+		// Each attempt gets its own short deadline. The caller's context can run for minutes (large
+		// results); bound only by it, an attempt sent over a connection that died in a partition
+		// waited for an acknowledgement that could never come, the unit's lease kept being extended,
+		// and the run stalled for the whole report window instead of being retried promptly.
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, resultPublishAttemptTimeout)
+		pubAck, publishErr = s.js.Publish(attemptCtx, publishSubject, data, pubOpts...)
+		attemptCancel()
 		if publishErr == nil {
 			break
 		}
@@ -856,5 +868,8 @@ func (s *MessageService) ensureSizeCap(ctx context.Context, stream jetstream.Str
 	if !ok {
 		return nil
 	}
-	return EnsureSizeCap(ctx, u, stream, DefaultWorkStreamMaxBytes, s.logger)
+	return EnsureStreamPolicy(ctx, u, stream, WorkStream, s.logger)
 }
+
+// resultPublishAttemptTimeout bounds one attempt to publish a result.
+const resultPublishAttemptTimeout = 10 * time.Second

@@ -76,7 +76,7 @@ func TestWaitingUnitIsNotRedelivered(t *testing.T) {
 
 		stop := func() {}
 		if heartbeat {
-			stop = newHeartbeatRunner().startAckHeartbeat(ctx, msg, "wf", "run", "node")
+			_, stop = newHeartbeatRunner().startAckHeartbeat(ctx, msg, "wf", "run", "node")
 		}
 		time.Sleep(wait) // the unit waiting for the admission budget
 

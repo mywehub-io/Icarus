@@ -5,6 +5,8 @@ package runner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -158,22 +160,22 @@ func WithConsumerFilterSubject(filterSubject string) RunnerOption {
 // ICARUS_RUNNER_WORKERS env, ICARUS_RUNNER_WORKER_MULTIPLIER × GOMAXPROCS,
 // or GOMAXPROCS as the fallback (in that order).
 type Runner struct {
-	client                 *client.Client
-	processor              Processor
-	stream                 string
-	consumer               string
-	consumerFilterSubject  string
-	batchSize              int
-	logger                 *zap.Logger
-	processTimeout         time.Duration
-	tracer                 trace.Tracer
-	tracingShutdown        func(context.Context) error
-	config                 Config
-	jobChan                chan *message.Message
+	client                *client.Client
+	processor             Processor
+	stream                string
+	consumer              string
+	consumerFilterSubject string
+	batchSize             int
+	logger                *zap.Logger
+	processTimeout        time.Duration
+	tracer                trace.Tracer
+	tracingShutdown       func(context.Context) error
+	config                Config
+	jobChan               chan *message.Message
 	// idle holds one token per worker that is free to take a message. The fetch loop takes
 	// tokens before it fetches and asks for no more messages than it holds; a worker returns its
 	// token when it finishes a message.
-	idle                   chan struct{}
+	idle chan struct{}
 	// maxDeliver is the consumer's MaxDeliver, read when the consumer is resolved. It decides
 	// whether a transient failure is retried or reported as final (see retryPolicy).
 	maxDeliver             atomic.Int64
@@ -181,9 +183,25 @@ type Runner struct {
 	unitObserver           UnitObserver
 	// heartbeatKV is the EXECUTION_HEARTBEATS bucket used for the liveness heartbeat and the
 	// claim-per-execution-unit idempotency check (see startAckHeartbeat and claimExecutionUnit).
-	// nil when the bucket could not be created/reached at startup; both mechanisms degrade to
-	// no-ops (heartbeat) or fail-open (claim) when nil rather than blocking processing.
-	heartbeatKV jetstream.KeyValue
+	// Use heartbeats(ctx), which reopens it when it is missing or bound to a connection the client
+	// has since replaced. When it still cannot be used, the claim fails closed: the unit waits
+	// rather than risk running twice (workplan infra-fault-tolerance, D5).
+	heartbeatKV   jetstream.KeyValue
+	heartbeatMu   sync.Mutex
+	heartbeatConn *nats.Conn
+
+	// unpublished holds the result of each unit that succeeded but whose result could not be
+	// published, by execution id, so its redelivery publishes that result instead of running the
+	// unit again (keepUnpublished).
+	unpublishedMu    sync.Mutex
+	unpublished      map[string]message.Message
+	unpublishedOrder []string
+
+	// local remembers the executions this process is handling or has finished, so a redelivery of
+	// one is neither run concurrently nor run again (see processMessage).
+	localMu    sync.Mutex
+	local      map[string]int
+	localOrder []string
 
 	// busySince holds, per worker, the UnixNano time it took its current message, or 0 while it
 	// is idle. The watchdog reads it to tell a runner whose workers are all busy (nothing to
@@ -224,7 +242,7 @@ type Config struct {
 }
 
 // defaultStallTimeout is the StallTimeout used when neither Config nor env sets one. An idle
-// runner completes a fetch every fetchMaxWait (1 s), so two minutes without one is far outside
+// runner completes a fetch every fetchMaxWait (10 s), so two minutes without one is far outside
 // normal operation.
 const defaultStallTimeout = 2 * time.Minute
 
@@ -379,16 +397,16 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 		logger.Warn("JetStream handle not available; EXECUTION_HEARTBEATS heartbeat and claim disabled for this runner")
 	} else if kv, err := client.JetStream().KeyValue(ensureCtx, executionHeartbeatBucket); err == nil {
 		runner.heartbeatKV = kv
+		runner.heartbeatConn = client.Connection()
 	} else if errors.Is(err, jetstream.ErrBucketNotFound) {
-		kv, createErr := client.JetStream().CreateKeyValue(ensureCtx, jetstream.KeyValueConfig{
-			Bucket: executionHeartbeatBucket,
-			TTL:    executionHeartbeatTTL,
-		})
+		kv, createErr := client.JetStream().CreateKeyValue(ensureCtx, message.HeartbeatBucketConfig())
 		if createErr == nil {
 			runner.heartbeatKV = kv
+			runner.heartbeatConn = client.Connection()
 		} else if errors.Is(createErr, jetstream.ErrBucketExists) {
 			if kv, getErr := client.JetStream().KeyValue(ensureCtx, executionHeartbeatBucket); getErr == nil {
 				runner.heartbeatKV = kv
+				runner.heartbeatConn = client.Connection()
 			} else {
 				logger.Warn("EXECUTION_HEARTBEATS bucket exists but could not be opened; heartbeat and claim disabled for this runner", zap.Error(getErr))
 			}
@@ -433,11 +451,20 @@ func (r *Runner) Close() error {
 	return nil
 }
 
-// fetchMaxWait bounds one fetch request. A fetch that finds no messages returns after it, so
-// the loop notices shutdown and freed workers within this time. A worker that frees up while a
-// fetch is open waits up to this long for new work, so it is kept short (it was 5 s); an idle
-// runner pays one cheap pull request per second for it.
-var fetchMaxWait = 1 * time.Second
+// fetchMaxWait bounds one fetch request: the server holds the pull this long, and nats.go stops
+// reading its replies one second after that. A message the server sends once the client has
+// stopped reading is lost to that delivery: it is redelivered only after AckWait (30 s), and
+// MaxDeliver (5) such losses strand the unit. At 1 s (it was cut from 5 s), any round trip over
+// about 2 s lost even a message sent at once, and under 1 to 3 s of latency every unit queued in
+// those minutes burned its five deliveries (chaos CN-06, 10/10/2026). At 10 s a round trip up to
+// about 11 s is safe for those, and only a message that arrives at the very end of an idle pull
+// is exposed.
+//
+// A fetch returns as soon as it has the messages it asked for, so the wait only applies while
+// there is no backlog: freed workers do not wait for work that exists. The cost is a shutdown
+// that may wait up to this long for the open fetch, and server heartbeats on the pull (nats.go
+// enables them for waits of 10 s or more), which also bring a dead pull to light sooner.
+var fetchMaxWait = 10 * time.Second
 
 // Run starts the message processing pipeline and blocks until shutdown completes.
 //
@@ -583,6 +610,21 @@ func (r *Runner) Run(ctx context.Context) error {
 						return
 					}
 					r.logger.Error("Error resolving JetStream consumer", zap.Error(err))
+					if errors.Is(err, jetstream.ErrStreamNotFound) {
+						// The stream itself is gone (lost with the server's store, or not loaded at a
+						// restart): recreate it, then the consumer below. Retrying the resolve alone
+						// can never succeed, and the runner stopped consuming for the life of the
+						// process.
+						if ensureErr := r.client.Messages.EnsureStream(ctx, r.stream); ensureErr != nil {
+							r.logger.Error("Failed to create the missing JetStream stream again",
+								zap.String("stream", r.stream),
+								zap.Error(ensureErr))
+						} else {
+							r.logger.Warn("JetStream stream was missing; created it again",
+								zap.String("stream", r.stream))
+							err = jetstream.ErrConsumerNotFound
+						}
+					}
 					if errors.Is(err, jetstream.ErrConsumerNotFound) {
 						// Deleted while the runner was up (lost in a server restart, or removed by
 						// its InactiveThreshold): resolving it again can never succeed, so create it
@@ -927,12 +969,12 @@ var ackHeartbeatInterval = 10 * time.Second
 // executionHeartbeatBucket is the NATS KV bucket used for the liveness heartbeat Zeus's sweeper
 // polls (see the temporal-removal plan's phase-2) and for the claim-per-execution-unit idempotency
 // check in processMessage. New as of this change; nothing else in Icarus reads or writes it.
-const executionHeartbeatBucket = "EXECUTION_HEARTBEATS"
+const executionHeartbeatBucket = message.ExecutionHeartbeatsBucket
 
 // executionHeartbeatTTL is how long a heartbeat entry survives with no refresh. Three missed
 // writes (executionHeartbeatEveryNTicks x ackHeartbeatInterval x 3 = 90s) before expiry, so a
 // single missed KV write does not read as a dead pod.
-const executionHeartbeatTTL = 90 * time.Second
+const executionHeartbeatTTL = message.ExecutionHeartbeatTTL
 
 // heartbeatKVTimeout bounds each EXECUTION_HEARTBEATS call (claim, heartbeat write, state
 // write). They used to run on the process context, which for a long unit (esr-operation allows
@@ -981,6 +1023,21 @@ type executionHeartbeat struct {
 	State string `json:"state,omitempty"`
 	// RetryAt is when the next delivery is due, for heartbeatRetrying.
 	RetryAt string `json:"retry_at,omitempty"`
+	// Owner identifies the runner process that wrote the entry (processToken). Pod alone cannot:
+	// HOSTNAME is empty outside Kubernetes, and one pod runs a process per restart.
+	Owner string `json:"owner,omitempty"`
+}
+
+// processToken identifies this runner process in the claims it writes, so it can recognise its
+// own claim when a write's reply was lost (see claimExecutionUnit).
+var processToken = newProcessToken()
+
+func newProcessToken() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("pid-%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 // executionHeartbeatKey builds the EXECUTION_HEARTBEATS key for one execution unit. Dots, not
@@ -1021,10 +1078,11 @@ const (
 //   - retrying, done for an earlier execution (Zeus dispatched the node again), or running
 //     with no write for claimStaleAfter (its pod is presumed dead): taken over with an Update
 //     on the entry's revision, so two deliveries racing for it cannot both win;
-//   - running and fresh: claimBusy.
+//   - running and fresh: claimBusy, unless this process wrote it for this execution (Owner):
+//     then it is this process's own claim, whose Create reply was lost, and it is taken over.
 //
-// A non-nil error means the KV could not be used; callers fail OPEN on it, since a KV outage
-// must not stop all processing platform-wide.
+// A non-nil error means the KV could not be used; the caller fails CLOSED on it (claimOrNak
+// naks the delivery for later), so a unit is never run twice across a KV outage (D5).
 func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, hb executionHeartbeat, now time.Time) (claimOutcome, error) {
 	payload, err := json.Marshal(hb)
 	if err != nil {
@@ -1053,7 +1111,13 @@ func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, 
 			return claimDuplicate, nil
 		case cur.State == heartbeatRetrying,
 			cur.State == heartbeatDone,
-			now.Sub(entry.Created()) >= claimStaleAfter:
+			now.Sub(entry.Created()) >= claimStaleAfter,
+			// This process's own claim for this execution, which it is not running (the caller
+			// checks its local memory first): a Create whose reply was lost, so the claim was
+			// stored but reported unavailable. Read as someone else's, it made every redelivery
+			// back off until the deliveries ran out and the unit was stranded (chaos CN-06,
+			// latency).
+			hb.Owner != "" && cur.Owner == hb.Owner && cur.ExecutionID == hb.ExecutionID:
 			if _, err := kv.Update(ctx, key, payload, entry.Revision()); err == nil {
 				return claimWon, nil
 			} else if errors.Is(err, jetstream.ErrKeyExists) {
@@ -1069,17 +1133,26 @@ func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, 
 }
 
 // claimOrNak is processMessage's entry-point wrapper around claimExecutionUnit. It returns true
-// when processing should proceed (the claim was won, heartbeatKV is nil, or the KV could not be
-// used — fail-open), and false when the message has already been nak'd or terminated and
-// processMessage must return without calling Process.
+// when processing should proceed (the claim was won, or the message is not an execution unit, or
+// the client has no JetStream at all, as in tests), and false when the message has already been
+// nak'd or terminated and processMessage must return without calling Process. A KV that cannot
+// be used fails closed: the delivery is nak'd for later.
 //
-// Isolated as its own method (rather than inlined in processMessage) so the fail-open and
+// Isolated as its own method (rather than inlined in processMessage) so the fail-closed and
 // lost-claim paths are testable without a real *client.Client — both would otherwise be
 // unreachable in a unit test, since a won claim falls through into Process and the real
 // ReportSuccess/ReportError machinery.
 func (r *Runner) claimOrNak(ctx context.Context, msg *message.Message, workflowID, runID, nodeID, executionID string) bool {
-	if r.heartbeatKV == nil {
-		return true
+	if workflowID == "" || runID == "" || nodeID == "" {
+		return true // not an execution unit of a run: there is nothing to claim
+	}
+	kv := r.heartbeats(ctx)
+	if kv == nil {
+		if r.client == nil || r.client.JetStream() == nil {
+			return true // no JetStream at all (a test-only client): nothing to claim against
+		}
+		r.nakClaimUnavailable(msg, workflowID, runID, nodeID, errors.New("EXECUTION_HEARTBEATS bucket unavailable"))
+		return false
 	}
 	key := executionHeartbeatKey(workflowID, runID, nodeID)
 	hb := executionHeartbeat{
@@ -1091,20 +1164,24 @@ func (r *Runner) claimOrNak(ctx context.Context, msg *message.Message, workflowI
 		Pod:         os.Getenv("HOSTNAME"),
 		StartedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 		State:       heartbeatRunning,
+		Owner:       processToken,
 	}
 	claimCtx, cancel := context.WithTimeout(ctx, heartbeatKVTimeout)
 	defer cancel()
-	outcome, claimErr := claimExecutionUnit(claimCtx, r.heartbeatKV, key, hb, time.Now())
+	outcome, claimErr := claimExecutionUnit(claimCtx, kv, key, hb, time.Now())
 	if claimErr != nil {
-		// KV unreachable: fail OPEN. A KV outage must not halt all processing platform-wide —
-		// a broken heartbeat/claim mechanism already looks identical to "every pod is dead"
-		// from Zeus's side, an accepted degradation.
-		r.logger.Warn("Failed to claim execution unit (KV unreachable); processing anyway",
-			zap.String("workflow_id", workflowID),
-			zap.String("run_id", runID),
-			zap.String("node_id", nodeID),
-			zap.Error(claimErr))
-		return true
+		// KV unreachable: fail CLOSED (D5). This used to process anyway, and after a partition a
+		// redelivered unit then ran alongside the original or after it had already finished: the
+		// chaos suite saw whole chains execute twice, emails and uploads included. Without NATS
+		// the result cannot be published either, so waiting costs nothing the outage did not.
+		if bucketGone(claimErr) || errors.Is(claimErr, nats.ErrConnectionClosed) {
+			// Reopen it on the next delivery: the bucket was recreated, or the handle belongs to a
+			// connection the client has since replaced and closed. Keeping such a handle made every
+			// claim fail and, failing closed, stopped all processing after a NATS restart.
+			r.forgetHeartbeats()
+		}
+		r.nakClaimUnavailable(msg, workflowID, runID, nodeID, claimErr)
+		return false
 	}
 	switch outcome {
 	case claimDuplicate:
@@ -1139,7 +1216,11 @@ func (r *Runner) claimOrNak(ctx context.Context, msg *message.Message, workflowI
 // keeping the claim this pod holds. Failures are logged: the claim and Zeus both cope with a
 // stale entry, more slowly.
 func (r *Runner) setHeartbeatState(msg *message.Message, workflowID, runID, nodeID, executionID, state string, retryAt time.Time) {
-	if r.heartbeatKV == nil || workflowID == "" || runID == "" || nodeID == "" {
+	if workflowID == "" || runID == "" || nodeID == "" {
+		return
+	}
+	kv := r.heartbeats(context.Background())
+	if kv == nil {
 		return
 	}
 	hb := executionHeartbeat{
@@ -1151,6 +1232,7 @@ func (r *Runner) setHeartbeatState(msg *message.Message, workflowID, runID, node
 		Pod:         os.Getenv("HOSTNAME"),
 		StartedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 		State:       state,
+		Owner:       processToken,
 	}
 	if !retryAt.IsZero() {
 		hb.RetryAt = retryAt.UTC().Format(time.RFC3339Nano)
@@ -1161,7 +1243,7 @@ func (r *Runner) setHeartbeatState(msg *message.Message, workflowID, runID, node
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), heartbeatKVTimeout)
 	defer cancel()
-	if _, err := r.heartbeatKV.Put(ctx, executionHeartbeatKey(workflowID, runID, nodeID), payload); err != nil {
+	if _, err := kv.Put(ctx, executionHeartbeatKey(workflowID, runID, nodeID), payload); err != nil {
 		r.logger.Warn("Failed to write execution heartbeat state",
 			zap.String("workflow_id", workflowID),
 			zap.String("run_id", runID),
@@ -1222,8 +1304,9 @@ func (r *Runner) willRetry(msg *message.Message, processErr error, attempt int) 
 //   - published but not acked: the unit is complete; mark it done so a redelivery is Term'd;
 //   - not published, attempts left: retry after a delay, publishing nothing;
 //   - otherwise: report one final failure.
-func (r *Runner) handleReportSuccessError(span trace.Span, msg *message.Message, workflowID, runID, nodeID, executionID, correlationID string, reportErr error) error {
+func (r *Runner) handleReportSuccessError(span trace.Span, msg *message.Message, workflowID, runID, nodeID, executionID, correlationID string, reportErr error, result message.Message) error {
 	if errors.Is(reportErr, message.ErrAckAfterPublish) {
+		r.setLocalExecution(executionID, localDone)
 		r.logger.Warn("Result published but the source message was not acked; a redelivery will be dropped as a duplicate",
 			zap.String("workflowID", workflowID),
 			zap.String("execution_id", executionID),
@@ -1236,6 +1319,8 @@ func (r *Runner) handleReportSuccessError(span trace.Span, msg *message.Message,
 	}
 	attempt := deliverAttempt(msg)
 	if errors.Is(reportErr, message.ErrResultNotPublished) && r.willRetry(msg, reportErr, attempt) {
+		// Keep the result: the redelivery publishes it rather than running the unit again.
+		r.keepUnpublished(executionID, result)
 		delay := retryDelay(attempt)
 		r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Now().Add(delay))
 		r.logger.Warn("Result not published; retrying the unit after a delay",
@@ -1264,6 +1349,7 @@ func (r *Runner) handleReportSuccessError(span trace.Span, msg *message.Message,
 		r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatRetrying, time.Time{})
 		return reportErr
 	}
+	r.setLocalExecution(executionID, localDone)
 	r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatDone, time.Time{})
 	return reportErr
 }
@@ -1279,14 +1365,22 @@ func (r *Runner) handleReportSuccessError(span trace.Span, msg *message.Message,
 //
 // Failures are logged, not propagated: a missed extension costs a redelivery, whereas failing
 // the message would discard work that is still in progress.
-func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, workflowID, runID, nodeID string) func() {
+//
+// It returns two functions. stopKV ends the EXECUTION_HEARTBEATS "running" writes and is called
+// when Process returns, so a late refresh can never overwrite the unit's final state. stop ends
+// the ack-deadline extension as well, and is called once the message is settled: the deadline must
+// keep being extended while the result is reported, or a report that is slow (NATS partitioned)
+// lets the deadline lapse, the unit is redelivered while this pod is still reporting it, and it
+// runs twice. Both are idempotent.
+func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, workflowID, runID, nodeID string) (stopKV func(), stop func()) {
 	if msg == nil || msg.GetJetStreamMsg() == nil {
-		return func() {} // Core NATS or a synthesised message: nothing to extend.
+		return func() {}, func() {} // Core NATS or a synthesised message: nothing to extend.
 	}
 
 	// hbCtx ends when stop is called, so stop never waits on a KV write in flight.
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	stopped := make(chan struct{})
+	var kvStopped atomic.Bool
 
 	executionID := ""
 	if msg.Payload != nil {
@@ -1324,7 +1418,7 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 					zap.String("node_id", nodeID))
 
 				tick++
-				if r.heartbeatKV == nil || tick%executionHeartbeatEveryNTicks != 0 {
+				if tick%executionHeartbeatEveryNTicks != 0 || kvStopped.Load() {
 					continue
 				}
 				hb := executionHeartbeat{
@@ -1336,6 +1430,7 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 					Pod:         pod,
 					StartedAt:   startedAt,
 					State:       heartbeatRunning,
+					Owner:       processToken,
 				}
 				payload, marshalErr := json.Marshal(hb)
 				if marshalErr != nil {
@@ -1344,8 +1439,12 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 				}
 				// Put, not Create: the claim in processMessage already Created this key before
 				// this ticker started, so this pod owns it. Every write here is a refresh.
+				kv := r.heartbeats(hbCtx)
+				if kv == nil {
+					continue
+				}
 				putCtx, putCancel := context.WithTimeout(hbCtx, heartbeatKVTimeout)
-				_, err := r.heartbeatKV.Put(putCtx, key, payload)
+				_, err := kv.Put(putCtx, key, payload)
 				putCancel()
 				if err != nil {
 					r.logger.Warn("Failed to write execution heartbeat; Zeus's sweeper may see this unit as stalled while it is actually running",
@@ -1358,9 +1457,13 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 		}
 	}()
 
-	return func() {
-		hbCancel()
-		<-stopped
+	var once sync.Once
+	return func() { kvStopped.Store(true) }, func() {
+		once.Do(func() {
+			kvStopped.Store(true)
+			hbCancel()
+			<-stopped
+		})
 	}
 }
 
@@ -1493,14 +1596,55 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	// (a redelivery landing on a different pod while the first pod is still alive and
 	// heartbeating) backs off instead of running the plugin twice. This is the idempotency
 	// replacement for Temporal's deterministic-workflow-ID dedup.
+	// A redelivery of a unit this process is still handling (its report slowed by a partition) or
+	// has already finished must not run it again. The claim store cannot tell when this pod's own
+	// writes to it failed in the same partition: it then sees a stale "running" entry and lets the
+	// redelivery take over.
+	switch r.localExecution(executionID) {
+	case localRunning:
+		r.logger.Info("Execution unit is still being handled by this process; redelivering later",
+			zap.String("stream", r.stream), zap.String("execution_id", executionID))
+		if err := msg.NakWithDelay(claimBusyNakDelay); err != nil {
+			r.logger.Warn("Failed to nak a redelivery of a unit still in progress", zap.Error(err))
+		}
+		return nil
+	case localDone:
+		r.logger.Info("Execution unit already finished by this process; terminating duplicate delivery",
+			zap.String("stream", r.stream), zap.String("execution_id", executionID))
+		if err := msg.Term(); err != nil {
+			r.logger.Warn("Failed to terminate duplicate delivery", zap.Error(err))
+		}
+		return nil
+	}
 	if !r.claimOrNak(processCtx, msg, workflowID, runID, nodeID, executionID) {
+		return nil
+	}
+	r.setLocalExecution(executionID, localRunning)
+	defer r.clearLocalRunning(executionID)
+
+	// A unit that already succeeded here, but whose result could not be published, is not run
+	// again: its kept result is published instead. Running it again repeated every side effect it
+	// has (an email, an upload, an HTTP call) after any NATS outage the publish could not ride out;
+	// the chaos suite saw whole chains execute twice after a partition.
+	if kept, ok := r.takeUnpublished(executionID); ok {
+		r.logger.Info("Publishing the kept result of an already-executed unit instead of running it again",
+			zap.String("workflowID", workflowID),
+			zap.String("execution_id", executionID))
+		reportCtx, reportCancel := context.WithTimeout(backgroundWithSpan(span), 10*time.Minute)
+		defer reportCancel()
+		if reportErr := r.client.Messages.ReportSuccess(reportCtx, kept, msg.GetJetStreamMsg()); reportErr != nil {
+			return r.handleReportSuccessError(span, msg, workflowID, runID, nodeID, executionID, correlationID, reportErr, kept)
+		}
+		r.setLocalExecution(executionID, localDone)
+		r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatDone, time.Time{})
 		return nil
 	}
 
 	// Hold the JetStream ack deadline open for as long as Process runs. Without this, any
 	// handler slower than the server's AckWait is redelivered while it is still executing —
 	// see startAckHeartbeat.
-	stopHeartbeat := r.startAckHeartbeat(processCtx, msg, workflowID, runID, nodeID)
+	stopKVHeartbeat, stopHeartbeat := r.startAckHeartbeat(processCtx, msg, workflowID, runID, nodeID)
+	defer stopHeartbeat()
 
 	if r.unitObserver != nil {
 		r.unitObserver.UnitStarted(r.stream, time.Duration(queueWaitMs)*time.Millisecond, payloadBytes(msg.Payload))
@@ -1509,7 +1653,7 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 	// Process the message
 	processStart := time.Now()
 	resultMessage, processErr := r.processor.Process(processCtx, msg)
-	stopHeartbeat()
+	stopKVHeartbeat()
 	processingTime := time.Since(start)
 	if r.unitObserver != nil {
 		r.unitObserver.UnitFinished(r.stream, time.Since(processStart), processErr, payloadBytes(resultMessage.Payload))
@@ -1746,8 +1890,9 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		reportCtx, reportCancel := context.WithTimeout(backgroundWithSpan(span), 10*time.Minute)
 		defer reportCancel()
 		if reportErr := r.client.Messages.ReportSuccess(reportCtx, resultMessage, msg.GetJetStreamMsg()); reportErr != nil {
-			return r.handleReportSuccessError(span, msg, workflowID, runID, nodeID, executionID, correlationID, reportErr)
+			return r.handleReportSuccessError(span, msg, workflowID, runID, nodeID, executionID, correlationID, reportErr, resultMessage)
 		}
+		r.setLocalExecution(executionID, localDone)
 		r.setHeartbeatState(msg, workflowID, runID, nodeID, executionID, heartbeatDone, time.Time{})
 	} else {
 		// If we don't have workflow info, still ack the message since processing succeeded
@@ -1780,7 +1925,12 @@ func isFatalConsumeError(err error) bool {
 		errors.Is(err, jetstream.ErrConsumerNotFound) ||
 		errors.Is(err, jetstream.ErrConnectionClosed) ||
 		errors.Is(err, nats.ErrConnectionClosed) ||
-		errors.Is(err, nats.ErrConnectionDraining)
+		errors.Is(err, nats.ErrConnectionDraining) ||
+		// After the server's store is lost, a pull for the vanished durable gets no responder or
+		// no heartbeat, never "consumer deleted": resolve it again, which recreates the stream
+		// and the durable, instead of fetching from nothing until the stall watchdog fires.
+		errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, jetstream.ErrNoHeartbeat)
 }
 
 // tryReconnectNATS attempts to restore a dead NATS connection. Returns true on success.
@@ -1793,4 +1943,170 @@ func (r *Runner) tryReconnectNATS() bool {
 	}
 	r.logger.Info("NATS reconnected after transport failure")
 	return true
+}
+
+// claimUnavailableNakDelay is how long a delivery waits when the claim store cannot be used.
+const claimUnavailableNakDelay = 10 * time.Second
+
+// nakClaimUnavailable hands a message back for later because its execution unit could not be
+// claimed (the EXECUTION_HEARTBEATS bucket is unreachable or missing).
+func (r *Runner) nakClaimUnavailable(msg *message.Message, workflowID, runID, nodeID string, cause error) {
+	r.logger.Warn("Cannot claim execution unit (claim store unavailable); redelivering later instead of risking a second run",
+		zap.String("stream", r.stream),
+		zap.String("workflow_id", workflowID),
+		zap.String("run_id", runID),
+		zap.String("node_id", nodeID),
+		zap.Duration("nak_delay", claimUnavailableNakDelay),
+		zap.Error(cause))
+	if err := msg.NakWithDelay(claimUnavailableNakDelay); err != nil {
+		r.logger.Warn("Failed to nak message after a claim-store failure", zap.Error(err))
+	}
+}
+
+// heartbeats returns the EXECUTION_HEARTBEATS bucket, opening (or creating) it when the runner has
+// none or holds one bound to a connection the client has since replaced. It returns nil when the
+// bucket cannot be reached.
+func (r *Runner) heartbeats(ctx context.Context) jetstream.KeyValue {
+	r.heartbeatMu.Lock()
+	defer r.heartbeatMu.Unlock()
+	if r.client == nil || r.client.JetStream() == nil {
+		return r.heartbeatKV // nothing to reopen it from (an injected bucket in tests)
+	}
+	conn := r.client.Connection()
+	if r.heartbeatKV != nil && r.heartbeatConn == conn && (conn == nil || !conn.IsClosed()) {
+		return r.heartbeatKV
+	}
+	js := r.client.JetStream()
+	if js == nil {
+		return r.heartbeatKV
+	}
+	openCtx, cancel := context.WithTimeout(ctx, heartbeatKVTimeout)
+	defer cancel()
+	kv, err := js.KeyValue(openCtx, executionHeartbeatBucket)
+	if errors.Is(err, jetstream.ErrBucketNotFound) {
+		kv, err = js.CreateKeyValue(openCtx, message.HeartbeatBucketConfig())
+		if errors.Is(err, jetstream.ErrBucketExists) {
+			kv, err = js.KeyValue(openCtx, executionHeartbeatBucket)
+		}
+	}
+	if err != nil {
+		r.logger.Warn("EXECUTION_HEARTBEATS bucket unavailable", zap.Error(err))
+		r.heartbeatKV = nil
+		return nil
+	}
+	r.heartbeatKV = kv
+	r.heartbeatConn = conn
+	return kv
+}
+
+// bucketGone reports whether a KV error means the bucket itself no longer exists.
+func bucketGone(err error) bool {
+	// A KV call on a bucket whose stream has been deleted gets no responder at all: the stream's
+	// API subject has nobody behind it. That is the common case (bucket deleted, or lost with the
+	// server's store), and missing it left every claim failing closed with the bucket never made
+	// again.
+	return errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, jetstream.ErrStreamNotFound) ||
+		errors.Is(err, nats.ErrNoResponders) || errors.Is(err, jetstream.ErrNoStreamResponse)
+}
+
+// forgetHeartbeats drops the open bucket so heartbeats opens it again.
+func (r *Runner) forgetHeartbeats() {
+	r.heartbeatMu.Lock()
+	r.heartbeatKV = nil
+	r.heartbeatMu.Unlock()
+}
+
+// maxUnpublishedResults bounds how many unpublished results a runner keeps. An outage long enough
+// to fill it drops the oldest, whose units then run again on redelivery, as they always did.
+const maxUnpublishedResults = 10000
+
+// keepUnpublished keeps the result of a unit that succeeded but could not be published.
+func (r *Runner) keepUnpublished(executionID string, result message.Message) {
+	if executionID == "" {
+		return
+	}
+	r.unpublishedMu.Lock()
+	defer r.unpublishedMu.Unlock()
+	if r.unpublished == nil {
+		r.unpublished = make(map[string]message.Message)
+	}
+	if _, exists := r.unpublished[executionID]; !exists {
+		r.unpublishedOrder = append(r.unpublishedOrder, executionID)
+	}
+	r.unpublished[executionID] = result
+	for len(r.unpublishedOrder) > maxUnpublishedResults {
+		delete(r.unpublished, r.unpublishedOrder[0])
+		r.unpublishedOrder = r.unpublishedOrder[1:]
+	}
+}
+
+// takeUnpublished removes and returns the kept result for an execution, if there is one.
+func (r *Runner) takeUnpublished(executionID string) (message.Message, bool) {
+	if executionID == "" {
+		return message.Message{}, false
+	}
+	r.unpublishedMu.Lock()
+	defer r.unpublishedMu.Unlock()
+	result, ok := r.unpublished[executionID]
+	if ok {
+		delete(r.unpublished, executionID)
+		for i, id := range r.unpublishedOrder {
+			if id == executionID {
+				r.unpublishedOrder = append(r.unpublishedOrder[:i], r.unpublishedOrder[i+1:]...)
+				break
+			}
+		}
+	}
+	return result, ok
+}
+
+const (
+	localRunning = 1
+	localDone    = 2
+	// maxLocalExecutions bounds the executions a runner remembers as finished.
+	maxLocalExecutions = 20000
+)
+
+// localExecution says whether this process is handling, or has finished, an execution.
+func (r *Runner) localExecution(executionID string) int {
+	if executionID == "" {
+		return 0
+	}
+	r.localMu.Lock()
+	defer r.localMu.Unlock()
+	return r.local[executionID]
+}
+
+func (r *Runner) setLocalExecution(executionID string, state int) {
+	if executionID == "" {
+		return
+	}
+	r.localMu.Lock()
+	defer r.localMu.Unlock()
+	if r.local == nil {
+		r.local = make(map[string]int)
+	}
+	if _, seen := r.local[executionID]; !seen {
+		r.localOrder = append(r.localOrder, executionID)
+	}
+	r.local[executionID] = state
+	for len(r.localOrder) > maxLocalExecutions {
+		oldest := r.localOrder[0]
+		r.localOrder = r.localOrder[1:]
+		if r.local[oldest] != localRunning {
+			delete(r.local, oldest)
+		}
+	}
+}
+
+// clearLocalRunning forgets an execution that ended without finishing (it will be retried).
+func (r *Runner) clearLocalRunning(executionID string) {
+	if executionID == "" {
+		return
+	}
+	r.localMu.Lock()
+	defer r.localMu.Unlock()
+	if r.local[executionID] == localRunning {
+		delete(r.local, executionID)
+	}
 }

@@ -238,7 +238,7 @@ func TestStartAckHeartbeat_ExtendsUntilStopped(t *testing.T) {
 	jsMsg := &heartbeatMsg{}
 	msg := buildMessageFor(t, jsMsg)
 
-	stop := newHeartbeatRunner().startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
+	_, stop := newHeartbeatRunner().startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
 	time.Sleep(60 * time.Millisecond)
 	stop()
 
@@ -264,7 +264,7 @@ func TestStartAckHeartbeat_StopsOnContextCancellation(t *testing.T) {
 	msg := buildMessageFor(t, jsMsg)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	stop := newHeartbeatRunner().startAckHeartbeat(ctx, msg, "wf1", "run1", "node1")
+	_, stop := newHeartbeatRunner().startAckHeartbeat(ctx, msg, "wf1", "run1", "node1")
 	cancel()
 
 	// stop() blocks until the goroutine exits, so this returning at all proves cancellation
@@ -287,7 +287,7 @@ func TestStartAckHeartbeat_SurvivesExtensionFailure(t *testing.T) {
 	jsMsg := &heartbeatMsg{err: context.DeadlineExceeded}
 	msg := buildMessageFor(t, jsMsg)
 
-	stop := newHeartbeatRunner().startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
+	_, stop := newHeartbeatRunner().startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
 	time.Sleep(60 * time.Millisecond)
 	stop()
 
@@ -301,7 +301,7 @@ func TestStartAckHeartbeat_SurvivesExtensionFailure(t *testing.T) {
 func TestStartAckHeartbeat_NoJetStreamMessageIsNoOp(t *testing.T) {
 	withShortHeartbeat(t, 5*time.Millisecond)
 
-	stop := newHeartbeatRunner().startAckHeartbeat(context.Background(), message.NewMessage(), "wf1", "run1", "node1")
+	_, stop := newHeartbeatRunner().startAckHeartbeat(context.Background(), message.NewMessage(), "wf1", "run1", "node1")
 	time.Sleep(20 * time.Millisecond)
 	stop()
 	stop() // idempotent
@@ -314,7 +314,7 @@ func TestStartAckHeartbeat_StopIsIdempotent(t *testing.T) {
 	jsMsg := &heartbeatMsg{}
 	msg := buildMessageFor(t, jsMsg)
 
-	stop := newHeartbeatRunner().startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
+	_, stop := newHeartbeatRunner().startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
 
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
@@ -333,7 +333,7 @@ func TestStartAckHeartbeat_WritesExecutionHeartbeat(t *testing.T) {
 	msg := buildMessageFor(t, jsMsg)
 	kv := &fakeHeartbeatKV{}
 
-	stop := newHeartbeatRunnerWithKV(kv).startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
+	_, stop := newHeartbeatRunnerWithKV(kv).startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
 	time.Sleep(60 * time.Millisecond) // ~12 ticks at 5ms, so ~4 KV writes expected
 	stop()
 
@@ -360,7 +360,7 @@ func TestStartAckHeartbeat_SurvivesKVWriteFailure(t *testing.T) {
 	msg := buildMessageFor(t, jsMsg)
 	kv := &fakeHeartbeatKV{putErr: context.DeadlineExceeded}
 
-	stop := newHeartbeatRunnerWithKV(kv).startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
+	_, stop := newHeartbeatRunnerWithKV(kv).startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
 	time.Sleep(60 * time.Millisecond)
 	stop()
 
@@ -396,6 +396,44 @@ func TestClaimOrNak_RunningElsewhere_NaksWithDelay(t *testing.T) {
 	}
 	if got := jsMsg.delayedNaks(); len(got) != 1 || got[0] != claimBusyNakDelay {
 		t.Fatalf("NakWithDelay calls = %v, want [%v]", got, claimBusyNakDelay)
+	}
+}
+
+// A claim this process wrote itself, for this execution, whose Create reply was lost (the server
+// stored it; the runner saw a timeout and redelivered later) is taken over, not read as someone
+// else's. It used to back every redelivery off until the deliveries ran out (chaos CN-06).
+func TestClaimOrNak_OwnOrphanedClaim_TakesOver(t *testing.T) {
+	kv := &fakeHeartbeatKV{}
+	kv.seed(t, claimKey, executionHeartbeat{ExecutionID: "exec1", State: heartbeatRunning, Owner: processToken}, time.Now())
+
+	if !claimWith(t, kv, &heartbeatMsg{numDelivered: 2}, "exec1") {
+		t.Fatal("this process's own orphaned claim must be taken over")
+	}
+}
+
+// Another process's live claim on the same execution is still respected.
+func TestClaimOrNak_OtherProcessClaim_NaksWithDelay(t *testing.T) {
+	kv := &fakeHeartbeatKV{}
+	kv.seed(t, claimKey, executionHeartbeat{ExecutionID: "exec1", State: heartbeatRunning, Owner: "another-process"}, time.Now())
+	jsMsg := &heartbeatMsg{numDelivered: 2}
+
+	if claimWith(t, kv, jsMsg, "exec1") {
+		t.Fatal("another process's live claim must not be taken over")
+	}
+	if got := jsMsg.delayedNaks(); len(got) != 1 || got[0] != claimBusyNakDelay {
+		t.Fatalf("NakWithDelay calls = %v, want [%v]", got, claimBusyNakDelay)
+	}
+}
+
+// Every claim records the process that wrote it.
+func TestClaimOrNak_RecordsOwner(t *testing.T) {
+	kv := &fakeHeartbeatKV{}
+	if !claimWith(t, kv, &heartbeatMsg{}, "exec1") {
+		t.Fatal("expected to win a fresh claim")
+	}
+	hb, _ := kv.entry(t, claimKey)
+	if hb.Owner != processToken || hb.Owner == "" {
+		t.Fatalf("claim owner = %q, want this process (%q)", hb.Owner, processToken)
 	}
 }
 
@@ -476,11 +514,15 @@ func TestClaimOrNak_LosesTakeoverRace_NaksWithDelay(t *testing.T) {
 // TestClaimOrNak_KVUnreachable_ProcessesAnyway asserts that a KV error other than a lost claim
 // (bucket unreachable, etc.) fails OPEN: processing proceeds rather than being blocked by an
 // unrelated KV outage.
-func TestClaimOrNak_KVUnreachable_ProcessesAnyway(t *testing.T) {
+func TestClaimOrNak_KVUnreachable_WaitsInsteadOfRunning(t *testing.T) {
 	kv := &fakeHeartbeatKV{getErr: context.DeadlineExceeded}
+	jsMsg := &heartbeatMsg{}
 
-	if !claimWith(t, kv, &heartbeatMsg{}, "exec1") {
-		t.Fatal("expected claimOrNak to fail open (proceed=true) when the KV is unreachable")
+	if claimWith(t, kv, jsMsg, "exec1") {
+		t.Fatal("a unit that cannot be claimed must not run: it could be running elsewhere (D5, fail closed)")
+	}
+	if got := jsMsg.delayedNaks(); len(got) != 1 || got[0] != claimUnavailableNakDelay {
+		t.Fatalf("nak delays = %v, want one of %v", got, claimUnavailableNakDelay)
 	}
 }
 
