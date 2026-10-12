@@ -216,6 +216,9 @@ func TestIsFatalConsumeError(t *testing.T) {
 		{jetstream.ErrConnectionClosed, true},
 		{jetstream.ErrConsumerDeleted, true},
 		{jetstream.ErrConsumerNotFound, true},
+		// What a pull gets once the server's store is lost.
+		{nats.ErrNoResponders, true},
+		{fmt.Errorf("fetch: %w", jetstream.ErrNoHeartbeat), true},
 		{errors.New("pull rejected"), false},
 		{nil, false},
 	} {
@@ -384,7 +387,7 @@ func TestStartAckHeartbeat_StopDoesNotWaitOnHungKVWrite(t *testing.T) {
 
 	kv := &hangingKV{fakeHeartbeatKV: &fakeHeartbeatKV{}, putStarted: make(chan struct{})}
 	msg := buildMessageFor(t, &heartbeatMsg{})
-	stop := newHeartbeatRunnerWithKV(kv).startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
+	_, stop := newHeartbeatRunnerWithKV(kv).startAckHeartbeat(context.Background(), msg, "wf1", "run1", "node1")
 
 	select {
 	case <-kv.putStarted:
@@ -402,7 +405,7 @@ func TestStartAckHeartbeat_StopDoesNotWaitOnHungKVWrite(t *testing.T) {
 
 // A claim whose KV reply never comes fails open after heartbeatKVTimeout instead of holding the
 // worker for the whole process context.
-func TestClaimOrNak_HungKV_FailsOpenAfterTimeout(t *testing.T) {
+func TestClaimOrNak_HungKV_FailsClosedAfterTimeout(t *testing.T) {
 	original := heartbeatKVTimeout
 	heartbeatKVTimeout = 50 * time.Millisecond
 	t.Cleanup(func() { heartbeatKVTimeout = original })
@@ -415,8 +418,8 @@ func TestClaimOrNak_HungKV_FailsOpenAfterTimeout(t *testing.T) {
 	}()
 	select {
 	case proceed := <-done:
-		if !proceed {
-			t.Fatal("a claim the KV never answered must fail open")
+		if proceed {
+			t.Fatal("a claim the KV never answered must fail closed: the unit waits rather than risk running twice")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("claimOrNak waited on a hung KV call")

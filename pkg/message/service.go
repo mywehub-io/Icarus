@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -160,14 +161,14 @@ func (s *MessageService) EnsureStream(ctx context.Context, streamName string) er
 				subjects = []string{s.resultSubject}
 			}
 
-			streamConfig := WithSizeCap(jetstream.StreamConfig{
+			streamConfig := WorkStreamConfig(jetstream.StreamConfig{
 				Name:     streamName,
 				Subjects: subjects,
 				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
 				Replicas: 1,
-			}, DefaultWorkStreamMaxBytes)
+			})
 
 			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
@@ -310,14 +311,14 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 				zap.String("subject", s.resultSubject),
 				zap.Bool("is_result_stream", true))
 
-			streamConfig := WithSizeCap(jetstream.StreamConfig{
+			streamConfig := WorkStreamConfig(jetstream.StreamConfig{
 				Name:     streamName,
 				Subjects: []string{s.resultSubject},
 				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
 				Replicas: 1,
-			}, DefaultWorkStreamMaxBytes)
+			})
 
 			_, err = s.js.CreateStream(ctx, streamConfig)
 			if err != nil {
@@ -381,8 +382,20 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 	// Retry logic for critical result publishing
 	var publishErr error
 	var pubAck *jetstream.PubAck
+	// One dedup id per execution: a retry after a lost acknowledgement, or the same execution
+	// reported twice, is stored once inside the stream's duplicate window.
+	var pubOpts []jetstream.PublishOpt
+	if resultMsg.ExecutionID != "" {
+		pubOpts = append(pubOpts, jetstream.WithMsgID("result:"+resultMsg.ExecutionID))
+	}
 	for attempt := 1; attempt <= s.publishMaxRetries; attempt++ {
-		pubAck, publishErr = s.js.Publish(ctx, publishSubject, data)
+		// Each attempt gets its own short deadline. The caller's context can run for minutes (large
+		// results); bound only by it, an attempt sent over a connection that died in a partition
+		// waited for an acknowledgement that could never come, the unit's lease kept being extended,
+		// and the run stalled for the whole report window instead of being retried promptly.
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, resultPublishAttemptTimeout)
+		pubAck, publishErr = s.js.Publish(attemptCtx, publishSubject, data, pubOpts...)
+		attemptCancel()
 		if publishErr == nil {
 			break
 		}
@@ -671,9 +684,7 @@ func (s *MessageService) ReportError(ctx context.Context, executionID, workflowI
 		zap.String("error_code", errorCode))
 
 	// Extract node ID from execution ID
-	// Format: {workflowID}-{nodeID}-{timestamp}
-	// We need to extract the nodeID part
-	nodeID := ExtractNodeIDFromExecutionID(executionID, workflowID)
+	nodeID := NodeIDFromExecutionID(executionID, workflowID, runID)
 
 	s.logger.Debug("Extracted nodeID from executionID",
 		zap.String("execution_id", executionID),
@@ -814,6 +825,41 @@ func jetStreamDeliverCountStr(msg jetstream.Msg) string {
 	return ""
 }
 
+// NodeIDFromExecutionID extracts the nodeID from an executionID in either format Zeus has used:
+// {workflowID}-{runID}-{nodeID}-{timestamp}-{seq} (current) and {workflowID}-{nodeID}-{timestamp}.
+// Zeus added the run id and a sequence number so two runs dispatched in the same instant get
+// different execution ids; parsing the new form with the old rules left the run id and the
+// timestamp in the node id, so Zeus could not find the failed node in its plan and treated every
+// failure as having no error handler. Exactly two numeric segments are dropped from the new form,
+// never "every trailing number": a UUID's last group can be all digits.
+func NodeIDFromExecutionID(executionID, workflowID, runID string) string {
+	if runID != "" {
+		if rest, ok := strings.CutPrefix(executionID, workflowID+"-"+runID+"-"); ok {
+			for range 2 {
+				i := strings.LastIndexByte(rest, '-')
+				if i <= 0 || !allDigits(rest[i+1:]) {
+					return rest
+				}
+				rest = rest[:i]
+			}
+			return rest
+		}
+	}
+	return ExtractNodeIDFromExecutionID(executionID, workflowID)
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // ExtractNodeIDFromExecutionID extracts the base nodeID from a compound executionID.
 // ExecutionID format: {workflowID}-{nodeID}-{timestamp}
 // Example: "4b45d6f2-ee47-490e-b5c4-86754d95aaa9-8ff422ee-5ed1-421c-8967-1dc1c996b895-1767712791219504964"
@@ -863,8 +909,11 @@ func (s *MessageService) ensureSizeCap(ctx context.Context, stream jetstream.Str
 	if !ok {
 		return nil
 	}
-	return EnsureSizeCap(ctx, u, stream, DefaultWorkStreamMaxBytes, s.logger)
+	return EnsureStreamPolicy(ctx, u, stream, WorkStream, s.logger)
 }
+
+// resultPublishAttemptTimeout bounds one attempt to publish a result.
+const resultPublishAttemptTimeout = 10 * time.Second
 
 // errorDetailOf reads the structured detail a failure carries, if any: the failing node (an
 // embedded runtime ProcessingError) and an author's code and message (an Error plugin's

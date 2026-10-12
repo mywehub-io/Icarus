@@ -154,8 +154,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	// during reconnect; a stale service returns transport errors (retried) instead of
 	// panicking on a nil pointer. This is a pointer swap only — no hot-path locking.
 	if c.conn != nil && !c.conn.IsConnected() {
+		// Close the abandoned connection rather than just dropping it. It was set never to stop
+		// reconnecting, so a dropped one kept redialling in the background, leaking a connection
+		// per outage and holding whatever was bound to it alive.
+		old := c.conn
 		c.conn = nil
 		c.js = nil
+		old.Close()
 	}
 
 	if c.config != nil && c.logger != nil {
