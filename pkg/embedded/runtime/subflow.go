@@ -1301,9 +1301,10 @@ func (sp *SubflowProcessor) processDepthLevelParallel(
 					sp.emitEmbeddedNodeEndedOnce(ctx, config, true, out.Error.Error())
 				}
 				result.err = &EmbeddedNodeFailureError{
-					FailedNodeID:    config.NodeId,
-					FailedNodeLabel: config.Label,
-					Cause:           out.Error,
+					FailedNodeID:         config.NodeId,
+					FailedNodeLabel:      config.Label,
+					FailedNodePluginType: config.PluginType,
+					Cause:                out.Error,
 				}
 				resultChan <- result
 				return
@@ -1476,9 +1477,10 @@ func (sp *SubflowProcessor) processSingleNodeAtDepth(
 			sp.emitEmbeddedNodeEndedOnce(ctx, config, true, out.Error.Error())
 		}
 		return &EmbeddedNodeFailureError{
-			FailedNodeID:    config.NodeId,
-			FailedNodeLabel: config.Label,
-			Cause:           out.Error,
+			FailedNodeID:         config.NodeId,
+			FailedNodeLabel:      config.Label,
+			FailedNodePluginType: config.PluginType,
+			Cause:                out.Error,
 		}
 	}
 
