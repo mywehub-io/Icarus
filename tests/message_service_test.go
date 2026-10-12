@@ -363,6 +363,36 @@ func TestPublishResultUsesFlatSubject(t *testing.T) {
 	}
 }
 
+// TestNodeIDFromExecutionID covers both execution id formats Zeus has dispatched. The current one
+// carries the run id and a sequence number; parsed with the old rules it left the run id and the
+// timestamp in the node id, so Zeus never found a failed node's error handler or connector scope.
+func TestNodeIDFromExecutionID(t *testing.T) {
+	const (
+		wf   = "c74b1699-3a79-4fab-8827-51ebb4ff0e51"
+		run  = "a319311b-0fc9-4ee6-bbad-6e647de67001"
+		node = "11a76435-b54a-5e81-9cae-e512f3ca6827"
+		// A UUID whose last group is all digits: only the two numeric suffixes may be dropped.
+		digitNode = "11a76435-b54a-5e81-9cae-123456789012"
+	)
+	tests := []struct {
+		name, executionID, runID, want string
+	}{
+		{"current format", wf + "-" + run + "-" + node + "-1791808473511882000-17", run, node},
+		{"current format, node id ends in digits", wf + "-" + run + "-" + digitNode + "-1791808473511882000-3", run, digitNode},
+		{"previous format", wf + "-" + node + "-1767712791219504964", run, node},
+		{"previous format without a run id", wf + "-" + node + "-1767712791219504964", "", node},
+		{"connector scope end (previous format, Zeus-built)", wf + "-" + node + "-1767712791219504964", run, node},
+		{"unrecognised", "something-else", run, "something-else"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := message.NodeIDFromExecutionID(tt.executionID, wf, tt.runID); got != tt.want {
+				t.Errorf("NodeIDFromExecutionID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExtractNodeIDFromExecutionID(t *testing.T) {
 	tests := []struct {
 		name        string

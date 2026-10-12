@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -683,9 +684,7 @@ func (s *MessageService) ReportError(ctx context.Context, executionID, workflowI
 		zap.String("error_code", errorCode))
 
 	// Extract node ID from execution ID
-	// Format: {workflowID}-{nodeID}-{timestamp}
-	// We need to extract the nodeID part
-	nodeID := ExtractNodeIDFromExecutionID(executionID, workflowID)
+	nodeID := NodeIDFromExecutionID(executionID, workflowID, runID)
 
 	s.logger.Debug("Extracted nodeID from executionID",
 		zap.String("execution_id", executionID),
@@ -824,6 +823,41 @@ func jetStreamDeliverCountStr(msg jetstream.Msg) string {
 		return strconv.FormatUint(md.NumDelivered, 10)
 	}
 	return ""
+}
+
+// NodeIDFromExecutionID extracts the nodeID from an executionID in either format Zeus has used:
+// {workflowID}-{runID}-{nodeID}-{timestamp}-{seq} (current) and {workflowID}-{nodeID}-{timestamp}.
+// Zeus added the run id and a sequence number so two runs dispatched in the same instant get
+// different execution ids; parsing the new form with the old rules left the run id and the
+// timestamp in the node id, so Zeus could not find the failed node in its plan and treated every
+// failure as having no error handler. Exactly two numeric segments are dropped from the new form,
+// never "every trailing number": a UUID's last group can be all digits.
+func NodeIDFromExecutionID(executionID, workflowID, runID string) string {
+	if runID != "" {
+		if rest, ok := strings.CutPrefix(executionID, workflowID+"-"+runID+"-"); ok {
+			for range 2 {
+				i := strings.LastIndexByte(rest, '-')
+				if i <= 0 || !allDigits(rest[i+1:]) {
+					return rest
+				}
+				rest = rest[:i]
+			}
+			return rest
+		}
+	}
+	return ExtractNodeIDFromExecutionID(executionID, workflowID)
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ExtractNodeIDFromExecutionID extracts the base nodeID from a compound executionID.
