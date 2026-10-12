@@ -75,6 +75,38 @@ func (e *ProcessingError) Unwrap() error {
 	return e.Cause
 }
 
+// FailedNode names the node that failed, for message.ReportError's error detail.
+func (e *ProcessingError) FailedNode() (nodeID, label, pluginType string) {
+	return e.NodeId, e.NodeLabel, e.PluginType
+}
+
+// CodedError is an error raised on purpose with an author-chosen code, by the Error plugin. The
+// code travels as the run's error code (message.ResultError.Code), and the message stays exactly as
+// the author wrote it (ResultError.Detail.Message), which a connector's error event carries
+// unchanged (workplans/connector D9).
+type CodedError struct {
+	Code    string
+	Message string
+}
+
+// Error renders the code ahead of the message, so the code is visible wherever the error text is.
+func (e *CodedError) Error() string {
+	if e.Code == "" {
+		return e.Message
+	}
+	return e.Code + ": " + e.Message
+}
+
+// ErrorCode returns the author's code.
+func (e *CodedError) ErrorCode() string { return e.Code }
+
+// Transient reports that a coded failure is never retried (message.TransientClassifier): an
+// author's Error step, or data that breaks a schema, fails the same way every time.
+func (e *CodedError) Transient() bool { return false }
+
+// RawMessage returns the author's message without the code.
+func (e *CodedError) RawMessage() string { return e.Message }
+
 // NewProcessingError creates a new processing error.
 func NewProcessingError(nodeId, nodeLabel, pluginType string, itemIndex int, phase string, cause error) *ProcessingError {
 	return &ProcessingError{

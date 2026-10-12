@@ -531,6 +531,21 @@ type ResultError struct {
 	Message   string `json:"message"`        // Human-readable error message
 	Retryable bool   `json:"retryable"`      // Whether the error is retryable (transient vs permanent)
 	Type      string `json:"type,omitempty"` // Error type (e.g., "internal", "bad_request", "not_found")
+	// Detail names the node inside the unit that failed and carries its own message, when the
+	// failure says so. Zeus composes a connector step's error event from it (workplans/connector
+	// D9): the failing step's label, and an Error step's code and message exactly as authored.
+	Detail *ErrorDetail `json:"detail,omitempty"`
+}
+
+// ErrorDetail is the structured part of a ResultError. Every field is optional.
+type ErrorDetail struct {
+	NodeID     string `json:"node_id,omitempty"`
+	NodeLabel  string `json:"node_label,omitempty"`
+	PluginType string `json:"plugin_type,omitempty"`
+	// Code is an author's code (the Error plugin). Also copied to ResultError.Code.
+	Code string `json:"code,omitempty"`
+	// Message is the failing node's own message, without the unit's wrapping text.
+	Message string `json:"message,omitempty"`
 }
 
 // NewResultMessage creates a new result message with timestamps
