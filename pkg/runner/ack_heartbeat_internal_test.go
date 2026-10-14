@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 
@@ -29,14 +30,16 @@ type heartbeatMsg struct {
 	naks         atomic.Int64
 	terms        atomic.Int64
 	numDelivered uint64 // 0 means 1
+	headers      nats.Header
 
 	mu        sync.Mutex
 	nakDelays []time.Duration
 	err       error
 }
 
-func (m *heartbeatMsg) Data() []byte    { return m.data }
-func (m *heartbeatMsg) Subject() string { return "TEST.subject" }
+func (m *heartbeatMsg) Data() []byte         { return m.data }
+func (m *heartbeatMsg) Subject() string      { return "TEST.subject" }
+func (m *heartbeatMsg) Headers() nats.Header { return m.headers }
 
 func (m *heartbeatMsg) Metadata() (*jetstream.MsgMetadata, error) {
 	delivered := m.numDelivered
@@ -118,6 +121,8 @@ type fakeHeartbeatKV struct {
 	createErr error // returned by every Create call when set
 	updateErr error // returned by every Update call when set
 	putErr    error // returned by every Put call when set
+	// afterGet, when set, runs once right after the next Get, outside the lock.
+	afterGet func()
 }
 
 type fakeKVEntry struct {
@@ -172,11 +177,17 @@ func (kv *fakeHeartbeatKV) entry(t *testing.T, key string) (executionHeartbeat, 
 
 func (kv *fakeHeartbeatKV) Get(ctx context.Context, key string) (jetstream.KeyValueEntry, error) {
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	if kv.getErr != nil {
+		kv.mu.Unlock()
 		return nil, kv.getErr
 	}
 	e, ok := kv.entries[key]
+	afterGet := kv.afterGet
+	kv.afterGet = nil
+	kv.mu.Unlock()
+	if afterGet != nil {
+		afterGet() // another writer, between this read and the caller's write
+	}
 	if !ok {
 		return nil, jetstream.ErrKeyNotFound
 	}

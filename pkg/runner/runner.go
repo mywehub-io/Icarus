@@ -48,6 +48,8 @@ import (
 //     the runner calls ReportError, which publishes the failed result once and
 //     acks (permanent) or terminates (transient) the message, then invokes
 //     ProcessFailureObserver.
+//   - ErrHandOff (wrapped or not), while HandOffAllowed(ctx) → the unit is handed
+//     to another replica without using a delivery attempt (see ErrHandOff).
 //
 // Context: the ctx passed to Process is derived from the runner's main context
 // with an additional processTimeout deadline. When processTimeout fires,
@@ -158,7 +160,8 @@ func WithConsumerFilterSubject(filterSubject string) RunnerOption {
 //
 // Worker pool size: resolved at construction from Config.WorkerCount,
 // ICARUS_RUNNER_WORKERS env, ICARUS_RUNNER_WORKER_MULTIPLIER × GOMAXPROCS,
-// or GOMAXPROCS as the fallback (in that order).
+// or GOMAXPROCS as the fallback (in that order). With WithGate there is no pool:
+// the runner takes work as the Gate admits it and runs each unit in its own goroutine.
 type Runner struct {
 	client                *client.Client
 	processor             Processor
@@ -218,6 +221,20 @@ type Runner struct {
 	// connected reports whether the NATS connection is up; nil means r.client.IsConnected.
 	// A seam for tests, which have no real connection.
 	connected func() bool
+
+	// gate, when set, replaces the worker pool: the fetch loop takes only what it admits and runs
+	// each unit in its own goroutine (see WithGate).
+	gate Gate
+	// gateWaiting is true while the fetch loop waits on the gate. The process is then at capacity,
+	// so the runner has nothing to fetch for and is not stalled.
+	gateWaiting atomic.Bool
+	// inFlight holds, in gated mode, the UnixNano start time of each unit being processed, by a
+	// sequence number. It plays the role busySince plays for the worker pool.
+	inFlightMu  sync.Mutex
+	inFlight    map[uint64]int64
+	inFlightSeq uint64
+	// republish publishes a handed-off unit; nil means the client's JetStream. A seam for tests.
+	republish publishMsgFunc
 }
 
 // Config controls runner worker pool behavior.
@@ -373,6 +390,10 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 	for _, opt := range opts {
 		opt(runner)
 	}
+	if runner.gate != nil && cfg != nil && cfg.WorkerCount > 0 {
+		logger.Info("runner Config.WorkerCount is ignored: the runner takes work as its Gate admits it",
+			zap.String("stream", stream), zap.String("consumer", consumer), zap.Int("worker_count", cfg.WorkerCount))
+	}
 
 	// Ensure the stream and consumer exist, create them if necessary
 	ensureCtx := context.Background()
@@ -470,7 +491,9 @@ var fetchMaxWait = 10 * time.Second
 //
 // Startup: Run launches WorkerCount worker goroutines and one fetch goroutine. The fetch
 // goroutine waits until at least one worker is idle, fetches up to that many messages (capped
-// at batchSize) and hands each straight to a worker. It never holds a message no worker can
+// at batchSize) and hands each straight to a worker. With a Gate there are no workers: the fetch
+// goroutine waits until the gate admits at least one unit, fetches up to that many, and starts a
+// goroutine per message. It never holds a message no worker can
 // start, so every delivered message is processed at once, under its ack heartbeat. Work that
 // cannot start yet waits undelivered in the stream, where no ack deadline runs and no delivery
 // attempt is used, and where another replica with a free worker can take it.
@@ -504,19 +527,19 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.lastProgress.Store(time.Now().UnixNano())
 	r.running.Store(true)
 
-	// Start workers
-	for i := 0; i < r.config.WorkerCount; i++ {
-		processWG.Add(1)
-		go func(id int) {
-			defer processWG.Done()
-			r.worker(ctx, id)
-		}(i)
+	// Start workers. A gated runner has none: each unit runs in its own goroutine (runUnit).
+	if r.gate == nil {
+		for i := 0; i < r.config.WorkerCount; i++ {
+			processWG.Add(1)
+			go func(id int) {
+				defer processWG.Done()
+				r.worker(ctx, id)
+			}(i)
+		}
 	}
 
-	// handleMsg wraps a fetched JetStream message and hands it to a worker. The caller holds an
-	// idle token for it, so a worker is free and the send does not wait. It reports whether the
-	// message went to a worker; when it did not, the caller returns the token.
-	handleMsg := func(jsMsg jetstream.Msg) bool {
+	// toUnit wraps a fetched JetStream message, or naks it and returns nil when it is malformed.
+	toUnit := func(jsMsg jetstream.Msg) *message.Message {
 		msg, err := message.FromJetStreamMsg(jsMsg)
 		if err != nil {
 			deliverCount := ""
@@ -530,13 +553,32 @@ func (r *Runner) Run(ctx context.Context) error {
 				zap.String("jetstream_deliver_count", deliverCount),
 				zap.Error(err))
 			_ = jsMsg.Nak()
-			return false
+			return nil
 		}
 		if msg.Metadata == nil {
 			msg.Metadata = make(map[string]string)
 		}
 		if _, ok := msg.Metadata[message.MetaIcarusEnqueueUnixMs]; !ok {
 			msg.WithMetadata(message.MetaIcarusEnqueueUnixMs, fmt.Sprintf("%d", time.Now().UnixMilli()))
+		}
+		return msg
+	}
+
+	// handleMsg hands a fetched message to a worker, or in gated mode starts its goroutine. The
+	// caller holds an idle token or a gate slot for it, so the hand-over does not wait. It reports
+	// whether the message was taken; when it was not, the caller returns the token or slot.
+	handleMsg := func(jsMsg jetstream.Msg) bool {
+		msg := toUnit(jsMsg)
+		if msg == nil {
+			return false
+		}
+		if r.gate != nil {
+			processWG.Add(1)
+			go func() {
+				defer processWG.Done()
+				r.runUnit(ctx, msg)
+			}()
+			return true
 		}
 		select {
 		case r.jobChan <- msg:
@@ -553,6 +595,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		defer backgroundWG.Done()
 		r.watchdog(ctx)
 	}()
+
+	if obs, ok := r.unitObserver.(ConsumerObserver); ok {
+		backgroundWG.Add(1)
+		go func() {
+			defer backgroundWG.Done()
+			r.observeConsumer(ctx, obs)
+		}()
+	}
 
 	// Start the fetch goroutine.
 	backgroundWG.Add(1)
@@ -584,6 +634,10 @@ func (r *Runner) Run(ctx context.Context) error {
 			// client) cons is resolved again, or it keeps fetching over a connection that is
 			// closed or abandoned.
 			consConn *nats.Conn
+			// want is how many units a gated fetch asks for: as many as the consumer reported
+			// still waiting after the last fetch (up to batchSize), or 1 when nothing is, so an
+			// idle runner's open pull holds one slot rather than a batch.
+			want = 1
 		)
 		for {
 			if ctx.Err() != nil {
@@ -656,21 +710,22 @@ func (r *Runner) Run(ctx context.Context) error {
 				r.logger.Info("JetStream fetch started",
 					zap.String("stream", r.stream),
 					zap.String("consumer", r.consumer),
+					zap.Bool("gated", r.gate != nil),
 					zap.Int("worker_count", r.config.WorkerCount),
 					zap.Int("batch_size", r.batchSize),
 					zap.Int64("max_deliver", r.maxDeliver.Load()))
 				backoffDelay = 100 * time.Millisecond
 			}
 
-			want, ok := r.takeIdle(ctx)
+			taken, ok := r.takeSlots(ctx, want)
 			if !ok {
 				r.logger.Info("Shutting down message processor...")
 				return
 			}
 
-			batch, err := cons.Fetch(want, jetstream.FetchMaxWait(fetchMaxWait))
+			batch, err := cons.Fetch(taken, jetstream.FetchMaxWait(fetchMaxWait))
 			if err != nil {
-				r.returnIdle(want)
+				r.returnSlots(taken)
 				if ctx.Err() != nil {
 					return
 				}
@@ -681,12 +736,30 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 
 			handed := 0
+			var (
+				pendingAfter uint64
+				sawPending   bool
+			)
 			for jsMsg := range batch.Messages() {
+				if md, mdErr := jsMsg.Metadata(); mdErr == nil && md != nil {
+					pendingAfter, sawPending = md.NumPending, true
+				}
 				if handleMsg(jsMsg) {
 					handed++
 				}
 			}
-			r.returnIdle(want - handed)
+			r.returnSlots(taken - handed)
+			// Ask next for what is waiting: the last message's NumPending is how many the consumer
+			// still has undelivered. A fetch for more than is waiting stays open for fetchMaxWait,
+			// holding gate slots for work that is not there and taking whatever arrives meanwhile,
+			// however busy the process has become since the gate admitted it. With nothing waiting
+			// the runner holds one slot in an open pull.
+			switch {
+			case handed == 0 || !sawPending || pendingAfter == 0:
+				want = 1
+			default:
+				want = int(min(pendingAfter, uint64(r.batchSize)))
+			}
 
 			if berr := batch.Error(); berr != nil {
 				if ctx.Err() != nil {
@@ -755,6 +828,105 @@ func (r *Runner) returnIdle(n int) {
 	}
 }
 
+// takeSlots waits until the runner may take more work and returns how many units the next fetch
+// may ask for. With a gate it asks the gate for up to want (capped at batchSize); without one it
+// takes idle workers (takeIdle), and want is not used. It returns false when ctx ends first.
+func (r *Runner) takeSlots(ctx context.Context, want int) (int, bool) {
+	if r.gate == nil {
+		return r.takeIdle(ctx)
+	}
+	want = max(1, min(want, r.batchSize))
+	r.gateWaiting.Store(true)
+	n, err := r.gate.Acquire(ctx, want)
+	r.gateWaiting.Store(false)
+	if err != nil || ctx.Err() != nil {
+		if err == nil && n > 0 {
+			r.gate.Release(n)
+		}
+		return 0, false
+	}
+	n = max(1, min(n, want))
+	// Waiting on the gate is not a stall, and the watchdog must not count it as time without a
+	// fetch once the loop moves on to the fetch it now makes.
+	r.lastProgress.Store(time.Now().UnixNano())
+	return n, true
+}
+
+// returnSlots gives back n slots takeSlots granted but the fetch did not use.
+func (r *Runner) returnSlots(n int) {
+	if n <= 0 {
+		return
+	}
+	if r.gate != nil {
+		r.gate.Release(n)
+		return
+	}
+	r.returnIdle(n)
+}
+
+// runUnit processes one unit in gated mode and gives its gate slot back.
+func (r *Runner) runUnit(ctx context.Context, msg *message.Message) {
+	defer r.gate.Release(1)
+	id := r.trackStart()
+	if err := r.processMessage(ctx, msg); err != nil {
+		r.logger.Error("Message processing failed", zap.Error(err))
+	}
+	r.trackEnd(id)
+	r.lastProgress.Store(time.Now().UnixNano())
+}
+
+// trackStart records a gated unit as in flight and returns its id for trackEnd.
+func (r *Runner) trackStart() uint64 {
+	r.inFlightMu.Lock()
+	defer r.inFlightMu.Unlock()
+	if r.inFlight == nil {
+		r.inFlight = make(map[uint64]int64)
+	}
+	r.inFlightSeq++
+	r.inFlight[r.inFlightSeq] = time.Now().UnixNano()
+	return r.inFlightSeq
+}
+
+func (r *Runner) trackEnd(id uint64) {
+	r.inFlightMu.Lock()
+	defer r.inFlightMu.Unlock()
+	delete(r.inFlight, id)
+}
+
+// consumerObserveInterval is how often a runner whose observer implements ConsumerObserver reads
+// its consumer's state. A var so tests can shorten it.
+var consumerObserveInterval = 15 * time.Second
+
+// observeConsumer reports the consumer's backlog to obs every consumerObserveInterval until ctx
+// ends. A failed read is skipped: the next tick tries again.
+func (r *Runner) observeConsumer(ctx context.Context, obs ConsumerObserver) {
+	ticker := time.NewTicker(consumerObserveInterval)
+	defer ticker.Stop()
+	read := func() {
+		readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		// Resolving the consumer is one CONSUMER.INFO request, and the handle caches its reply.
+		cons, err := r.client.Messages.GetConsumer(readCtx, r.stream, r.consumer)
+		if err != nil {
+			return
+		}
+		info := cons.CachedInfo()
+		if info == nil {
+			return
+		}
+		obs.ConsumerObserved(r.stream, info.NumPending, info.NumAckPending)
+	}
+	read()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			read()
+		}
+	}
+}
+
 // handleFetchError logs a fetch failure and prepares the next attempt: a deleted or missing
 // consumer is resolved again and a dead transport is reconnected. It reports whether the loop
 // should back off before fetching again.
@@ -816,21 +988,41 @@ func (r *Runner) stallReason(now time.Time) string {
 		return fmt.Sprintf("a worker has held one unit for %s, past processTimeout (%s) plus %s",
 			oldest.Round(time.Second), r.processTimeout, workerStuckGrace)
 	}
-	if busy >= len(r.busySince) {
+	if r.gate != nil {
+		if r.gateWaiting.Load() {
+			return "" // the process is at capacity: there is nothing to fetch for
+		}
+	} else if busy >= len(r.busySince) {
 		return "" // every worker is busy within its deadline: there is nothing to fetch for
 	}
 	if !r.isConnected() {
 		return ""
 	}
 	if since := now.Sub(time.Unix(0, r.lastProgress.Load())); since > r.config.StallTimeout {
+		if r.gate != nil {
+			return fmt.Sprintf("no successful fetch for %s with %d units in flight and the gate open",
+				since.Round(time.Second), busy)
+		}
 		return fmt.Sprintf("no successful fetch for %s with %d of %d workers idle",
 			since.Round(time.Second), len(r.busySince)-busy, len(r.busySince))
 	}
 	return ""
 }
 
-// busyWorkers returns how many workers hold a message and how long the oldest has held its own.
+// busyWorkers returns how many workers (in gated mode, units) hold a message and how long the
+// oldest has held its own.
 func (r *Runner) busyWorkers(now time.Time) (busy int, oldest time.Duration) {
+	if r.gate != nil {
+		r.inFlightMu.Lock()
+		defer r.inFlightMu.Unlock()
+		for _, since := range r.inFlight {
+			busy++
+			if d := now.Sub(time.Unix(0, since)); d > oldest {
+				oldest = d
+			}
+		}
+		return busy, oldest
+	}
 	for i := range r.busySince {
 		since := r.busySince[i].Load()
 		if since == 0 {
@@ -897,6 +1089,7 @@ func (r *Runner) watchdog(ctx context.Context) {
 				zap.String("stream", r.stream),
 				zap.String("consumer", r.consumer),
 				zap.String("reason", reason),
+				zap.Bool("gated", r.gate != nil),
 				zap.Int("idle_slots", len(r.idle)),
 				zap.Int("in_flight", busy),
 				zap.Int("worker_count", len(r.busySince)),
@@ -998,6 +1191,9 @@ const (
 	// heartbeatDone: the unit's result is published. A redelivery of the same execution is a
 	// duplicate and is terminated.
 	heartbeatDone = "done"
+	// heartbeatQueued: the unit was handed off and waits in its stream as a new message, at
+	// QueuedStream/QueuedSeq; the next delivery takes the claim over (see handOff).
+	heartbeatQueued = "queued"
 )
 
 // claimStaleAfter is how long a running entry may go without a write before its pod is presumed
@@ -1026,6 +1222,11 @@ type executionHeartbeat struct {
 	// Owner identifies the runner process that wrote the entry (processToken). Pod alone cannot:
 	// HOSTNAME is empty outside Kubernetes, and one pod runs a process per restart.
 	Owner string `json:"owner,omitempty"`
+	// QueuedStream, QueuedSubject and QueuedSeq locate the re-published message of a unit in
+	// heartbeatQueued, so Zeus's liveness sweep can tell it is still waiting in its stream.
+	QueuedStream  string `json:"queued_stream,omitempty"`
+	QueuedSubject string `json:"queued_subject,omitempty"`
+	QueuedSeq     uint64 `json:"queued_seq,omitempty"`
 }
 
 // processToken identifies this runner process in the claims it writes, so it can recognise its
@@ -1046,8 +1247,11 @@ func executionHeartbeatKey(workflowID, runID, nodeID string) string {
 	return fmt.Sprintf("%s.%s.%s", workflowID, runID, nodeID)
 }
 
-// deliverAttempt returns msg's JetStream NumDelivered, or 0 if msg has no JetStream handle or the
-// metadata call fails (Core NATS / synthesised messages, or a transient metadata-fetch error).
+// deliverAttempt returns which attempt this delivery of msg's unit is: its JetStream NumDelivered,
+// plus the attempts the unit used before it was last handed off (HeaderAttemptOffset), so a
+// hand-off neither resets nor uses up the unit's attempts. It returns 0 if msg has no JetStream
+// handle or the metadata call fails (Core NATS / synthesised messages, or a transient
+// metadata-fetch error).
 func deliverAttempt(msg *message.Message) int {
 	jsMsg := msg.GetJetStreamMsg()
 	if jsMsg == nil {
@@ -1057,7 +1261,7 @@ func deliverAttempt(msg *message.Message) int {
 	if err != nil || md == nil {
 		return 0
 	}
-	return int(md.NumDelivered)
+	return int(md.NumDelivered) + headerInt(jsMsg, HeaderAttemptOffset)
 }
 
 // claimOutcome is what claimExecutionUnit decided.
@@ -1075,7 +1279,8 @@ const (
 // claimExecutionUnit claims key for hb's execution. With no entry it Creates one. With an
 // entry it decides from the entry's state:
 //   - done for the same execution: a duplicate delivery (claimDuplicate);
-//   - retrying, done for an earlier execution (Zeus dispatched the node again), or running
+//   - retrying, queued (handed off), done for an earlier execution (Zeus dispatched the node
+//     again), or running
 //     with no write for claimStaleAfter (its pod is presumed dead): taken over with an Update
 //     on the entry's revision, so two deliveries racing for it cannot both win;
 //   - running and fresh: claimBusy, unless this process wrote it for this execution (Owner):
@@ -1088,8 +1293,11 @@ func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, 
 	if err != nil {
 		return claimBusy, err
 	}
-	// Two passes: a Create that loses to another creator re-reads what that creator wrote.
-	for pass := 0; pass < 2; pass++ {
+	// Up to three passes: a Create or Update that loses to another writer re-reads what that writer
+	// wrote and decides again. The other write is not always a rival claim: a hand-off adds the
+	// copy's sequence to a queued entry just as the copy's delivery claims it, and treating that as
+	// "busy" nak'd the copy for claimBusyNakDelay.
+	for pass := 0; pass < 3; pass++ {
 		entry, err := kv.Get(ctx, key)
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			if _, err := kv.Create(ctx, key, payload); err == nil {
@@ -1110,6 +1318,7 @@ func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, 
 		case cur.State == heartbeatDone && cur.ExecutionID == hb.ExecutionID:
 			return claimDuplicate, nil
 		case cur.State == heartbeatRetrying,
+			cur.State == heartbeatQueued,
 			cur.State == heartbeatDone,
 			now.Sub(entry.Created()) >= claimStaleAfter,
 			// This process's own claim for this execution, which it is not running (the caller
@@ -1121,7 +1330,7 @@ func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, 
 			if _, err := kv.Update(ctx, key, payload, entry.Revision()); err == nil {
 				return claimWon, nil
 			} else if errors.Is(err, jetstream.ErrKeyExists) {
-				return claimBusy, nil // another delivery took it over first
+				continue // the entry changed under us: read it again and decide on what is there now
 			} else {
 				return claimBusy, err
 			}
@@ -1381,6 +1590,12 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	stopped := make(chan struct{})
 	var kvStopped atomic.Bool
+	// kvCtx ends when stopKV is called, and kvMu is held around each KV write, so once stopKV
+	// returns no running write can be sent. A write sent just before is ordered before any write
+	// the caller makes after (one connection), so it cannot overwrite the unit's next state: a
+	// hand-off's queued entry was turned back into running by a refresh still in flight.
+	kvCtx, kvCancel := context.WithCancel(hbCtx)
+	var kvMu sync.Mutex
 
 	executionID := ""
 	if msg.Payload != nil {
@@ -1421,6 +1636,11 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 				if tick%executionHeartbeatEveryNTicks != 0 || kvStopped.Load() {
 					continue
 				}
+				// Opening the bucket can block, so it happens outside kvMu.
+				kv := r.heartbeats(kvCtx)
+				if kv == nil {
+					continue
+				}
 				hb := executionHeartbeat{
 					WorkflowID:  workflowID,
 					RunID:       runID,
@@ -1439,13 +1659,15 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 				}
 				// Put, not Create: the claim in processMessage already Created this key before
 				// this ticker started, so this pod owns it. Every write here is a refresh.
-				kv := r.heartbeats(hbCtx)
-				if kv == nil {
+				kvMu.Lock()
+				if kvStopped.Load() {
+					kvMu.Unlock()
 					continue
 				}
-				putCtx, putCancel := context.WithTimeout(hbCtx, heartbeatKVTimeout)
+				putCtx, putCancel := context.WithTimeout(kvCtx, heartbeatKVTimeout)
 				_, err := kv.Put(putCtx, key, payload)
 				putCancel()
+				kvMu.Unlock()
 				if err != nil {
 					r.logger.Warn("Failed to write execution heartbeat; Zeus's sweeper may see this unit as stalled while it is actually running",
 						zap.String("workflow_id", workflowID),
@@ -1458,7 +1680,13 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 	}()
 
 	var once sync.Once
-	return func() { kvStopped.Store(true) }, func() {
+	stopKV = func() {
+		kvStopped.Store(true)
+		kvCancel()
+		kvMu.Lock() // waits for a write in flight to return, which kvCancel makes prompt
+		kvMu.Unlock()
+	}
+	return stopKV, func() {
 		once.Do(func() {
 			kvStopped.Store(true)
 			hbCancel()
@@ -1620,7 +1848,14 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		return nil
 	}
 	r.setLocalExecution(executionID, localRunning)
-	defer r.clearLocalRunning(executionID)
+	// A unit handed off is forgotten by handOff itself, before its copy is published: by the time
+	// this returns the copy may be running here, and its record must not be cleared.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			r.clearLocalRunning(executionID)
+		}
+	}()
 
 	// A unit that already succeeded here, but whose result could not be published, is not run
 	// again: its kept result is published instead. Running it again repeated every side effect it
@@ -1650,9 +1885,34 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		r.unitObserver.UnitStarted(r.stream, time.Duration(queueWaitMs)*time.Millisecond, payloadBytes(msg.Payload))
 	}
 
-	// Process the message
+	// Process the message. The processor may hand the unit off instead (ErrHandOff) when this
+	// process cannot start it soon enough; if the re-publish fails it runs here after all.
 	processStart := time.Now()
-	resultMessage, processErr := r.processor.Process(processCtx, msg)
+	canHandOff := r.canHandOff(msg, workflowID, runID, nodeID)
+	resultMessage, processErr := r.processor.Process(withHandOff(processCtx, canHandOff, handOffCount(msg)), msg)
+	if canHandOff && errors.Is(processErr, ErrHandOff) {
+		// Stop extending the original's deadline: it is acked as part of the hand-off.
+		stopKVHeartbeat()
+		stopHeartbeat()
+		handOffErr := r.handOff(msg, workflowID, runID, nodeID, executionID)
+		if handOffErr == nil {
+			handedOff = true
+			if r.unitObserver != nil {
+				r.unitObserver.UnitFinished(r.stream, time.Since(processStart), ErrHandOff, 0)
+			}
+			span.SetAttributes(attribute.Bool("unit.handed_off", true))
+			return nil
+		}
+		r.logger.Warn("Could not hand the unit off; running it here",
+			zap.String("stream", r.stream),
+			zap.String("execution_id", executionID),
+			zap.Error(handOffErr))
+		// The claim is still this process's own running entry (the queued write only follows a
+		// successful re-publish), so resume the heartbeat and run the unit here.
+		stopKVHeartbeat, stopHeartbeat = r.startAckHeartbeat(processCtx, msg, workflowID, runID, nodeID)
+		defer stopHeartbeat()
+		resultMessage, processErr = r.processor.Process(withHandOff(processCtx, false, handOffCount(msg)), msg)
+	}
 	stopKVHeartbeat()
 	processingTime := time.Since(start)
 	if r.unitObserver != nil {

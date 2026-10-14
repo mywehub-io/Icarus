@@ -1,5 +1,35 @@
 # Upgrade guide
 
+## Upgrading to the next release (shared capacity and hand-off)
+
+Additive: a runner built without the new options behaves as before.
+
+### `pkg/runner`
+
+- **`WithGate(Gate)`** replaces the fixed worker pool. The runner asks the gate how many units it
+  may take, fetches at most that many, and runs each in its own goroutine; `Config.WorkerCount` is
+  ignored. A host running several runners gives each a gate over one shared view of its capacity,
+  so a busy runner can use what an idle one is not. Work the gate does not admit stays undelivered
+  in the stream. A gated runner asks for as many messages as its consumer reports waiting (the last
+  delivery's `NumPending`), up to `batchSize`, and holds one slot in an open pull when nothing is
+  waiting. A runner waiting on its gate is not reported stalled by `Health`.
+- **`ErrHandOff`**. A processor that cannot start a unit soon enough may return it (wrapped or
+  not) while `HandOffAllowed(ctx)`. The runner re-publishes the unit with the headers
+  `Icarus-Handoffs` and `Icarus-Attempt-Offset` and a `Nats-Msg-Id` ending `:handoff:{n}`, marks
+  its `EXECUTION_HEARTBEATS` entry `queued` with the copy's stream sequence, and acks the original:
+  no delivery attempt is used. If the re-publish fails, `Process` is called again with hand-off
+  not allowed. `HandOffCount(ctx)` is how often the unit has been handed off;
+  `ContextWithHandOff` builds such a context for tests.
+- **Attempts carry across hand-offs.** A unit's attempt is `NumDelivered` plus
+  `Icarus-Attempt-Offset`, for retries and for `FinalAttempt`.
+- **`ConsumerObserver`**: when the `UnitObserver` implements it, the runner reports its consumer's
+  `NumPending` and `NumAckPending` every 15 s.
+- `UnitObserver.UnitFinished` receives `ErrHandOff` for a handed-off unit; count it as neither
+  success nor failure.
+- A claim that loses an `Update` race reads the entry again and decides on what is there now,
+  instead of treating every lost race as busy. `stopKV` (the first function `startAckHeartbeat`
+  returns) now waits for a refresh in flight, so no `running` refresh lands after it returns.
+
 ## Upgrading to v0.28.1
 
 - **Unclassified errors fail at once.** Only an error marked or recognised as transient is
