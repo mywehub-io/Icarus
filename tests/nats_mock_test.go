@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/wehubfusion/Icarus/pkg/message"
 )
@@ -25,15 +26,17 @@ type mockMsg struct {
 	termed       bool
 	nakDelays    []time.Duration
 	numDelivered uint64 // 0 means 1
+	headers      nats.Header
 }
 
 func newMockMsg(subject string, data []byte) *mockMsg {
 	return &mockMsg{subject: subject, data: data}
 }
 
-func (m *mockMsg) Data() []byte    { return m.data }
-func (m *mockMsg) Subject() string { return m.subject }
-func (m *mockMsg) Reply() string   { return "" }
+func (m *mockMsg) Data() []byte         { return m.data }
+func (m *mockMsg) Subject() string      { return m.subject }
+func (m *mockMsg) Reply() string        { return "" }
+func (m *mockMsg) Headers() nats.Header { return m.headers }
 
 func (m *mockMsg) Metadata() (*jetstream.MsgMetadata, error) {
 	delivered := m.numDelivered

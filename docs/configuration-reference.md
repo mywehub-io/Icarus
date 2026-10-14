@@ -45,7 +45,7 @@ Reconnects when the NATS TCP connection is missing or closed. Safe for concurren
 
 | Parameter | Type | Description |
 |---|---|---|
-| `batchSize` | `int` | Cap on messages per fetch; a fetch never asks for more than the idle workers. Must be > 0 |
+| `batchSize` | `int` | Cap on messages per fetch; a fetch never asks for more than the idle workers, or with `WithGate`, than the gate admits and the consumer reports waiting. Must be > 0 |
 | `processTimeout` | `time.Duration` | Per-message deadline; must be > 0 |
 | `tracingConfig` | `*TracingConfig` | nil disables OTel tracing |
 | `cfg` | `*Config` | nil uses `DefaultConfig()` (workers = GOMAXPROCS) |
@@ -58,6 +58,18 @@ type Config struct {
     QueueSize   int // ignored since v0.28.0: the runner fetches only for idle workers
 }
 ```
+
+## Runner options
+
+| Option | Effect |
+|---|---|
+| `WithGate(Gate)` | No worker pool: the runner takes work as the `Gate` admits it (`Acquire(ctx, max)`, `Release(n)`), one goroutine per unit. `Config.WorkerCount` is ignored (`pkg/runner/gate.go`) |
+| `WithUnitObserver(UnitObserver)` | Unit start and finish, for metrics. If it also implements `ConsumerObserver`, the consumer's backlog every 15 s |
+| `WithProcessFailureObserver(ProcessFailureObserver)` | Called after a failed result is published |
+| `WithConsumerFilterSubject(string)` | The durable's FilterSubject |
+
+A processor may return `runner.ErrHandOff` while `runner.HandOffAllowed(ctx)` to have the unit
+re-published for another replica; see the upgrade guide.
 
 ## `TracingConfig`
 
