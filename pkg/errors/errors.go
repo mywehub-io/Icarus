@@ -4,9 +4,13 @@ import (
 	"fmt"
 
 	"github.com/getsentry/sentry-go"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// ErrorInfoDomain is the google.rpc.ErrorInfo domain ToGRPCError stamps on every coded error.
+const ErrorInfoDomain = "wehub"
 
 // ErrorType classifies the nature of an AppError so callers and gRPC handlers
 // can decide on the appropriate response code and retry strategy without
@@ -201,9 +205,11 @@ func NewInternalError(metaData string, message string, code string, cause error)
 //	Conflict        → codes.AlreadyExists
 //	Internal (+ unknown) → codes.Internal
 //
-// The gRPC status message is set to AppError.Message. The underlying Err and
-// Code fields are not propagated to the gRPC status to avoid leaking internal
-// detail to callers.
+// The gRPC status message is set to AppError.Message. A non-empty Code goes on
+// the status as a google.rpc.ErrorInfo detail (Reason = Code, Domain =
+// ErrorInfoDomain), so a client can act on the code without parsing the message;
+// grpc-gateway writes it into a REST error body's "details" array. The underlying
+// Err is never propagated, to avoid leaking internal detail to callers.
 func (e *AppError) ToGRPCError() error {
 	var grpcCode codes.Code
 	switch e.Type {
@@ -227,5 +233,26 @@ func (e *AppError) ToGRPCError() error {
 		grpcCode = codes.Internal
 	}
 
-	return status.Error(grpcCode, e.Message)
+	st := status.New(grpcCode, e.Message)
+	if e.Code != "" {
+		if withInfo, err := st.WithDetails(&errdetails.ErrorInfo{Reason: e.Code, Domain: ErrorInfoDomain}); err == nil {
+			st = withInfo
+		}
+	}
+	return st.Err()
+}
+
+// CodeFromGRPC returns the AppError code a ToGRPCError status carries in its
+// ErrorInfo detail, or "" when it carries none.
+func CodeFromGRPC(err error) string {
+	st, ok := status.FromError(err)
+	if !ok {
+		return ""
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetDomain() == ErrorInfoDomain {
+			return info.GetReason()
+		}
+	}
+	return ""
 }
