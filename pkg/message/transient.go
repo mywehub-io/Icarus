@@ -24,7 +24,7 @@ type TransientClassifier interface {
 // decision both use it. The first rule that applies decides, looking through the whole chain:
 //
 //  1. an error implementing TransientClassifier;
-//  2. an *AppError: transient when its Type is Internal;
+//  2. an *AppError: transient when its Type is Internal or Timeout;
 //  3. a failure to reach a dependency: a network timeout, a refused, reset or unreachable
 //     connection, a DNS failure, a gRPC Unavailable, ResourceExhausted or DeadlineExceeded,
 //     or an Azure 408, 429 or 5xx response;
@@ -44,7 +44,7 @@ func IsTransientError(err error) bool {
 	}
 	var appErr *sdkerrors.AppError
 	if errors.As(err, &appErr) {
-		return appErr.Type == sdkerrors.Internal
+		return appErr.Type == sdkerrors.Internal || appErr.Type == sdkerrors.Timeout
 	}
 	return isDependencyFailure(err)
 }

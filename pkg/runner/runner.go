@@ -41,8 +41,8 @@ import (
 // Return semantics:
 //   - nil error → processing succeeded; the runner calls ReportSuccess and
 //     ACKs the NATS message.
-//   - non-nil error → processing failed. A transient error (anything but an
-//     *errors.AppError of a non-Internal type) with delivery attempts left is
+//   - non-nil error → processing failed. A transient error (see
+//     message.IsTransientError) with delivery attempts left is
 //     retried: the message is nak'd with a backoff delay (5s, 15s, 30s, 60s)
 //     and nothing is reported. On the last attempt, or for a permanent error,
 //     the runner calls ReportError, which publishes the failed result once and

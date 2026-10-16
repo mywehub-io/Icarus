@@ -42,6 +42,7 @@ func TestIsTransientError(t *testing.T) {
 		{"permanent AppError, wrapped", wrap(sdkerrors.NewValidationError("bad", "BAD", nil)), false},
 		{"Internal AppError", sdkerrors.NewInternalError("", "publish failed", "PUBLISH_FAILED", nil), true},
 		{"Internal AppError, wrapped", wrap(sdkerrors.NewInternalError("", "publish failed", "X", nil)), true},
+		{"Timeout AppError", sdkerrors.NewTimeoutError("timed out", "WAIT_TIMEOUT", nil), true},
 		{"classifier says transient, despite a permanent cause", classified(true), true},
 		{"classifier says permanent, despite a transient cause", fmt.Errorf("%w: %w", classified(false), syscall.ECONNREFUSED), false},
 		{"connection refused", wrap(&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}), true},

@@ -26,6 +26,10 @@ type AppError struct {
 | `Conflict` | `codes.AlreadyExists` | Duplicate resource |
 | `ValidationFailed` | `codes.InvalidArgument` | Schema or field validation failure |
 | `PermissionDenied` | `codes.PermissionDenied` | Authenticated but not authorized |
+| `FailedPrecondition` | `codes.FailedPrecondition` | Valid request the current state cannot satisfy |
+| `Timeout` | `codes.DeadlineExceeded` | A wait the server controls ran out; the work may still finish. Not sent to Sentry |
+
+New types are appended to the end of the list: `Type` is serialised as its number.
 
 ## Constructors
 
@@ -37,6 +41,8 @@ func NewValidationError(message, code string, cause error) *AppError
 func NewConflictError(message, code string, cause error) *AppError
 func NewUnauthorizedError(message, code string, cause error) *AppError
 func NewPermissionDeniedError(message, code string, cause error) *AppError
+func NewFailedPreconditionError(message, code string, cause error) *AppError
+func NewTimeoutError(message, code string, cause error) *AppError
 ```
 
 `NewInternalError` calls `sentry.CaptureMessage` automatically. The `metaData` parameter is
