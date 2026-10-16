@@ -1,5 +1,20 @@
 # Upgrade guide
 
+## Upgrading to v0.33.0
+
+Additive: no existing error changes type.
+
+### `pkg/errors`
+
+- **`Timeout` error type and `NewTimeoutError`.** `ToGRPCError` maps it to `codes.DeadlineExceeded`
+  instead of `codes.Internal`, so a caller can tell "the server stopped waiting" from "the server
+  failed". Unlike `NewInternalError` it does not capture to Sentry. A service switching a timeout
+  from `NewInternalError` to `NewTimeoutError` changes the gRPC code its clients see; check any
+  client that branches on `codes.Internal`.
+- A `switch` on `AppError.Type` with no `Timeout` case takes its `default` branch for it.
+- `message.IsTransientError` treats a `Timeout` `AppError` as transient, as it already did a gRPC
+  `DeadlineExceeded`.
+
 ## Upgrading to the next release (shared capacity and hand-off)
 
 Additive: a runner built without the new options behaves as before.

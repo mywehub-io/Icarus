@@ -13,6 +13,13 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### `Timeout` error type
+
+- `public:` `errors.Timeout` and `errors.NewTimeoutError`. `ToGRPCError` maps `Timeout` to
+  `codes.DeadlineExceeded`; `NewTimeoutError` does not capture to Sentry. Appended to `ErrorType`,
+  so existing numbers are unchanged.
+- `public:` `message.IsTransientError` treats a `Timeout` `AppError` as transient.
+
 ### Breaking: inline data is removed (raw payloads hard cut)
 
 A byte value is always a file reference and every unit result is a blob. Nothing is deprecated

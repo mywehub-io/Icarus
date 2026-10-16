@@ -57,6 +57,14 @@ const (
 	// workflow metadata is missing). Maps to gRPC codes.FailedPrecondition
 	// (HTTP 400). Callers should fix the precondition and retry.
 	FailedPrecondition
+
+	// Timeout indicates that the server stopped waiting for something it
+	// needed, such as a workflow run, before it finished. Maps to gRPC
+	// codes.DeadlineExceeded (HTTP 504). The work may still complete, so check
+	// its outcome before retrying anything that is not idempotent.
+	//
+	// New types are appended: Type is serialised as its number.
+	Timeout
 )
 
 // AppError is the canonical error type across all Olympus Go services.
@@ -173,6 +181,18 @@ func NewFailedPreconditionError(message string, code string, cause error) *AppEr
 	}
 }
 
+// NewTimeoutError constructs an AppError with Type == Timeout.
+// Use when a wait the server controls runs out. Unlike NewInternalError it
+// does not capture to Sentry: running out of time is an outcome, not a fault.
+func NewTimeoutError(message string, code string, cause error) *AppError {
+	return &AppError{
+		Type:    Timeout,
+		Message: message,
+		Code:    code,
+		Err:     cause,
+	}
+}
+
 // NewInternalError constructs an AppError with Type == Internal and captures
 // the event in Sentry. metaData is an optional structured string prepended to
 // the Sentry message (e.g. "service=zeus run_id=abc"); pass "" to omit it.
@@ -203,6 +223,8 @@ func NewInternalError(metaData string, message string, code string, cause error)
 //	Unauthorized    → codes.Unauthenticated
 //	PermissionDenied → codes.PermissionDenied
 //	Conflict        → codes.AlreadyExists
+//	FailedPrecondition → codes.FailedPrecondition
+//	Timeout         → codes.DeadlineExceeded
 //	Internal (+ unknown) → codes.Internal
 //
 // The gRPC status message is set to AppError.Message. A non-empty Code goes on
@@ -227,6 +249,8 @@ func (e *AppError) ToGRPCError() error {
 		grpcCode = codes.InvalidArgument
 	case FailedPrecondition:
 		grpcCode = codes.FailedPrecondition
+	case Timeout:
+		grpcCode = codes.DeadlineExceeded
 	case Internal:
 		fallthrough
 	default:

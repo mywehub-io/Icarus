@@ -32,6 +32,30 @@ func TestToGRPCErrorWithoutACodeHasNoDetail(t *testing.T) {
 	}
 }
 
+func TestTimeoutIsDeadlineExceeded(t *testing.T) {
+	err := NewTimeoutError("timed out waiting", "WAIT_TIMEOUT", nil).ToGRPCError()
+	st, _ := status.FromError(err)
+	if st.Code() != codes.DeadlineExceeded {
+		t.Fatalf("code = %v, want DeadlineExceeded", st.Code())
+	}
+	if got := CodeFromGRPC(err); got != "WAIT_TIMEOUT" {
+		t.Fatalf("CodeFromGRPC = %q, want WAIT_TIMEOUT", got)
+	}
+}
+
+// Type is serialised as its number, so a new type must not renumber the old ones.
+func TestErrorTypeNumbersAreStable(t *testing.T) {
+	want := map[ErrorType]int{
+		Internal: 0, NotFound: 1, BadRequest: 2, Unauthorized: 3, Conflict: 4,
+		ValidationFailed: 5, PermissionDenied: 6, FailedPrecondition: 7, Timeout: 8,
+	}
+	for typ, n := range want {
+		if int(typ) != n {
+			t.Errorf("type %d, want %d", typ, n)
+		}
+	}
+}
+
 func TestCodeFromGRPCOnAPlainError(t *testing.T) {
 	if got := CodeFromGRPC(status.Error(codes.Internal, "x")); got != "" {
 		t.Fatalf("CodeFromGRPC = %q", got)
