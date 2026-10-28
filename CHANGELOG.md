@@ -13,6 +13,28 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Error and validation messages no longer quote submitted values
+
+Validation results, node errors and parse errors reach logs, spans and Sentry, so they name the
+rule a value broke and never the value. Consumers that match the old text by string need
+updating; the `Code` values are unchanged.
+
+- `public:` JSON and CSV validation: `ENUM_MISMATCH` is `value not in allowed values [..]`,
+  `MIN_VALUE` / `MAX_VALUE` are `value is less than minimum N` / `value exceeds maximum N`. An
+  out-of-range number in streamed input gives its length.
+- `public:` HL7: the date, time and timestamp range checks name the component (`invalid day for
+  month in date`), and `segment too short` gives the length. The CEL helpers `toNumber`, `toDTM`,
+  `matchesPattern` and `validateAs` no longer quote a field value, and quote their location
+  argument only when it is an HL7 location.
+- `public:` simple condition: a non-numeric string in a numeric comparison is reported by length,
+  without the `strconv` error.
+- `public:` HTTP client: a failed request names only the scheme and host (the `*url.Error` is
+  kept, with its URL cut to them); an unparseable URL is reported as `invalid URL` with no cause.
+- `public:` JavaScript: an exception's text (`TypeError: msg`) is cut to 120 runes and marked
+  `... (truncated)`; goja's position suffix (` at script.js:L:C(pc)`) is kept unchanged. The full
+  `*goja.Exception` stays reachable as `ExecutionError.Err`.
+- `public:` strings `uri_decode`: a bad escape is not quoted, and the error wraps no cause.
+
 ### `Timeout` error type
 
 - `public:` `errors.Timeout` and `errors.NewTimeoutError`. `ToGRPCError` maps `Timeout` to

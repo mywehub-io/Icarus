@@ -408,7 +408,8 @@ func scalarValue(tok json.Token) (interface{}, error) {
 	if n, ok := tok.(json.Number); ok {
 		f, err := strconv.ParseFloat(string(n), 64)
 		if err != nil {
-			return nil, fmt.Errorf("invalid input JSON: number %s: %w", n, err)
+			// Neither the literal nor the strconv error (which repeats it) is echoed: it is input data.
+			return nil, fmt.Errorf("invalid input JSON: number of length %d is out of range", len(n))
 		}
 		return f, nil
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -140,6 +141,7 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 		if errors.As(err, &egress) {
 			return runtime.ErrorOutput(NewConfigError(n.NodeId(), "url", egress.Error(), egress))
 		}
+		err = redactURLError(err)
 		return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "request failed: "+err.Error(), err, 0, nil))
 	}
 	defer resp.Body.Close()
@@ -156,6 +158,27 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 		return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "failed to store response body: "+werr.Error(), werr, resp.StatusCode, nil))
 	}
 	return runtime.SuccessOutput(map[string]interface{}{"status": resp.StatusCode, "body": ref})
+}
+
+// redactURLError replaces the URL a *url.Error quotes with its scheme and host: the path and query
+// can come from the run's data and carry identifiers or tokens. The result is still a *url.Error
+// wrapping the same cause, so Timeout and errors.As on the cause behave as before. Any other error
+// is returned unchanged.
+func redactURLError(err error) error {
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	return &url.Error{Op: ue.Op, URL: redactURL(ue.URL), Err: ue.Err}
+}
+
+// redactURL returns scheme://host of raw, or "" when raw does not parse to both.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}, fileBody io.Reader, fileSize int64) (*http.Request, error) {
@@ -178,7 +201,13 @@ func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map
 
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, body)
 	if err != nil {
-		return nil, NewConfigError(n.NodeId(), "url", "invalid URL: "+err.Error(), err)
+		// The URL is not echoed, nor the parse error, which quotes it or a piece of it: it can come
+		// from the run's data and carry identifiers or tokens.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return nil, NewConfigError(n.NodeId(), "url", "invalid URL", nil)
+		}
+		return nil, NewConfigError(n.NodeId(), "url", err.Error(), err)
 	}
 	if fileBody != nil && body != nil {
 		req.ContentLength = fileSize

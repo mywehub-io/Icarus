@@ -127,7 +127,7 @@ func executeAction(nodeID string, itemIndex int, action string, params map[strin
 		str := getInputString(params, input, "")
 		decoded, err := uriDecode(str)
 		if err != nil {
-			return nil, NewActionError(nodeID, itemIndex, action, fmt.Sprintf("uri_decode failed: %v", err), err)
+			return nil, NewActionError(nodeID, itemIndex, action, "uri_decode failed: invalid escape sequence", nil) // url.EscapeError quotes part of the input
 		}
 		return decoded, nil
 

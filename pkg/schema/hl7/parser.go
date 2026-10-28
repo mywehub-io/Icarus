@@ -134,7 +134,7 @@ func parseDelimiters(data string) (Delimiters, error) {
 
 func parseSegment(segStr string, d Delimiters) (Segment, error) {
 	if len(segStr) < 3 {
-		return Segment{}, fmt.Errorf("segment too short: %s", segStr)
+		return Segment{}, fmt.Errorf("segment too short: length %d", len(segStr)) // the content is not echoed: it is message data
 	}
 	seg := Segment{Name: segStr[0:3]}
 	if seg.Name == "MSH" {

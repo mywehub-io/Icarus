@@ -177,7 +177,7 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 		defer func() {
 			if r := recover(); r != nil {
 				if gojaErr, ok := r.(*goja.Exception); ok {
-					errChan <- NewExecutionError(n.NodeId(), gojaErr.Error(), input.ItemIndex, 0, 0, gojaErr)
+					errChan <- newScriptExceptionError(n.NodeId(), input.ItemIndex, gojaErr)
 				} else {
 					errChan <- NewExecutionError(n.NodeId(), fmt.Sprintf("%v", r), input.ItemIndex, 0, 0, nil)
 				}
@@ -196,7 +196,7 @@ func (n *JSRunnerNode) executeScript(ctx context.Context, input runtime.ProcessI
 		}
 		if err != nil {
 			if gojaErr, ok := err.(*goja.Exception); ok {
-				errChan <- NewExecutionError(n.NodeId(), gojaErr.Error(), input.ItemIndex, 0, 0, gojaErr)
+				errChan <- newScriptExceptionError(n.NodeId(), input.ItemIndex, gojaErr)
 			} else {
 				errChan <- NewExecutionError(n.NodeId(), err.Error(), input.ItemIndex, 0, 0, err)
 			}

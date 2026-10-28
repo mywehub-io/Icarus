@@ -42,7 +42,8 @@ func toFloat64(value interface{}) (float64, error) {
 	case string:
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return 0, fmt.Errorf("cannot convert string '%s' to number: %w", v, err)
+			// Neither the string nor the strconv error (which repeats it) is echoed: it is node input.
+			return 0, fmt.Errorf("cannot convert string of length %d to number", len(v))
 		}
 		return f, nil
 	default:
