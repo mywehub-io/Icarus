@@ -570,7 +570,7 @@ func (v *Validator) validateString(value string, rules *ValidationRules, path st
 		if !found {
 			errors = append(errors, contracts.ValidationError{
 				Path:    path,
-				Message: fmt.Sprintf("value '%s' not in allowed values %v", value, rules.Enum),
+				Message: fmt.Sprintf("value not in allowed values %v", rules.Enum), // the value is not echoed: it can be patient data
 				Code:    "ENUM_MISMATCH",
 			})
 		}
@@ -590,7 +590,7 @@ func (v *Validator) validateNumber(value float64, rules *ValidationRules, path s
 	if rules.Minimum != nil && value < *rules.Minimum {
 		errors = append(errors, contracts.ValidationError{
 			Path:    path,
-			Message: fmt.Sprintf("value %f is less than minimum %f", value, *rules.Minimum),
+			Message: fmt.Sprintf("value is less than minimum %v", *rules.Minimum), // the value is not echoed: it can be patient data
 			Code:    "MIN_VALUE",
 		})
 	}
@@ -598,7 +598,7 @@ func (v *Validator) validateNumber(value float64, rules *ValidationRules, path s
 	if rules.Maximum != nil && value > *rules.Maximum {
 		errors = append(errors, contracts.ValidationError{
 			Path:    path,
-			Message: fmt.Sprintf("value %f exceeds maximum %f", value, *rules.Maximum),
+			Message: fmt.Sprintf("value exceeds maximum %v", *rules.Maximum),
 			Code:    "MAX_VALUE",
 		})
 	}

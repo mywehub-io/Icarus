@@ -80,7 +80,7 @@ func hl7EnvOptions(ctx *bindCtx) []celgo.EnvOption {
 					loc := stringVal(v)
 					s := msgGet(ctx, loc)
 					if strings.TrimSpace(s) == "" {
-						return celtypes.WrapErr(fmt.Errorf("toDTM(%q): field is empty — guard with valued()", loc))
+						return celtypes.WrapErr(fmt.Errorf("toDTM(%q): field is empty — guard with valued()", locLabel(loc)))
 					}
 					t, err := parseHL7DTM(s)
 					if err != nil {
@@ -94,11 +94,11 @@ func hl7EnvOptions(ctx *bindCtx) []celgo.EnvOption {
 					loc := stringVal(v)
 					s := strings.TrimSpace(msgGet(ctx, loc))
 					if s == "" {
-						return celtypes.WrapErr(fmt.Errorf("toNumber(%q): field is empty — guard with valued()", loc))
+						return celtypes.WrapErr(fmt.Errorf("toNumber(%q): field is empty — guard with valued()", locLabel(loc)))
 					}
 					f, err := strconv.ParseFloat(s, 64)
 					if err != nil {
-						return celtypes.WrapErr(fmt.Errorf("toNumber(%q): %q is not a valid number", loc, s))
+						return celtypes.WrapErr(fmt.Errorf("toNumber(%q): field value of length %d is not a valid number", locLabel(loc), len(s)))
 					}
 					return celtypes.Double(f)
 				}))),
@@ -144,8 +144,8 @@ func validateAsImpl(ctx *bindCtx, loc, typeCode string) (bool, error) {
 	locNorm := strings.ToUpper(loc)
 	if !reHL7Location.MatchString(locNorm) {
 		return false, fmt.Errorf(
-			"validateAs: first argument must be an HL7 field location (e.g. 'OBX-5'), not a field value; got %q",
-			loc,
+			"validateAs: first argument must be an HL7 field location (e.g. 'OBX-5'), not a field value; got a string of length %d",
+			len(loc), // not quoted: the usual mistake passes msg(...), a field value
 		)
 	}
 	tid := strings.ToUpper(strings.TrimSpace(typeCode))
@@ -162,11 +162,11 @@ func validateAsImpl(ctx *bindCtx, loc, typeCode string) (bool, error) {
 func matchesPatternImpl(ctx *bindCtx, loc, pattern string) (bool, error) {
 	val := strings.TrimSpace(msgGet(ctx, loc))
 	if val == "" {
-		return false, fmt.Errorf("matchesPattern(%q): field is empty — guard with valued()", loc)
+		return false, fmt.Errorf("matchesPattern(%q): field is empty — guard with valued()", locLabel(loc))
 	}
 	re, err := compiledPattern(pattern)
 	if err != nil {
-		return false, fmt.Errorf("matchesPattern(%q): invalid pattern %q: %v", loc, pattern, err)
+		return false, fmt.Errorf("matchesPattern(%q): invalid pattern %q: %v", locLabel(loc), pattern, err)
 	}
 	ok, err := re.MatchString(val)
 	if err != nil {
@@ -174,9 +174,18 @@ func matchesPatternImpl(ctx *bindCtx, loc, pattern string) (bool, error) {
 		// internal runtime failure. Surface it as HL7_CUSTOM_RULE_RUNTIME_ERROR rather
 		// than silently returning false (which would produce a spurious
 		// violation) or true (which would silently pass a potentially-matching field).
-		return false, fmt.Errorf("matchesPattern(%q): match failed: %w", loc, err)
+		return false, fmt.Errorf("matchesPattern(%q): match failed: %w", locLabel(loc), err)
 	}
 	return ok, nil
+}
+
+// locLabel is loc for an error message when it is an HL7 field location. Anything else is reported
+// by length only: the usual mistake passes msg(...), which is the field's value.
+func locLabel(loc string) string {
+	if reHL7Location.MatchString(strings.ToUpper(strings.TrimSpace(loc))) {
+		return loc
+	}
+	return fmt.Sprintf("<not a field location, length %d>", len(loc))
 }
 
 // compiledPattern returns a cached *regexp2.Regexp for pattern, compiling it on
@@ -197,6 +206,8 @@ func compiledPattern(pattern string) (*regexp2.Regexp, error) {
 }
 
 // parseHL7DTM parses an HL7 DTM/TS string (partial precision allowed) into UTC.
+// Its errors do not quote the value: it is message data, often a date of birth, and the error
+// reaches the validation result as an HL7_CUSTOM_RULE_RUNTIME_ERROR message.
 //
 // HL7 DTM format: YYYY[MM[DD[HH[MM[SS[.S[S[S[S]]]]]]]]][+/-ZZZZ]
 //
@@ -247,7 +258,7 @@ func parseHL7DTM(s string) (time.Time, error) {
 	// (e.g. "2026abcd01") means the input is not a valid HL7 DTM value.
 	for _, c := range body {
 		if c < '0' || c > '9' {
-			return time.Time{}, fmt.Errorf("invalid HL7 DTM value: %q (unexpected character %q in date-time body)", s, c)
+			return time.Time{}, fmt.Errorf("invalid HL7 DTM value (non-digit character in date-time body)")
 		}
 	}
 
@@ -266,7 +277,7 @@ func parseHL7DTM(s string) (time.Time, error) {
 	// strconv.Atoi on a slice of guaranteed digit bytes cannot fail.
 	y, _ := strconv.Atoi(string(digits[0:4]))
 	if y == 0 {
-		return time.Time{}, fmt.Errorf("invalid HL7 DTM value: %q", s)
+		return time.Time{}, fmt.Errorf("invalid HL7 DTM value (year 0000)")
 	}
 
 	// Use 1 as the default for month and day when omitted (partial precision).
@@ -290,7 +301,7 @@ func parseHL7DTM(s string) (time.Time, error) {
 	// month 13 → Jan of next year). Detect this by comparing back.
 	if t.Year() != y || int(t.Month()) != mo || t.Day() != d ||
 		t.Hour() != h || t.Minute() != mi || t.Second() != sec {
-		return time.Time{}, fmt.Errorf("invalid HL7 DTM value: %q (calendar components out of range)", s)
+		return time.Time{}, fmt.Errorf("invalid HL7 DTM value (calendar components out of range)")
 	}
 	return t.UTC(), nil
 }

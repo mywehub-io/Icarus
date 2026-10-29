@@ -1,9 +1,24 @@
 package jsrunner
 
 import (
+	"bytes"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/dop251/goja"
 )
+
+// maxExceptionMessageRunes bounds the exception message a script error carries. The message is
+// the script's own text, and a script can put the item's values in it (`throw new Error("no ward
+// for " + input.nhsNumber)`, or a runtime message quoting a value); the error becomes node output,
+// log text, a span attribute and a Sentry event. 120 runes (counted with the type prefix) keeps a
+// typical engine message such as "TypeError: Cannot read property 'x' of undefined" whole while
+// cutting long dumps of data. It does not stop a short value from appearing: a script that puts
+// data in what it throws still leaks that data.
+// The full exception stays reachable, in process only, as ExecutionError.Err.
+const maxExceptionMessageRunes = 120
 
 // ExecutionError represents a JavaScript execution error
 type ExecutionError struct {
@@ -44,6 +59,46 @@ func NewExecutionError(nodeID, message string, itemIndex, line, column int, err 
 		Message:   message,
 		Err:       err,
 	}
+}
+
+// newScriptExceptionError reports an exception the script threw as goja would, "TypeError: msg at
+// script.js:3:7(5)", with the thrown value's text (type and message) bounded by
+// maxExceptionMessageRunes. The position suffix is kept as goja writes it: readers of node errors
+// (the wehub CLI's run diagnosis) parse it.
+func newScriptExceptionError(nodeID string, itemIndex int, ex *goja.Exception) *ExecutionError {
+	var b strings.Builder
+	b.WriteString(truncateRunes(thrownText(ex.Value()), maxExceptionMessageRunes))
+	// Exception.Error writes the first frame when it is script code or a named function.
+	if st := ex.Stack(); len(st) > 0 && (st[0].SrcName() != "<native>" || st[0].FuncName() != "<native>") {
+		var pos bytes.Buffer
+		st[0].Write(&pos)
+		b.WriteString(" at ")
+		b.WriteString(pos.String())
+	}
+	return NewExecutionError(nodeID, b.String(), itemIndex, 0, 0, ex)
+}
+
+// thrownText is the thrown value's string form: "TypeError: msg" for an Error object.
+func thrownText(v goja.Value) (s string) {
+	if v == nil {
+		return ""
+	}
+	// A thrown object's toString can itself throw; reading it then panics.
+	defer func() {
+		if recover() != nil {
+			s = "thrown value"
+		}
+	}()
+	return v.String()
+}
+
+// truncateRunes cuts s to at most n runes, marking a cut with "... (truncated)".
+func truncateRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	return string(r[:n]) + "... (truncated)"
 }
 
 // TimeoutError represents a JavaScript execution timeout

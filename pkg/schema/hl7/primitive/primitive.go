@@ -132,17 +132,18 @@ func maxDaysInMonth(year, month int) int {
 	}
 }
 
+// The range checks below name the component, not its value: a date or timestamp can be a date of birth.
 func validateDTCalendarRange(value, path string) *FieldError {
 	yyyy, _ := strconv.Atoi(value[0:4])
 	if len(value) >= 6 {
 		mm, _ := strconv.Atoi(value[4:6])
 		if mm < 1 || mm > 12 {
-			return &FieldError{Path: path, Message: fmt.Sprintf("invalid month %02d in date", mm), Code: "HL7_DATATYPE"}
+			return &FieldError{Path: path, Message: "invalid month in date", Code: "HL7_DATATYPE"}
 		}
 		if len(value) == 8 {
 			dd, _ := strconv.Atoi(value[6:8])
 			if maxDD := maxDaysInMonth(yyyy, mm); dd < 1 || dd > maxDD {
-				return &FieldError{Path: path, Message: fmt.Sprintf("invalid day %02d for %04d-%02d", dd, yyyy, mm), Code: "HL7_DATATYPE"}
+				return &FieldError{Path: path, Message: "invalid day for month in date", Code: "HL7_DATATYPE"}
 			}
 		}
 	}
@@ -154,20 +155,20 @@ func validateTMRange(value, path string) *FieldError {
 	if len(digits) >= 2 {
 		hh, _ := strconv.Atoi(digits[0:2])
 		if hh > 23 {
-			return &FieldError{Path: path, Message: fmt.Sprintf("invalid hour %02d in time", hh), Code: "HL7_DATATYPE"}
+			return &FieldError{Path: path, Message: "invalid hour in time", Code: "HL7_DATATYPE"}
 		}
 	}
 	if len(digits) >= 4 {
 		mm, _ := strconv.Atoi(digits[2:4])
 		if mm > 59 {
-			return &FieldError{Path: path, Message: fmt.Sprintf("invalid minute %02d in time", mm), Code: "HL7_DATATYPE"}
+			return &FieldError{Path: path, Message: "invalid minute in time", Code: "HL7_DATATYPE"}
 		}
 	}
 	if len(digits) >= 6 {
 		ssPart := digits[4:6]
 		ss, _ := strconv.Atoi(ssPart)
 		if ss > 59 {
-			return &FieldError{Path: path, Message: fmt.Sprintf("invalid second %02d in time", ss), Code: "HL7_DATATYPE"}
+			return &FieldError{Path: path, Message: "invalid second in time", Code: "HL7_DATATYPE"}
 		}
 	}
 	return nil
@@ -179,31 +180,31 @@ func validateDTMCalendarRange(value, path string) *FieldError {
 	if len(digits) >= 6 {
 		mm, _ := strconv.Atoi(digits[4:6])
 		if mm < 1 || mm > 12 {
-			return &FieldError{Path: path, Message: fmt.Sprintf("invalid month %02d in timestamp", mm), Code: "HL7_DATATYPE"}
+			return &FieldError{Path: path, Message: "invalid month in timestamp", Code: "HL7_DATATYPE"}
 		}
 		if len(digits) >= 8 {
 			dd, _ := strconv.Atoi(digits[6:8])
 			if maxDD := maxDaysInMonth(yyyy, mm); dd < 1 || dd > maxDD {
-				return &FieldError{Path: path, Message: fmt.Sprintf("invalid day %02d for %04d-%02d", dd, yyyy, mm), Code: "HL7_DATATYPE"}
+				return &FieldError{Path: path, Message: "invalid day for month in timestamp", Code: "HL7_DATATYPE"}
 			}
 		}
 	}
 	if len(digits) >= 10 {
 		hh, _ := strconv.Atoi(digits[8:10])
 		if hh > 23 {
-			return &FieldError{Path: path, Message: fmt.Sprintf("invalid hour %02d in timestamp", hh), Code: "HL7_DATATYPE"}
+			return &FieldError{Path: path, Message: "invalid hour in timestamp", Code: "HL7_DATATYPE"}
 		}
 	}
 	if len(digits) >= 12 {
 		min, _ := strconv.Atoi(digits[10:12])
 		if min > 59 {
-			return &FieldError{Path: path, Message: fmt.Sprintf("invalid minute %02d in timestamp", min), Code: "HL7_DATATYPE"}
+			return &FieldError{Path: path, Message: "invalid minute in timestamp", Code: "HL7_DATATYPE"}
 		}
 	}
 	if len(digits) >= 14 {
 		ss, _ := strconv.Atoi(digits[12:14])
 		if ss > 59 {
-			return &FieldError{Path: path, Message: fmt.Sprintf("invalid second %02d in timestamp", ss), Code: "HL7_DATATYPE"}
+			return &FieldError{Path: path, Message: "invalid second in timestamp", Code: "HL7_DATATYPE"}
 		}
 	}
 	return nil
