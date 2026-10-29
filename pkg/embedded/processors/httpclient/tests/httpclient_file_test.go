@@ -45,6 +45,54 @@ func TestProcess_PayloadFileIsTheRequestBody(t *testing.T) {
 	}
 }
 
+// With no Content-Type header, a payload file is sent as the type it was written with, else the
+// type its name implies; a header from config wins, a type that says only "bytes" is not sent, and
+// a GET sends none.
+func TestProcess_PayloadFileSetsContentType(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, contentType, fileName, header, want string
+	}{
+		{name: "the file's type", method: "POST", path: "payload.csv", contentType: fileref.ContentTypeCSV, want: fileref.ContentTypeCSV},
+		{name: "a header wins", method: "POST", path: "payload.json", contentType: fileref.ContentTypeJSON, header: "application/fhir+json", want: "application/fhir+json"},
+		{name: "the name's type", method: "PUT", path: "payload.bin", fileName: "export.xml", want: fileref.ContentTypeXML},
+		{name: "the path's type", method: "POST", path: "payload.json", want: fileref.ContentTypeJSON},
+		{name: "bytes only", method: "POST", path: "payload.bin", contentType: fileref.ContentTypeOctetStream, want: ""},
+		{name: "a GET", method: "GET", path: "payload.json", contentType: fileref.ContentTypeJSON, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := "unset"
+			server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.Header.Get("Content-Type")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			content := "synthetic"
+			b := memfs.New()
+			ref := fileref.FileRef{Path: fileref.RunPrefix("w", "r") + "t/" + tc.path, Size: int64(len(content)), ContentType: tc.contentType, FileName: tc.fileName}
+			b.Put(ref.Path, []byte(content))
+			store, _ := filestore.New(b, "w", "r")
+			cfg := map[string]interface{}{"label": "t", "connection": map[string]interface{}{"url": server.URL, "method": tc.method}}
+			if tc.header != "" {
+				cfg["headers"] = map[string]interface{}{"source": "config", "value": map[string]interface{}{"content-type": tc.header}}
+			}
+			rawCfg, _ := json.Marshal(cfg)
+
+			out := createTestNode(t, "node1").Process(runtime.ProcessInput{
+				Ctx: context.Background(), RawConfig: rawCfg, NodeId: "node1", Files: store, WorkflowID: "w", RunID: "r",
+				Data:       map[string]interface{}{"payload": fileref.Value(ref)},
+				ByteFields: map[string]bool{"payload": true},
+			})
+			if out.Error != nil {
+				t.Fatal(out.Error)
+			}
+			if got != tc.want {
+				t.Fatalf("Content-Type = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // When every consumer of /body reads files, the response is streamed into a file.
 func TestProcess_ResponseBodyIsAFile(t *testing.T) {
 	server := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
