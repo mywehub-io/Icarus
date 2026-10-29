@@ -13,6 +13,13 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### HTTP Client sends the payload's content type
+
+- `public:` With no `Content-Type` header from config or input, the HTTP Client node sends a
+  payload file as the type it was written with (`FileRef.ContentType`), else the type its file
+  name or path implies. A header set on the node still wins. A file whose only known type is
+  `application/octet-stream` is still sent with no `Content-Type`, and `GET` and `HEAD` send none.
+
 ### Error and validation messages no longer quote submitted values
 
 Validation results, node errors and parse errors reach logs, spans and Sentry, so they name the

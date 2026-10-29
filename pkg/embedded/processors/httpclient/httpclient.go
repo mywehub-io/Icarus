@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/wehubfusion/Icarus/pkg/embedded/runtime"
+	"github.com/wehubfusion/Icarus/pkg/fileref"
 )
 
 const (
@@ -96,9 +97,10 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 	}
 
 	// A file a BYTE mapping delivered to "payload" is streamed as the request body, with its
-	// length.
+	// length and, unless a header sets one, its content type.
 	var fileBody io.ReadCloser
 	var fileSize int64
+	var fileType string
 	if ref, ok := input.TrustedFile("payload"); ok {
 		if input.Files == nil {
 			return runtime.ErrorOutput(NewConfigError(n.NodeId(), "payload", "payload is a file but file storage is not configured", nil))
@@ -108,7 +110,7 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 			return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "failed to open payload file: "+openErr.Error(), openErr, 0, nil))
 		}
 		defer rc.Close()
-		fileBody, fileSize = rc, ref.Size
+		fileBody, fileSize, fileType = rc, ref.Size, payloadContentType(ref)
 	} else if v, present := input.Data["payload"]; present && v != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "payload", "payload must be a file: map a byte port (a file reference) into payload", nil))
 	}
@@ -127,7 +129,7 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 	}
 
 	// Build request
-	req, err := n.buildRequest(ctx, &cfg, input.Data, reqBody, fileSize)
+	req, err := n.buildRequest(ctx, &cfg, input.Data, reqBody, fileSize, fileType)
 	if err != nil {
 		return runtime.ErrorOutput(err)
 	}
@@ -181,7 +183,7 @@ func redactURL(raw string) string {
 	return u.Scheme + "://" + u.Host
 }
 
-func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}, fileBody io.Reader, fileSize int64) (*http.Request, error) {
+func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}, fileBody io.Reader, fileSize int64, fileType string) (*http.Request, error) {
 	urlStr, usingConnection, conn, err := n.resolveURL(cfg, data)
 	if err != nil {
 		return nil, err
@@ -216,6 +218,10 @@ func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map
 	if err := n.applyHeaders(req, cfg, data); err != nil {
 		return nil, err
 	}
+	// A Content-Type header from config or input wins; otherwise the body goes as its file's type.
+	if body != nil && fileType != "" && req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", fileType)
+	}
 
 	// Apply auth only when using connection
 	if usingConnection {
@@ -223,6 +229,18 @@ func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map
 	}
 
 	return req, nil
+}
+
+// payloadContentType is the type a payload file is sent as when no header sets one: the type the
+// file was written with, else the type its name implies. A type that says only "bytes" is not
+// sent, so the server reads such a body as it did before the node set a type.
+func payloadContentType(ref fileref.FileRef) string {
+	for _, ct := range []string{ref.ContentType, fileref.ContentTypeFor(ref.FileName), fileref.ContentTypeFor(ref.Path)} {
+		if base := fileref.BaseContentType(ct); base != "" && base != fileref.ContentTypeOctetStream {
+			return ct
+		}
+	}
+	return ""
 }
 
 func (n *HTTPClientNode) resolveURL(
