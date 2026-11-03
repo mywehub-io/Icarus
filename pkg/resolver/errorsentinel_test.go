@@ -188,3 +188,60 @@ func TestBuildInputFromMappings_PluginErrorTrueViaFlatKey(t *testing.T) {
 		t.Errorf("expected persisterror == true, got %v", v)
 	}
 }
+
+// TestBuildInputFromMappings_PluginErrorFalseWhenSourceNeverFetched covers the success path the
+// fetch planner leaves unfetched: a unit whose only mapping from a source is its /error reads no
+// key of that source, so the source never reaches SourceResults. A consumer's condition on a
+// connector step's /error hit this (connector demo, UAT, 03/11/2026): the step's scope result
+// holds no /error, the condition failed "source node ... not found in source results".
+func TestBuildInputFromMappings_PluginErrorFalseWhenSourceNeverFetched(t *testing.T) {
+	for _, tc := range []struct {
+		endpoint string
+		want     interface{}
+	}{
+		{"/" + embeddedrt.ErrorOutputKeyError, false},
+		{"/" + embeddedrt.ErrorOutputKeyDescription, ""},
+	} {
+		params := BuildInputParams{
+			UnitNodeID: "condition-node",
+			FieldMappings: []message.FieldMapping{{
+				SourceNodeID:         "connector-step",
+				SourceSectionId:      embeddedrt.SectionPluginError,
+				SourceEndpoint:       tc.endpoint,
+				DestinationEndpoints: []string{"/gate"},
+				DataType:             "EVENT",
+			}},
+			SourceResults: map[string]*SourceResult{},
+		}
+		result, err := buildInputFromMappings(params)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.endpoint, err)
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal(result, &data); err != nil {
+			t.Fatalf("%s: output not valid JSON: %v", tc.endpoint, err)
+		}
+		if v, ok := data["gate"]; !ok || v != tc.want {
+			t.Errorf("%s: gate = %v (present %v), want %v", tc.endpoint, v, ok, tc.want)
+		}
+	}
+}
+
+// TestBuildInputFromMappings_DataMappingFromMissingSourceStillFails keeps the default to the
+// plugin-error section: a data mapping from a source that never arrived is still an error.
+func TestBuildInputFromMappings_DataMappingFromMissingSourceStillFails(t *testing.T) {
+	params := BuildInputParams{
+		UnitNodeID: "next-node",
+		FieldMappings: []message.FieldMapping{{
+			SourceNodeID:         "connector-step",
+			SourceSectionId:      embeddedrt.SectionDefault,
+			SourceEndpoint:       "/files",
+			DestinationEndpoints: []string{"/files"},
+			DataType:             "STRING",
+		}},
+		SourceResults: map[string]*SourceResult{},
+	}
+	if _, err := buildInputFromMappings(params); err == nil {
+		t.Fatal("a data mapping from a source that never arrived must fail")
+	}
+}

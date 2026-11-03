@@ -1041,6 +1041,21 @@ func buildInputFromMappings(params BuildInputParams) ([]byte, error) {
 			}
 		}
 
+		// The fetch planner fetches nothing for a plugin-error mapping it expects to miss
+		// (fetch_planner.go), so when that is all a unit reads from a source, no key of the
+		// source is read and the source never reaches SourceResults: flatKeyData is nil and
+		// the synthesis above never runs. That is the success path of a node whose result
+		// holds no /error, such as a connector step's scope: answer it with the same default
+		// the planner relied on. A source that failed wrote /error, so it was fetched.
+		if mapping.SourceSectionId == runtime.SectionPluginError && !hasSourceResult(params.SourceResults, mapping.SourceNodeID) {
+			if def := pluginErrorSectionDefault(mapping.SourceEndpoint); def != nil {
+				for _, destEndpoint := range mapping.DestinationEndpoints {
+					setFieldAtPath(inputData, destEndpoint, def)
+				}
+				continue
+			}
+		}
+
 		var sourceResult *SourceResult
 
 		if result, exists := params.SourceResults[mapping.SourceNodeID]; exists {
@@ -1757,6 +1772,22 @@ func navigateMap(data map[string]interface{}, path string) interface{} {
 // flat StandardUnitOutput. An absent key means the upstream node succeeded
 // without explicitly writing /error, so /error defaults to false and
 // /errorDescription defaults to "".
+// hasSourceResult reports whether nodeID's result reached SourceResults, under its own id or
+// inside another result's projected fields (one archive can hold several nodes).
+func hasSourceResult(sourceResults map[string]*SourceResult, nodeID string) bool {
+	if _, ok := sourceResults[nodeID]; ok {
+		return true
+	}
+	for _, r := range sourceResults {
+		if r != nil && r.ProjectedFields != nil {
+			if _, ok := r.ProjectedFields[nodeID]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func pluginErrorSectionDefault(sourceEndpoint string) interface{} {
 	endpoint := strings.TrimPrefix(sourceEndpoint, "/")
 	switch endpoint {
