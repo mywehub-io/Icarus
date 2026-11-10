@@ -25,13 +25,14 @@ const (
 )
 
 // streamingClient has no overall timeout; dial, TLS and the response headers are still bounded,
-// and idleReader bounds the body. Every dial passes the egress policy (egress.go).
-func streamingClient() *http.Client {
+// and idleReader bounds the body. Every dial passes the egress policy (egress.go), and every
+// redirect passes redirectPolicy (connection.go).
+func streamingClient(connHeaders []string, hadBody bool) *http.Client {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.ResponseHeaderTimeout = responseHeaderTimeout
 	// http.DefaultTransport's dialer, plus the policy.
 	t.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: guardDial}).DialContext
-	return &http.Client{Transport: t}
+	return &http.Client{Transport: t, CheckRedirect: redirectPolicy(connHeaders, hadBody)}
 }
 
 // idleReader cancels its context when no Read returns for idle, so a stalled peer fails the
@@ -129,13 +130,13 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 	}
 
 	// Build request
-	req, err := n.buildRequest(ctx, &cfg, input.Data, reqBody, fileSize, fileType)
+	req, connHeaders, err := n.buildRequest(ctx, &cfg, input.Data, reqBody, fileSize, fileType)
 	if err != nil {
 		return runtime.ErrorOutput(err)
 	}
 
 	// Execute request
-	client := streamingClient()
+	client := streamingClient(connHeaders, req.Body != nil && req.Body != http.NoBody)
 	resp, err := client.Do(req)
 	if err != nil {
 		// A refused destination is the workflow's configuration, not a fault a retry clears.
@@ -183,15 +184,30 @@ func redactURL(raw string) string {
 	return u.Scheme + "://" + u.Host
 }
 
-func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}, fileBody io.Reader, fileSize int64, fileType string) (*http.Request, error) {
+// buildRequest builds the request and returns, with it, the names of the headers the connection set
+// (its custom headers and its credential), which a redirect off the connection's host removes.
+//
+// Header order: the connection's custom headers, then the node's headers, then the connection's
+// credential. A node can override a connection's custom header, and nothing a node sets, including a
+// header from the run's data, can replace the credential.
+func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}, fileBody io.Reader, fileSize int64, fileType string) (*http.Request, []string, error) {
 	urlStr, usingConnection, conn, err := n.resolveURL(cfg, data)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if usingConnection && cfg.PathFromInput {
+		p, isText := data["path"].(string)
+		if raw, present := data["path"]; present && raw != nil && !isText {
+			return nil, nil, NewConfigError(n.NodeId(), "path", fmt.Sprintf("path from input must be text, not %T", raw), nil)
+		}
+		if urlStr, err = joinInputPath(n.NodeId(), urlStr, p); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	method, err := n.resolveMethod(cfg, data, usingConnection, conn)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var body io.Reader
@@ -207,28 +223,41 @@ func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map
 		// from the run's data and carry identifiers or tokens.
 		var ue *url.Error
 		if errors.As(err, &ue) {
-			return nil, NewConfigError(n.NodeId(), "url", "invalid URL", nil)
+			return nil, nil, NewConfigError(n.NodeId(), "url", "invalid URL", nil)
 		}
-		return nil, NewConfigError(n.NodeId(), "url", err.Error(), err)
+		return nil, nil, NewConfigError(n.NodeId(), "url", err.Error(), err)
 	}
 	if fileBody != nil && body != nil {
 		req.ContentLength = fileSize
 	}
 
+	// The connection's headers and credential go only with the connection's own URL.
+	var connHeaders []string
+	if usingConnection {
+		if connHeaders, err = applyConnectionHeaders(n.NodeId(), req, conn); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	if err := n.applyHeaders(req, cfg, data); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// A Content-Type header from config or input wins; otherwise the body goes as its file's type.
 	if body != nil && fileType != "" && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", fileType)
 	}
 
-	// Apply auth only when using connection
 	if usingConnection {
-		n.applyAuth(req, conn)
+		authHeader, err := applyAuth(n.NodeId(), req, conn)
+		if err != nil {
+			return nil, nil, err
+		}
+		if authHeader != "" {
+			connHeaders = append(connHeaders, authHeader)
+		}
 	}
 
-	return req, nil
+	return req, connHeaders, nil
 }
 
 // payloadContentType is the type a payload file is sent as when no header sets one: the type the
@@ -290,6 +319,13 @@ func (n *HTTPClientNode) resolveMethod(
 	conn map[string]interface{},
 ) (string, error) {
 	if usingConnection {
+		// The step's connection_method wins, so one connection serves every method its service
+		// takes; the connection's own method is the fallback. Only connection_method is read, never
+		// method: method is the setting for a URL from config or input, and a value left behind from
+		// one of those must not change what a connection's step sends.
+		if method := strings.ToUpper(strings.TrimSpace(cfg.ConnectionMethod)); method != "" {
+			return method, nil
+		}
 		method := strings.ToUpper(strings.TrimSpace(getString(conn, "method", "POST")))
 		if method == "" {
 			return "POST", nil
@@ -432,16 +468,6 @@ func buildInputHeaders(nodeID string, cfg *Config, data map[string]interface{}, 
 		result[name] = s
 	}
 	return result, nil
-}
-
-func (n *HTTPClientNode) applyAuth(req *http.Request, conn map[string]interface{}) {
-	// Only Bearer auth supported (matches Nyx HTTP schema: url, method, auth_type, bearer_token)
-	if strings.ToLower(getString(conn, "auth_type", "")) != "bearer" {
-		return
-	}
-	if token := getString(conn, "bearer_token", ""); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 }
 
 func getString(m map[string]interface{}, key, def string) string {
