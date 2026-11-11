@@ -62,13 +62,18 @@ type Config struct {
 	URL *BindableText `json:"url,omitempty"`
 	// Method is required when URL comes from config or input; it is ignored when URL comes from connection.
 	Method string `json:"method,omitempty"`
+	// ConnectionMethod is the method when URL comes from connection; empty uses the connection's own.
+	ConnectionMethod string `json:"connection_method,omitempty"`
+	// PathFromInput appends the input "path" to the connection's URL, after any connection_path.
+	// Only with URL from connection; the path may not name a scheme or host or climb out.
+	PathFromInput bool `json:"path_from_input,omitempty"`
 	// Headers is optional; when omitted, legacy manual_inputs key/value entries are treated as static headers.
 	Headers *BindableObject `json:"headers,omitempty"`
 
 	ManualInputs []ManualInput `json:"manual_inputs,omitempty"`
-	// Connection is populated by Elysium enrichment (connection_id -> connection details from Nyx).
-	// Contains: url, method, auth_type, bearer_token, basic_username, basic_password,
-	// api_key_header, api_key_value, custom_headers, etc.
+	// Connection is populated by Elysium enrichment (connection_id -> connection details from Nyx):
+	// url, method, auth_type, bearer_token, basic_username, basic_password, api_key_header,
+	// api_key_value and custom_headers, all of which the node sends (connection.go).
 	Connection map[string]interface{} `json:"connection"`
 }
 
@@ -93,6 +98,12 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	}
 	if v, ok := raw["method"]; ok {
 		_ = json.Unmarshal(v, &c.Method)
+	}
+	if v, ok := raw["connection_method"]; ok {
+		_ = json.Unmarshal(v, &c.ConnectionMethod)
+	}
+	if v, ok := raw["path_from_input"]; ok {
+		_ = json.Unmarshal(v, &c.PathFromInput)
 	}
 	if v, ok := raw["headers"]; ok {
 		var headers BindableObject
@@ -154,6 +165,12 @@ func (c *Config) Validate(nodeID string) error {
 		}
 	default:
 		return NewConfigError(nodeID, "url.source", fmt.Sprintf("unsupported url.source %q", urlSource), nil)
+	}
+
+	// A path from input is joined to the connection's URL, whose host it can never change. With a URL
+	// from config or input there is no such host to keep, so the setting is refused rather than ignored.
+	if c.PathFromInput && urlSource != "connection" {
+		return NewConfigError(nodeID, "path_from_input", "path_from_input needs url.source=connection", nil)
 	}
 
 	return nil

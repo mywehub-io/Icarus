@@ -13,6 +13,39 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### HTTP Client sends every credential on its connection, and can take a path from input
+
+- `public:` With the URL from the connection, the HTTP Client sends the credential for the
+  connection's `auth_type`: `bearer` (`bearer_token`), `basic` (`basic_username`,
+  `basic_password`) and `apikey` (`api_key_value` in the header `api_key_header`). Before, only
+  `bearer` was sent, and a `basic` or `apikey` connection ran unauthenticated with no error.
+- `public:` The connection's `custom_headers` (a JSON object of header names to values) are sent
+  too. Order: the connection's custom headers, then the node's headers, then the credential, so a
+  node header can replace a custom header but never the credential.
+- `public:` An `auth_type` whose credential is missing, an unknown `auth_type`, an invalid API key
+  header name or `custom_headers` that are not a JSON object of strings is a config error, and no
+  request is sent. This includes `bearer` with an empty `bearer_token`, which used to send no
+  `Authorization`.
+- `public:` A `bearer_token`, `api_key_value` or custom header value with a line break or control
+  character in it, most often a secret pasted with a newline at its end, is a config error naming
+  the field. Before, it failed as a transport error (`request failed: … invalid header field
+  value`) that named only the header.
+- `public:` A redirect that leaves the connection's scheme and host drops every header the
+  connection set, `Authorization` included. Go itself keeps `Authorization` within a domain and
+  never drops an API key or custom header.
+- `public:` A request that carries a body no longer follows redirects. The node reports the 3xx
+  status: following would have sent a GET without the body (301, 302, 303), or could not resend a
+  streamed body (307, 308).
+- `public:` New setting `connection_method`: the method with the URL from the connection. Empty
+  falls back to the connection's own method, as before. `method` is still read only for a URL from
+  config or input.
+- `public:` New setting `path_from_input`: appends the input `path` to the connection's URL, after
+  any `connection_path`. The path is refused if it names a scheme or host, holds user information,
+  a fragment, a backslash or whitespace, or climbs out with `..`, with `%2F` and `%5C` read as
+  separators for that check (`SYN%2F1` is accepted, `a%2F..%2Fadmin` is not). It needs
+  `url.source=connection`. A `path` that is not text is refused as such. The error never quotes
+  the path.
+
 ### HTTP Client sends the payload's content type
 
 - `public:` With no `Content-Type` header from config or input, the HTTP Client node sends a
