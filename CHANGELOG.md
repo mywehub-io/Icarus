@@ -13,6 +13,14 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### A small result archive is read with one GET
+
+- `internal:` A result archive of 64 KiB or less is downloaded with one GET and read in memory,
+  whichever entries the unit needs. Opening it over ranged reads cost two to four GETs: the
+  end-of-directory record, the central directory, the 64 KiB window behind the manifest (which
+  already held the whole file), and on a whole-file plan a second download of the same file.
+  Larger archives keep the ranged path.
+
 ### HTTP Client sends every credential on its connection, and can take a path from input
 
 - `public:` With the URL from the connection, the HTTP Client sends the credential for the

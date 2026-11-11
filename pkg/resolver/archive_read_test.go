@@ -253,3 +253,87 @@ func TestDownloadPayloadAdmitsConsumerGraphJSONAndRejectsAnythingElse(t *testing
 		t.Fatal("a blob that is neither an archive nor JSON was passed through silently")
 	}
 }
+
+// A result archive no larger than the read-ahead window costs one GET, whichever way the
+// planner decides: a few selected keys, or (above the 60% rule) the whole payload.
+func TestSmallArchiveIsReadWithOneGET(t *testing.T) {
+	doc := buildFixtureDoc(t)
+	cases := []struct {
+		name     string
+		mappings []message.FieldMapping
+	}{
+		{"selected keys", []message.FieldMapping{
+			{SourceNodeID: "solo", SourceEndpoint: "/name", DestinationEndpoints: []string{"/name"}},
+		}},
+		{"whole file", []message.FieldMapping{
+			{SourceNodeID: "solo", SourceEndpoint: "/", DestinationEndpoints: []string{"/a"}},
+			{SourceNodeID: "iter", SourceEndpoint: "/", DestinationEndpoints: []string{"/b"}},
+			{SourceNodeID: "child", SourceEndpoint: "/", DestinationEndpoints: []string{"/c"}},
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake, url := serveArchive(t, doc)
+			size := int64(len(fake.bodies[url]))
+			if size > smallArchiveBytes {
+				t.Fatalf("fixture is %d bytes, above the %d small-archive bound", size, smallArchiveBytes)
+			}
+			svc := NewService(fake)
+			files := []*RequiredBlobFile{{BlobURL: url, SizeBytes: size, ContainsNodes: []string{"solo", "iter", "child"}}}
+			got, err := svc.downloadAndParseBlobFiles(context.Background(), files, c.mappings)
+			if err != nil {
+				t.Fatalf("archive read: %v", err)
+			}
+			if got["solo"] == nil || got["solo"].RawFlatKeys["solo-/name"] != "david" {
+				t.Fatalf("solo-/name not resolved: %+v", got["solo"])
+			}
+			if n := fake.gets.Load(); n != 1 {
+				t.Fatalf("read requests = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// An archive above the bound keeps the ranged path: it is opened from its tail, never fetched
+// whole for a single key.
+func TestLargeArchiveKeepsRangedReads(t *testing.T) {
+	doc, err := json.Marshal(map[string]interface{}{
+		"solo-/name": "david",
+		"solo-/blob": largeString(int(smallArchiveBytes) * 3),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake, url := serveArchive(t, doc)
+	size := int64(len(fake.bodies[url]))
+	svc := NewService(fake)
+	files := []*RequiredBlobFile{{BlobURL: url, SizeBytes: size, ContainsNodes: []string{"solo"}}}
+	mappings := []message.FieldMapping{{SourceNodeID: "solo", SourceEndpoint: "/name", DestinationEndpoints: []string{"/name"}}}
+	got, err := svc.downloadAndParseBlobFiles(context.Background(), files, mappings)
+	if err != nil {
+		t.Fatalf("archive read: %v", err)
+	}
+	if got["solo"].RawFlatKeys["solo-/name"] != "david" {
+		t.Fatal("solo-/name not resolved")
+	}
+	if _, present := got["solo"].RawFlatKeys["solo-/blob"]; present {
+		t.Fatal("the large unselected key was fetched")
+	}
+	if n := fake.gets.Load(); n < 2 {
+		t.Fatalf("read requests = %d, want the ranged open (2 or more)", n)
+	}
+}
+
+// A small archive that comes back shorter than its reference says is an error, never a partial
+// result: a truncated archive would otherwise parse as whatever entries survived.
+func TestSmallArchiveShortReadIsAnError(t *testing.T) {
+	fake, url := serveArchive(t, buildFixtureDoc(t))
+	size := int64(len(fake.bodies[url])) + 5
+	svc := NewService(fake)
+	files := []*RequiredBlobFile{{BlobURL: url, SizeBytes: size, ContainsNodes: []string{"solo"}}}
+	mappings := []message.FieldMapping{{SourceNodeID: "solo", SourceEndpoint: "/name", DestinationEndpoints: []string{"/name"}}}
+	got, err := svc.downloadAndParseBlobFiles(context.Background(), files, mappings)
+	if err == nil || !strings.Contains(err.Error(), "want") {
+		t.Fatalf("short read: err = %v, result = %+v; want a size mismatch error", err, got)
+	}
+}

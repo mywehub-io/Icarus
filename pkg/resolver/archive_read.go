@@ -83,6 +83,12 @@ func (s *Service) readArchive(
 		}
 	}
 
+	// size > 0: a zero count asks DownloadRange for the whole blob, so an empty archive keeps the
+	// ranged path, which refuses it without a request.
+	if size > 0 && size <= smallArchiveBytes {
+		return s.readSmallArchive(ctx, f, sourceNodeIDs, mappings, size)
+	}
+
 	ra, err := storage.NewBlobReaderAt(ctx, s.blobClient, f.BlobURL, size)
 	if err != nil {
 		return nil, fmt.Errorf("resolver: open archive %s: %w", f.BlobURL, err)
@@ -102,6 +108,52 @@ func (s *Service) readArchive(
 	moved, requests := ra.Stats()
 	s.logArchiveRead(f, size, moved, requests, len(flat), plan)
 
+	return sourceResultsFromContent(flat, sourceNodeIDs, f.ContainsNodes), nil
+}
+
+// smallArchiveBytes is the size up to which an archive is fetched whole in one GET.
+//
+// Opening an archive over ranged reads costs at least two GETs (the end-of-directory record,
+// then the central directory) and a third for the 64 KiB window behind the manifest. For an
+// archive no larger than that window, the third GET alone already returns the whole file, so
+// fetching it whole up front moves no more bytes and saves every other round trip. Result
+// archives are usually a few KB.
+const smallArchiveBytes = storage.DefaultReadAheadBytes
+
+// readSmallArchive reads an archive of at most smallArchiveBytes with a single GET and serves
+// the plan from memory, whichever way the planner decides.
+func (s *Service) readSmallArchive(
+	ctx context.Context,
+	f *RequiredBlobFile,
+	sourceNodeIDs map[string]bool,
+	mappings []message.FieldMapping,
+	size int64,
+) (map[string]*SourceResult, error) {
+	data, err := s.blobClient.DownloadRange(ctx, f.BlobURL, 0, size)
+	if err != nil {
+		return nil, fmt.Errorf("resolver: download archive %s: %w", f.BlobURL, err)
+	}
+	if int64(len(data)) != size {
+		return nil, fmt.Errorf("resolver: download archive %s: got %d bytes, want %d", f.BlobURL, len(data), size)
+	}
+
+	reader, err := archive.NewReader(bytes.NewReader(data), size)
+	if err != nil {
+		return nil, fmt.Errorf("resolver: read archive %s: %w", f.BlobURL, err)
+	}
+	plan := planArchiveFetch(reader, f.ContainsNodes, mappings)
+
+	var flat map[string]interface{}
+	if plan.wholeFile {
+		flat, err = reader.FlatAll()
+	} else {
+		flat, err = reader.Flat(plan.keys)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolver: read archive entries from %s: %w", f.BlobURL, err)
+	}
+
+	s.logArchiveRead(f, size, size, 1, len(flat), plan)
 	return sourceResultsFromContent(flat, sourceNodeIDs, f.ContainsNodes), nil
 }
 
