@@ -23,6 +23,7 @@ import (
 	internaltracing "github.com/wehubfusion/Icarus/internal/tracing"
 	"github.com/wehubfusion/Icarus/pkg/client"
 	"github.com/wehubfusion/Icarus/pkg/message"
+	"github.com/wehubfusion/Icarus/pkg/storage"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -1761,8 +1762,10 @@ func (r *Runner) processMessage(ctx context.Context, msg *message.Message) error
 		))
 	defer span.End()
 
-	// Create a timeout context for message processing that respects both the main context and timeout
-	processCtx, cancel := context.WithTimeout(ctx, r.processTimeout)
+	// Create a timeout context for message processing that respects both the main context and timeout.
+	// It carries one unit cache, so the resolver reads each small upstream archive once however many
+	// times the unit resolves from it (its input, then its embedded nodes' prior unit outputs).
+	processCtx, cancel := context.WithTimeout(storage.WithUnitCache(ctx), r.processTimeout)
 	defer cancel()
 
 	// Check if the main context is already cancelled before starting processing

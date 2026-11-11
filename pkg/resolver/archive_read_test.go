@@ -10,6 +10,7 @@ import (
 
 	"github.com/wehubfusion/Icarus/pkg/archive"
 	"github.com/wehubfusion/Icarus/pkg/message"
+	"github.com/wehubfusion/Icarus/pkg/storage"
 )
 
 // This is the differential harness in miniature, and it is the primary safety net for the
@@ -335,5 +336,39 @@ func TestSmallArchiveShortReadIsAnError(t *testing.T) {
 	got, err := svc.downloadAndParseBlobFiles(context.Background(), files, mappings)
 	if err == nil || !strings.Contains(err.Error(), "want") {
 		t.Fatalf("short read: err = %v, result = %+v; want a size mismatch error", err, got)
+	}
+}
+
+// Within one unit (one context carrying a unit cache) an archive read twice costs one GET; without
+// a cache each read fetches it again.
+func TestUnitCacheServesTheSecondReadOfAnArchive(t *testing.T) {
+	doc := buildFixtureDoc(t)
+	mappings := []message.FieldMapping{{SourceNodeID: "solo", SourceEndpoint: "/name", DestinationEndpoints: []string{"/name"}}}
+	for _, c := range []struct {
+		name string
+		ctx  context.Context
+		want int64
+	}{
+		{"with a unit cache", storage.WithUnitCache(context.Background()), 1},
+		{"without one", context.Background(), 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fake, url := serveArchive(t, doc)
+			size := int64(len(fake.bodies[url]))
+			svc := NewService(fake)
+			for i := 0; i < 2; i++ {
+				files := []*RequiredBlobFile{{BlobURL: url, SizeBytes: size, ContainsNodes: []string{"solo", "iter", "child"}}}
+				got, err := svc.downloadAndParseBlobFiles(c.ctx, files, mappings)
+				if err != nil {
+					t.Fatalf("read %d: %v", i, err)
+				}
+				if got["solo"].RawFlatKeys["solo-/name"] != "david" {
+					t.Fatalf("read %d: solo-/name not resolved", i)
+				}
+			}
+			if n := fake.gets.Load(); n != c.want {
+				t.Fatalf("read requests = %d, want %d", n, c.want)
+			}
+		})
 	}
 }

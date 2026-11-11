@@ -13,13 +13,17 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
-### A small result archive is read with one GET
+### A small result archive is read with one GET, once per unit
 
 - `internal:` A result archive of 64 KiB or less is downloaded with one GET and read in memory,
   whichever entries the unit needs. Opening it over ranged reads cost two to four GETs: the
   end-of-directory record, the central directory, the 64 KiB window behind the manifest (which
   already held the whole file), and on a whole-file plan a second download of the same file.
   Larger archives keep the ranged path.
+- `internal:` The runner gives each unit's context a `storage.UnitCache`. The resolver keeps every
+  archive of 64 KiB or less it downloads there, so a unit that reads the same archive twice (its
+  input, then its embedded nodes' prior unit outputs) sends one GET. The cache lives as long as
+  the unit, and a result archive never changes while a later unit reads it.
 
 ### HTTP Client sends every credential on its connection, and can take a path from input
 

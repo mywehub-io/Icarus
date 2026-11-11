@@ -129,12 +129,20 @@ func (s *Service) readSmallArchive(
 	mappings []message.FieldMapping,
 	size int64,
 ) (map[string]*SourceResult, error) {
-	data, err := s.blobClient.DownloadRange(ctx, f.BlobURL, 0, size)
-	if err != nil {
-		return nil, fmt.Errorf("resolver: download archive %s: %w", f.BlobURL, err)
-	}
-	if int64(len(data)) != size {
-		return nil, fmt.Errorf("resolver: download archive %s: got %d bytes, want %d", f.BlobURL, len(data), size)
+	cache := storage.UnitCacheFrom(ctx)
+	data, cached := cache.Get(f.BlobURL)
+	var moved, requests int64
+	if !cached || int64(len(data)) != size {
+		var err error
+		data, err = s.blobClient.DownloadRange(ctx, f.BlobURL, 0, size)
+		if err != nil {
+			return nil, fmt.Errorf("resolver: download archive %s: %w", f.BlobURL, err)
+		}
+		if int64(len(data)) != size {
+			return nil, fmt.Errorf("resolver: download archive %s: got %d bytes, want %d", f.BlobURL, len(data), size)
+		}
+		cache.Put(f.BlobURL, data)
+		moved, requests = size, 1
 	}
 
 	reader, err := archive.NewReader(bytes.NewReader(data), size)
@@ -153,7 +161,7 @@ func (s *Service) readSmallArchive(
 		return nil, fmt.Errorf("resolver: read archive entries from %s: %w", f.BlobURL, err)
 	}
 
-	s.logArchiveRead(f, size, size, 1, len(flat), plan)
+	s.logArchiveRead(f, size, moved, requests, len(flat), plan)
 	return sourceResultsFromContent(flat, sourceNodeIDs, f.ContainsNodes), nil
 }
 
