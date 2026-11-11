@@ -147,17 +147,12 @@ func NewAzureBlobClient(connectionString, containerName string, logger *zap.Logg
 	}
 
 	credential, err := azblob.NewSharedKeyCredential(accountName, accountKey)
-		if err != nil {
+	if err != nil {
 		return nil, fmt.Errorf("failed to create shared key credential: %w", err)
-		}
-
-	var clientOpts *azblob.ClientOptions
-	if strings.HasPrefix(strings.ToLower(serviceURL), "http://") {
-		clientOpts = &azblob.ClientOptions{
-			ClientOptions: azcore.ClientOptions{
-				InsecureAllowCredentialWithHTTP: true,
-			},
 	}
+
+	clientOpts := &azblob.ClientOptions{
+		ClientOptions: clientOptions(strings.HasPrefix(strings.ToLower(serviceURL), "http://")),
 	}
 
 	client, err := azblob.NewClientWithSharedKeyCredential(serviceURL, credential, clientOpts)
@@ -376,13 +371,8 @@ func (a *AzureBlobClient) BlobSize(ctx context.Context, blobURL string) (int64, 
 // blobClientForURL builds a blob-level client for any URL in the same storage account.
 // Shared by DownloadFromURL and DownloadRange so the HTTP/Azurite carve-out lives once.
 func (a *AzureBlobClient) blobClientForURL(blobURL string) (*blob.Client, error) {
-	var clientOpts *blob.ClientOptions
-	if strings.HasPrefix(strings.ToLower(a.serviceURL), "http://") {
-		clientOpts = &blob.ClientOptions{
-			ClientOptions: azcore.ClientOptions{
-				InsecureAllowCredentialWithHTTP: true,
-			},
-		}
+	clientOpts := &blob.ClientOptions{
+		ClientOptions: clientOptions(strings.HasPrefix(strings.ToLower(a.serviceURL), "http://")),
 	}
 
 	blobClient, err := blob.NewClientWithSharedKeyCredential(blobURL, a.credential, clientOpts)

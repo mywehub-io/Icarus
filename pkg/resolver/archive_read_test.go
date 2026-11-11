@@ -10,6 +10,7 @@ import (
 
 	"github.com/wehubfusion/Icarus/pkg/archive"
 	"github.com/wehubfusion/Icarus/pkg/message"
+	"github.com/wehubfusion/Icarus/pkg/storage"
 )
 
 // This is the differential harness in miniature, and it is the primary safety net for the
@@ -251,5 +252,123 @@ func TestDownloadPayloadAdmitsConsumerGraphJSONAndRejectsAnythingElse(t *testing
 
 	if _, err := svc.downloadPayload(context.Background(), staleURL); err == nil {
 		t.Fatal("a blob that is neither an archive nor JSON was passed through silently")
+	}
+}
+
+// A result archive no larger than the read-ahead window costs one GET, whichever way the
+// planner decides: a few selected keys, or (above the 60% rule) the whole payload.
+func TestSmallArchiveIsReadWithOneGET(t *testing.T) {
+	doc := buildFixtureDoc(t)
+	cases := []struct {
+		name     string
+		mappings []message.FieldMapping
+	}{
+		{"selected keys", []message.FieldMapping{
+			{SourceNodeID: "solo", SourceEndpoint: "/name", DestinationEndpoints: []string{"/name"}},
+		}},
+		{"whole file", []message.FieldMapping{
+			{SourceNodeID: "solo", SourceEndpoint: "/", DestinationEndpoints: []string{"/a"}},
+			{SourceNodeID: "iter", SourceEndpoint: "/", DestinationEndpoints: []string{"/b"}},
+			{SourceNodeID: "child", SourceEndpoint: "/", DestinationEndpoints: []string{"/c"}},
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake, url := serveArchive(t, doc)
+			size := int64(len(fake.bodies[url]))
+			if size > smallArchiveBytes {
+				t.Fatalf("fixture is %d bytes, above the %d small-archive bound", size, smallArchiveBytes)
+			}
+			svc := NewService(fake)
+			files := []*RequiredBlobFile{{BlobURL: url, SizeBytes: size, ContainsNodes: []string{"solo", "iter", "child"}}}
+			got, err := svc.downloadAndParseBlobFiles(context.Background(), files, c.mappings)
+			if err != nil {
+				t.Fatalf("archive read: %v", err)
+			}
+			if got["solo"] == nil || got["solo"].RawFlatKeys["solo-/name"] != "david" {
+				t.Fatalf("solo-/name not resolved: %+v", got["solo"])
+			}
+			if n := fake.gets.Load(); n != 1 {
+				t.Fatalf("read requests = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// An archive above the bound keeps the ranged path: it is opened from its tail, never fetched
+// whole for a single key.
+func TestLargeArchiveKeepsRangedReads(t *testing.T) {
+	doc, err := json.Marshal(map[string]interface{}{
+		"solo-/name": "david",
+		"solo-/blob": largeString(int(smallArchiveBytes) * 3),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake, url := serveArchive(t, doc)
+	size := int64(len(fake.bodies[url]))
+	svc := NewService(fake)
+	files := []*RequiredBlobFile{{BlobURL: url, SizeBytes: size, ContainsNodes: []string{"solo"}}}
+	mappings := []message.FieldMapping{{SourceNodeID: "solo", SourceEndpoint: "/name", DestinationEndpoints: []string{"/name"}}}
+	got, err := svc.downloadAndParseBlobFiles(context.Background(), files, mappings)
+	if err != nil {
+		t.Fatalf("archive read: %v", err)
+	}
+	if got["solo"].RawFlatKeys["solo-/name"] != "david" {
+		t.Fatal("solo-/name not resolved")
+	}
+	if _, present := got["solo"].RawFlatKeys["solo-/blob"]; present {
+		t.Fatal("the large unselected key was fetched")
+	}
+	if n := fake.gets.Load(); n < 2 {
+		t.Fatalf("read requests = %d, want the ranged open (2 or more)", n)
+	}
+}
+
+// A small archive that comes back shorter than its reference says is an error, never a partial
+// result: a truncated archive would otherwise parse as whatever entries survived.
+func TestSmallArchiveShortReadIsAnError(t *testing.T) {
+	fake, url := serveArchive(t, buildFixtureDoc(t))
+	size := int64(len(fake.bodies[url])) + 5
+	svc := NewService(fake)
+	files := []*RequiredBlobFile{{BlobURL: url, SizeBytes: size, ContainsNodes: []string{"solo"}}}
+	mappings := []message.FieldMapping{{SourceNodeID: "solo", SourceEndpoint: "/name", DestinationEndpoints: []string{"/name"}}}
+	got, err := svc.downloadAndParseBlobFiles(context.Background(), files, mappings)
+	if err == nil || !strings.Contains(err.Error(), "want") {
+		t.Fatalf("short read: err = %v, result = %+v; want a size mismatch error", err, got)
+	}
+}
+
+// Within one unit (one context carrying a unit cache) an archive read twice costs one GET; without
+// a cache each read fetches it again.
+func TestUnitCacheServesTheSecondReadOfAnArchive(t *testing.T) {
+	doc := buildFixtureDoc(t)
+	mappings := []message.FieldMapping{{SourceNodeID: "solo", SourceEndpoint: "/name", DestinationEndpoints: []string{"/name"}}}
+	for _, c := range []struct {
+		name string
+		ctx  context.Context
+		want int64
+	}{
+		{"with a unit cache", storage.WithUnitCache(context.Background()), 1},
+		{"without one", context.Background(), 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fake, url := serveArchive(t, doc)
+			size := int64(len(fake.bodies[url]))
+			svc := NewService(fake)
+			for i := 0; i < 2; i++ {
+				files := []*RequiredBlobFile{{BlobURL: url, SizeBytes: size, ContainsNodes: []string{"solo", "iter", "child"}}}
+				got, err := svc.downloadAndParseBlobFiles(c.ctx, files, mappings)
+				if err != nil {
+					t.Fatalf("read %d: %v", i, err)
+				}
+				if got["solo"].RawFlatKeys["solo-/name"] != "david" {
+					t.Fatalf("read %d: solo-/name not resolved", i)
+				}
+			}
+			if n := fake.gets.Load(); n != c.want {
+				t.Fatalf("read requests = %d, want %d", n, c.want)
+			}
+		})
 	}
 }

@@ -25,8 +25,14 @@ const DefaultRangeChunkBytes int64 = 8 * 1024 * 1024
 //
 // A RangeReader is single-use and not safe for concurrent Reads. Close must be called,
 // including after an error or an early stop, to release the prefetch goroutine.
+//
+// Nothing is fetched until the first Read. A caller that opens a file and closes it unread, or
+// that only learns from the open that a value is a file, then costs no GET; a fetch started at
+// open would have pulled up to a whole chunk for nothing.
 type RangeReader struct {
 	cancel context.CancelFunc
+	start  sync.Once
+	run    func()
 	chunks chan rangeChunk
 	done   chan struct{}
 
@@ -42,12 +48,15 @@ type RangeReader struct {
 	exit error
 }
 
+// errClosedUnread is what a Read after Close reports when the reader was never read.
+var errClosedUnread = fmt.Errorf("range reader closed before it was read")
+
 type rangeChunk struct {
 	data []byte
 	err  error
 }
 
-// NewRangeReader starts streaming the range. A non-positive chunk uses
+// NewRangeReader prepares to stream the range; the first Read starts it. A non-positive chunk uses
 // DefaultRangeChunkBytes. A zero length yields an immediately exhausted reader.
 func NewRangeReader(ctx context.Context, src RangeDownloader, blobURL string, offset, length, chunk int64) (*RangeReader, error) {
 	if src == nil {
@@ -73,7 +82,7 @@ func NewRangeReader(ctx context.Context, src RangeDownloader, blobURL string, of
 		chunks: make(chan rangeChunk, 1),
 		done:   make(chan struct{}),
 	}
-	go r.fetch(ctx, src, blobURL, offset, length, chunk)
+	r.run = func() { go r.fetch(ctx, src, blobURL, offset, length, chunk) }
 	return r, nil
 }
 
@@ -131,6 +140,7 @@ func (r *RangeReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	r.start.Do(r.run)
 	for len(r.cur) == 0 {
 		if r.err != nil {
 			return 0, r.err
@@ -161,6 +171,14 @@ func (r *RangeReader) Read(p []byte) (int, error) {
 
 // Close stops any fetch in progress and waits for the prefetch goroutine to exit.
 func (r *RangeReader) Close() error {
+	r.start.Do(func() {
+		// Closed before the first Read: no fetch was started, so settle what it would have.
+		r.mu.Lock()
+		r.exit = errClosedUnread
+		r.mu.Unlock()
+		close(r.chunks)
+		close(r.done)
+	})
 	r.cancel()
 	<-r.done
 	r.cur = nil

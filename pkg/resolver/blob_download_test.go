@@ -27,9 +27,16 @@ type fakeBlobClient struct {
 	inFlight atomic.Int32
 	peak     atomic.Int32
 	hold     time.Duration
+
+	// gets counts every read request of any kind (whole, ranged, size), for round-trip tests.
+	gets atomic.Int64
 }
 
-func (f *fakeBlobClient) DownloadResult(ctx context.Context, blobURL string) ([]byte, error) {
+// enter models one read request: it counts it, tracks how many are in flight, and holds for
+// f.hold. Every read method goes through it, so latency and concurrency apply to ranged reads as
+// much as to whole-object ones. The caller must call the returned leave.
+func (f *fakeBlobClient) enter(ctx context.Context) (leave func(), err error) {
+	f.gets.Add(1)
 	cur := f.inFlight.Add(1)
 	for {
 		peak := f.peak.Load()
@@ -37,14 +44,22 @@ func (f *fakeBlobClient) DownloadResult(ctx context.Context, blobURL string) ([]
 			break
 		}
 	}
-	defer f.inFlight.Add(-1)
-
+	leave = func() { f.inFlight.Add(-1) }
 	if f.hold > 0 {
 		select {
 		case <-time.After(f.hold):
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return leave, ctx.Err()
 		}
+	}
+	return leave, nil
+}
+
+func (f *fakeBlobClient) DownloadResult(ctx context.Context, blobURL string) ([]byte, error) {
+	leave, err := f.enter(ctx)
+	defer leave()
+	if err != nil {
+		return nil, err
 	}
 
 	if err, ok := f.errs[blobURL]; ok {
@@ -72,7 +87,12 @@ func (f *fakeBlobClient) UploadResult(_ context.Context, blobPath string, data [
 func (f *fakeBlobClient) DownloadFromURL(ctx context.Context, blobURL string) ([]byte, error) {
 	return f.DownloadResult(ctx, blobURL)
 }
-func (f *fakeBlobClient) DownloadRange(_ context.Context, blobURL string, offset, count int64) ([]byte, error) {
+func (f *fakeBlobClient) DownloadRange(ctx context.Context, blobURL string, offset, count int64) ([]byte, error) {
+	leave, err := f.enter(ctx)
+	defer leave()
+	if err != nil {
+		return nil, err
+	}
 	// Injected failures apply to every read method, not just the whole-object one. The
 	// archive path reaches a blob through BlobSize and DownloadRange, so a fake that only
 	// failed DownloadResult would report a "missing body" error instead of the one the
@@ -95,6 +115,7 @@ func (f *fakeBlobClient) DownloadRange(_ context.Context, blobURL string, offset
 }
 
 func (f *fakeBlobClient) BlobSize(_ context.Context, blobURL string) (int64, error) {
+	f.gets.Add(1)
 	if err, ok := f.errs[blobURL]; ok {
 		return 0, err
 	}
