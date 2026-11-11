@@ -122,3 +122,43 @@ func TestRangeReaderHonoursCancellation(t *testing.T) {
 		t.Fatal("expected an error after cancellation")
 	}
 }
+
+func TestRangeReaderFetchesNothingUntilRead(t *testing.T) {
+	src := &sliceRanges{data: bytes.Repeat([]byte("x"), 100)}
+	r, err := NewRangeReader(context.Background(), src, "u", 0, 100, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := src.calls.Load(); n != 0 {
+		t.Fatalf("requests before Read = %d, want 0", n)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := src.calls.Load(); n != 0 {
+		t.Fatalf("requests after Close unread = %d, want 0", n)
+	}
+	if _, err := r.Read(make([]byte, 1)); err == nil {
+		t.Fatal("Read after Close succeeded, want an error")
+	}
+}
+
+func TestRangeReaderShortReadCostsOneRequest(t *testing.T) {
+	src := &sliceRanges{data: bytes.Repeat([]byte("x"), 100)}
+	r, err := NewRangeReader(context.Background(), src, "u", 0, 100, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := make([]byte, 8)
+	if _, err := io.ReadFull(r, head); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The first chunk was read; the read-ahead may have started the second before Close.
+	if n := src.calls.Load(); n < 1 || n > 2 {
+		t.Fatalf("requests = %d, want 1 (or 2 with read-ahead)", n)
+	}
+}

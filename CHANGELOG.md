@@ -13,7 +13,7 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
-### A small result archive is read with one GET, once per unit
+### A small result archive is read with one GET, once per unit, and an unread file costs nothing
 
 - `internal:` A result archive of 64 KiB or less is downloaded with one GET and read in memory,
   whichever entries the unit needs. Opening it over ranged reads cost two to four GETs: the
@@ -24,6 +24,10 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
   archive of 64 KiB or less it downloads there, so a unit that reads the same archive twice (its
   input, then its embedded nodes' prior unit outputs) sends one GET. The cache lives as long as
   the unit, and a result archive never changes while a later unit reads it.
+- `internal:` A run file opened and closed without a read sends no request. `storage.RangeReader`
+  (behind `filestore` `Open`) starts its first ranged GET on the first `Read`, not on open, so a
+  plugin that opens a file only to learn it is one (xlsx, sftp) no longer sends a GET of up to
+  8 MiB that it then cancels. A `Read` after such a `Close` returns an error.
 
 ### HTTP Client sends every credential on its connection, and can take a path from input
 
