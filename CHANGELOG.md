@@ -13,7 +13,7 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
-### A small result archive is read with one GET, once per unit, and an unread file costs nothing
+### Fewer blob round trips: one GET per small archive, once per unit, nothing for an unread file, and a larger connection pool
 
 - `internal:` A result archive of 64 KiB or less is downloaded with one GET and read in memory,
   whichever entries the unit needs. Opening it over ranged reads cost two to four GETs: the
@@ -28,6 +28,11 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
   (behind `filestore` `Open`) starts its first ranged GET on the first `Read`, not on open, so a
   plugin that opens a file only to learn it is one (xlsx, sftp) no longer sends a GET of up to
   8 MiB that it then cancels. A `Read` after such a `Close` returns an error.
+- `internal:` Every blob client in a process (the service client and the per-URL clients built
+  for ranged reads) shares one HTTP client that keeps 64 idle connections per storage host.
+  azcore's default keeps 10, so on a busy pod most calls past the tenth opened a new TLS
+  connection and dropped it after use. The other transport settings, HTTP/2 ping included, stay
+  azcore's defaults.
 
 ### HTTP Client sends every credential on its connection, and can take a path from input
 
