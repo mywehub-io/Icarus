@@ -68,6 +68,19 @@ type ConnectionConfig struct {
 	// should leave this at 0.
 	ConsumerInactiveThreshold time.Duration
 
+	// RunnerScope is the runner id this client publishes under (see Client.SetRunnerScope).
+	// Empty publishes results and heartbeats without one.
+	RunnerScope string
+
+	// VerifyOnly stops the client creating or changing streams and KV buckets (see
+	// Client.SetVerifyOnly). It still creates its own durable consumers.
+	VerifyOnly bool
+
+	// Options are extra nats.go options applied after the ones built from the fields above, so
+	// they win where both set the same thing. A runner passes its credentials here (for example
+	// nats.UserJWT), see Client.SetNATSOptions.
+	Options []nats.Option
+
 	// Logger receives disconnect, reconnect, and closed events. Optional; when nil
 	// connection lifecycle events are not logged.
 	Logger *zap.Logger
@@ -129,6 +142,7 @@ func Connect(ctx context.Context, config *ConnectionConfig) (*nats.Conn, error) 
 	} else if config.Username != "" && config.Password != "" {
 		opts = append(opts, nats.UserInfo(config.Username, config.Password))
 	}
+	opts = append(opts, config.Options...)
 
 	// Create a channel to handle connection result
 	type result struct {
