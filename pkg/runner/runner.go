@@ -432,7 +432,7 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 	if client.JetStream() == nil {
 		logger.Warn("JetStream handle not available; EXECUTION_HEARTBEATS heartbeat and claim disabled for this runner")
 	} else if kv, err := client.JetStream().KeyValue(ensureCtx, executionHeartbeatBucket); err == nil {
-		runner.heartbeatKV = kv
+		runner.heartbeatKV = runner.guardHeartbeats(kv, client.Connection())
 		runner.heartbeatConn = client.Connection()
 	} else if errors.Is(err, jetstream.ErrBucketNotFound) && verifyOnly {
 		// Zeus creates the bucket at startup; heartbeatBucket opens it once it is there.
@@ -440,11 +440,11 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 	} else if errors.Is(err, jetstream.ErrBucketNotFound) {
 		kv, createErr := client.JetStream().CreateKeyValue(ensureCtx, message.HeartbeatBucketConfig())
 		if createErr == nil {
-			runner.heartbeatKV = kv
+			runner.heartbeatKV = runner.guardHeartbeats(kv, client.Connection())
 			runner.heartbeatConn = client.Connection()
 		} else if errors.Is(createErr, jetstream.ErrBucketExists) {
 			if kv, getErr := client.JetStream().KeyValue(ensureCtx, executionHeartbeatBucket); getErr == nil {
-				runner.heartbeatKV = kv
+				runner.heartbeatKV = runner.guardHeartbeats(kv, client.Connection())
 				runner.heartbeatConn = client.Connection()
 			} else {
 				logger.Warn("EXECUTION_HEARTBEATS bucket exists but could not be opened; heartbeat and claim disabled for this runner", zap.Error(getErr))
@@ -584,8 +584,13 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	// handleMsg hands a fetched message to a worker, or in gated mode starts its goroutine. The
 	// caller holds an idle token or a gate slot for it, so the hand-over does not wait. It reports
-	// whether the message was taken; when it was not, the caller returns the token or slot.
-	handleMsg := func(jsMsg jetstream.Msg) bool {
+	// whether the message was taken; when it was not, the caller returns the token or slot. A
+	// message that is not a unit of work from this runner's consumer (admitDelivery) is refused
+	// before it is read.
+	handleMsg := func(jsMsg jetstream.Msg, filters []string) bool {
+		if !r.admitDelivery(jsMsg, filters) {
+			return false
+		}
 		msg := toUnit(jsMsg)
 		if msg == nil {
 			return false
@@ -652,6 +657,8 @@ func (r *Runner) Run(ctx context.Context) error {
 			// client) cons is resolved again, or it keeps fetching over a connection that is
 			// closed or abandoned.
 			consConn *nats.Conn
+			// filters are the subjects cons delivers, read when it is resolved (admitDelivery).
+			filters []string
 			// want is how many units a gated fetch asks for: as many as the consumer reported
 			// still waiting after the last fetch (up to batchSize), or 1 when nothing is, so an
 			// idle runner's open pull holds one slot rather than a batch.
@@ -727,6 +734,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				}
 				cons = c
 				consConn = conn
+				filters = consumerFilters(cons, r.consumerFilterSubject)
 				r.recordMaxDeliver(cons)
 				r.logger.Info("JetStream fetch started",
 					zap.String("stream", r.stream),
@@ -765,7 +773,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				if md, mdErr := jsMsg.Metadata(); mdErr == nil && md != nil {
 					pendingAfter, sawPending = md.NumPending, true
 				}
-				if handleMsg(jsMsg) {
+				if handleMsg(jsMsg, filters) {
 					handed++
 				}
 			}
@@ -1348,12 +1356,18 @@ func claimExecutionUnit(ctx context.Context, kv jetstream.KeyValue, key string, 
 			return claimBusy, err
 		}
 
+		// A reflected entry (guardedHeartbeats) was not written by a runner: nothing in it is read,
+		// and it is taken over on its revision, which replaces it.
+		reflected := reflectedEntry(entry)
 		var cur executionHeartbeat
-		_ = json.Unmarshal(entry.Value(), &cur) // an unreadable entry is treated as running
+		if !reflected {
+			_ = json.Unmarshal(entry.Value(), &cur) // an unreadable entry is treated as running
+		}
 		switch {
-		case cur.State == heartbeatDone && cur.ExecutionID == hb.ExecutionID:
+		case !reflected && cur.State == heartbeatDone && cur.ExecutionID == hb.ExecutionID:
 			return claimDuplicate, nil
-		case cur.State == heartbeatRetrying,
+		case reflected,
+			cur.State == heartbeatRetrying,
 			cur.State == heartbeatQueued,
 			cur.State == heartbeatDone,
 			now.Sub(entry.Created()) >= claimStaleAfter,
@@ -2292,9 +2306,9 @@ func (r *Runner) heartbeats(ctx context.Context) jetstream.KeyValue {
 		r.heartbeatKV = nil
 		return nil
 	}
-	r.heartbeatKV = kv
+	r.heartbeatKV = r.guardHeartbeats(kv, conn)
 	r.heartbeatConn = conn
-	return kv
+	return r.heartbeatKV
 }
 
 // bucketGone reports whether a KV error means the bucket itself no longer exists.

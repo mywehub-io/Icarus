@@ -13,6 +13,31 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Added: the runner refuses server answers stored in its work stream or heartbeat bucket
+
+NATS does not check the reply subject of a request, so another customer's runner can make the
+JetStream server publish an answer (a direct get, a publish ack, an API response) to one of this
+runner's subjects, where a stream stores it as a unit of work or a heartbeat entry.
+
+- `public:` `message.IsReflection(subject string, h nats.Header, data []byte) (bool, string)`
+  reports whether a message is such an answer, and why: a `Nats-Subject` value that differs from
+  the subject, a `Status` header, `Nats-Stream` without `Nats-Subject`, or a body that is a
+  JetStream API response or publish ack.
+- `public:` The runner terminates a delivered unit that `message.IsReflection` reports, or whose
+  subject is outside its consumer's filter, before reading it: it is never run, retried or
+  answered with a result, and a warning names the subject, stream and reason. A delivery from
+  another stream or consumer is not processed or acknowledged.
+- `public:` The runner reads `EXECUTION_HEARTBEATS` entries with a direct get by subject
+  (`$JS.API.DIRECT.GET.KV_EXECUTION_HEARTBEATS.$KV.EXECUTION_HEARTBEATS.<key>`) instead of the KV
+  API, so it can see their headers. A scoped runner needs permission to send it for its own keys
+  (`...<runner id>.>`); without it a claim times out and the unit waits. A reflected entry is
+  treated as absent: its contents are not read, and the claim or hand-off writes over it on its
+  revision. A bucket that answers no direct gets is read through the KV API, without the check.
+- `internal:` A hand-off copy no longer carries a `Status` header, and `Nats-` headers are
+  dropped in any case, so the copy's own delivery is not refused.
+- `internal:` `github.com/nats-io/nats-server/v2` v2.11.8 is a test dependency, for tests that run
+  the refusals against an embedded server.
+
 ### Added: runner scope, verify-only and extra NATS options
 
 All three are off unless a caller turns them on, so existing callers are unchanged. They prepare

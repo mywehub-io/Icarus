@@ -117,8 +117,11 @@ func (r *Runner) handOff(msg *message.Message, workflowID, runID, nodeID, execut
 	header := nats.Header{}
 	for k, v := range jsMsg.Headers() {
 		// Server-set and publish-control headers (Nats-Msg-Id, Nats-Expected-*) are not copied:
-		// the copy is a new publish with its own id.
-		if strings.HasPrefix(k, "Nats-") {
+		// the copy is a new publish with its own id. Nor is a status: with Nats-Stream and
+		// Nats-Subject it marks a server answer, which the copy's delivery would refuse
+		// (message.IsReflection). Any case, since header names are matched without it.
+		if len(k) >= len("Nats-") && strings.EqualFold(k[:len("Nats-")], "Nats-") ||
+			strings.EqualFold(k, "Status") {
 			continue
 		}
 		header[k] = append([]string(nil), v...)
@@ -198,6 +201,10 @@ func (r *Runner) markQueued(msg *message.Message, workflowID, runID, nodeID, exe
 	var rev uint64
 	entry, err := kv.Get(ctx, key)
 	switch {
+	case err == nil && reflectedEntry(entry):
+		// Not written by a runner (guardedHeartbeats): no claim of anyone's, so it is replaced on
+		// its revision, as a missing entry would be created.
+		rev, err = kv.Update(ctx, key, payload, entry.Revision())
 	case err == nil:
 		var cur executionHeartbeat
 		if json.Unmarshal(entry.Value(), &cur) != nil || cur.Owner != processToken ||
