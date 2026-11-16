@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,6 +106,69 @@ func (c *Client) SetConsumerInactiveThreshold(d time.Duration) {
 	}
 }
 
+// SetRunnerScope names the runner this client works for. Results are then published to
+// <resultSubject>.<runnerID>, and a runner built on this client keys its EXECUTION_HEARTBEATS
+// entries <runnerID>.<workflow>.<run>.<node>. NATS (operator mode) can then confine a customer
+// runner to subjects and keys under its own id. Empty, the default, keeps the unscoped forms.
+//
+// Turn it on only once Zeus reads both forms (its result stream takes <resultSubject>.* and its
+// liveness sweeper reads both heartbeat keys): an older Zeus finds neither. Call before Connect;
+// after Connect, the value is propagated to the MessageService.
+func (c *Client) SetRunnerScope(runnerID string) {
+	if c == nil || c.config == nil {
+		return
+	}
+	c.config.RunnerScope = strings.TrimSpace(runnerID)
+	if c.Messages != nil {
+		c.Messages.SetRunnerScope(c.config.RunnerScope)
+	}
+}
+
+// SetVerifyOnly stops this client creating or changing JetStream streams and KV buckets. It then
+// only looks them up: a missing one is an error (a runner waits and retries), and an existing
+// one's size cap is left alone. It still creates its own durable consumers.
+//
+// A customer runner in NATS operator mode is not allowed to create or update streams, so the
+// platform (Zeus) creates them and the runner turns this on. Off, the default, keeps today's
+// create-if-missing behaviour. Call before Connect; after Connect, the value is propagated to the
+// MessageService.
+func (c *Client) SetVerifyOnly(on bool) {
+	if c == nil || c.config == nil {
+		return
+	}
+	c.config.VerifyOnly = on
+	if c.Messages != nil {
+		c.Messages.SetVerifyOnly(on)
+	}
+}
+
+// VerifyOnly reports whether SetVerifyOnly is on.
+func (c *Client) VerifyOnly() bool {
+	if c == nil || c.config == nil {
+		return false
+	}
+	return c.config.VerifyOnly
+}
+
+// SetNATSOptions adds nats.go options to the connection, applied after Icarus's own, so they win
+// where both set the same thing. A customer runner passes its credentials this way, for example
+// nats.UserJWT with callbacks that read the current JWT and sign the server's nonce, so a renewed
+// JWT is picked up on the next reconnect. Takes effect on the next Connect.
+func (c *Client) SetNATSOptions(opts ...natsclient.Option) {
+	if c == nil || c.config == nil {
+		return
+	}
+	c.config.Options = append([]natsclient.Option(nil), opts...)
+}
+
+// RunnerScope is the runner id set by SetRunnerScope, or "".
+func (c *Client) RunnerScope() string {
+	if c == nil || c.config == nil {
+		return ""
+	}
+	return c.config.RunnerScope
+}
+
 // NewClientWithConfig creates a new JetStream SDK client with custom configuration.
 // This allows full control over connection parameters such as reconnection settings,
 // timeouts, and authentication.
@@ -201,6 +265,12 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	if c.config.ConsumerInactiveThreshold > 0 {
 		msgService.SetInactiveThreshold(c.config.ConsumerInactiveThreshold)
+	}
+	if c.config.RunnerScope != "" {
+		msgService.SetRunnerScope(c.config.RunnerScope)
+	}
+	if c.config.VerifyOnly {
+		msgService.SetVerifyOnly(true)
 	}
 	if c.blobStorage != nil {
 		msgService.SetBlobStorage(c.blobStorage)

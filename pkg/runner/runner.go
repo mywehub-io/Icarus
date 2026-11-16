@@ -397,13 +397,27 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 	}
 
 	// Ensure the stream and consumer exist, create them if necessary
+	//
+	// A verify-only client (Client.SetVerifyOnly) may not create the stream. A missing one is then
+	// not fatal: the platform creates it, and the consume loop below keeps resolving the consumer
+	// with backoff and creates the durable once the stream is there.
 	ensureCtx := context.Background()
+	verifyOnly := client.Messages.VerifyOnly()
+	streamReady := true
 	if err := client.Messages.EnsureStream(ensureCtx, stream); err != nil {
-		return nil, fmt.Errorf("failed to ensure stream '%s' exists: %w", stream, err)
+		if !verifyOnly || !errors.Is(err, message.ErrVerifyOnlyStreamMissing) {
+			return nil, fmt.Errorf("failed to ensure stream '%s' exists: %w", stream, err)
+		}
+		streamReady = false
+		logger.Warn("JetStream stream does not exist yet and this runner may not create it; waiting for the platform to create it",
+			zap.String("stream", stream),
+			zap.String("consumer", consumer))
 	}
 
-	if err := client.Messages.EnsureConsumer(ensureCtx, stream, consumer, runner.consumerFilterSubject); err != nil {
-		return nil, fmt.Errorf("failed to ensure consumer '%s' exists: %w", consumer, err)
+	if streamReady {
+		if err := client.Messages.EnsureConsumer(ensureCtx, stream, consumer, runner.consumerFilterSubject); err != nil {
+			return nil, fmt.Errorf("failed to ensure consumer '%s' exists: %w", consumer, err)
+		}
 	}
 
 	// Ensure the EXECUTION_HEARTBEATS KV bucket exists. Multiple runners (multiple plugins,
@@ -420,6 +434,9 @@ func NewRunner(client *client.Client, processor Processor, stream, consumer stri
 	} else if kv, err := client.JetStream().KeyValue(ensureCtx, executionHeartbeatBucket); err == nil {
 		runner.heartbeatKV = kv
 		runner.heartbeatConn = client.Connection()
+	} else if errors.Is(err, jetstream.ErrBucketNotFound) && verifyOnly {
+		// Zeus creates the bucket at startup; heartbeatBucket opens it once it is there.
+		logger.Warn("EXECUTION_HEARTBEATS bucket does not exist and this runner may not create it; heartbeat and claim disabled until it appears")
 	} else if errors.Is(err, jetstream.ErrBucketNotFound) {
 		kv, createErr := client.JetStream().CreateKeyValue(ensureCtx, message.HeartbeatBucketConfig())
 		if createErr == nil {
@@ -670,7 +687,10 @@ func (r *Runner) Run(ctx context.Context) error {
 						// restart): recreate it, then the consumer below. Retrying the resolve alone
 						// can never succeed, and the runner stopped consuming for the life of the
 						// process.
-						if ensureErr := r.client.Messages.EnsureStream(ctx, r.stream); ensureErr != nil {
+						if ensureErr := r.client.Messages.EnsureStream(ctx, r.stream); errors.Is(ensureErr, message.ErrVerifyOnlyStreamMissing) {
+							r.logger.Warn("JetStream stream does not exist and this runner may not create it; waiting for the platform to create it",
+								zap.String("stream", r.stream))
+						} else if ensureErr != nil {
 							r.logger.Error("Failed to create the missing JetStream stream again",
 								zap.String("stream", r.stream),
 								zap.Error(ensureErr))
@@ -1248,6 +1268,21 @@ func executionHeartbeatKey(workflowID, runID, nodeID string) string {
 	return fmt.Sprintf("%s.%s.%s", workflowID, runID, nodeID)
 }
 
+// scopedExecutionHeartbeatKey prefixes the key with the runner id when there is one
+// (Client.SetRunnerScope), so NATS can confine a customer runner to keys under its own id. Zeus's
+// liveness sweeper reads this form first and the unprefixed one after it.
+func scopedExecutionHeartbeatKey(runnerScope, workflowID, runID, nodeID string) string {
+	if runnerScope == "" {
+		return executionHeartbeatKey(workflowID, runID, nodeID)
+	}
+	return runnerScope + "." + executionHeartbeatKey(workflowID, runID, nodeID)
+}
+
+// heartbeatKey is this runner's EXECUTION_HEARTBEATS key for one execution unit.
+func (r *Runner) heartbeatKey(workflowID, runID, nodeID string) string {
+	return scopedExecutionHeartbeatKey(r.client.RunnerScope(), workflowID, runID, nodeID)
+}
+
 // deliverAttempt returns which attempt this delivery of msg's unit is: its JetStream NumDelivered,
 // plus the attempts the unit used before it was last handed off (HeaderAttemptOffset), so a
 // hand-off neither resets nor uses up the unit's attempts. It returns 0 if msg has no JetStream
@@ -1364,7 +1399,7 @@ func (r *Runner) claimOrNak(ctx context.Context, msg *message.Message, workflowI
 		r.nakClaimUnavailable(msg, workflowID, runID, nodeID, errors.New("EXECUTION_HEARTBEATS bucket unavailable"))
 		return false
 	}
-	key := executionHeartbeatKey(workflowID, runID, nodeID)
+	key := r.heartbeatKey(workflowID, runID, nodeID)
 	hb := executionHeartbeat{
 		WorkflowID:  workflowID,
 		RunID:       runID,
@@ -1453,7 +1488,7 @@ func (r *Runner) setHeartbeatState(msg *message.Message, workflowID, runID, node
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), heartbeatKVTimeout)
 	defer cancel()
-	if _, err := kv.Put(ctx, executionHeartbeatKey(workflowID, runID, nodeID), payload); err != nil {
+	if _, err := kv.Put(ctx, r.heartbeatKey(workflowID, runID, nodeID), payload); err != nil {
 		r.logger.Warn("Failed to write execution heartbeat state",
 			zap.String("workflow_id", workflowID),
 			zap.String("run_id", runID),
@@ -1604,7 +1639,7 @@ func (r *Runner) startAckHeartbeat(ctx context.Context, msg *message.Message, wo
 	}
 	pod := os.Getenv("HOSTNAME")
 	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
-	key := executionHeartbeatKey(workflowID, runID, nodeID)
+	key := r.heartbeatKey(workflowID, runID, nodeID)
 
 	go func() {
 		defer close(stopped)
@@ -2246,7 +2281,7 @@ func (r *Runner) heartbeats(ctx context.Context) jetstream.KeyValue {
 	openCtx, cancel := context.WithTimeout(ctx, heartbeatKVTimeout)
 	defer cancel()
 	kv, err := js.KeyValue(openCtx, executionHeartbeatBucket)
-	if errors.Is(err, jetstream.ErrBucketNotFound) {
+	if errors.Is(err, jetstream.ErrBucketNotFound) && !r.client.Messages.VerifyOnly() {
 		kv, err = js.CreateKeyValue(openCtx, message.HeartbeatBucketConfig())
 		if errors.Is(err, jetstream.ErrBucketExists) {
 			kv, err = js.KeyValue(openCtx, executionHeartbeatBucket)

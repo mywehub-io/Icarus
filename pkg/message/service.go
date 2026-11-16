@@ -67,6 +67,59 @@ type MessageService struct {
 	// result publish does not pay a STREAM.INFO round trip each time. Cleared when a publish finds
 	// the stream gone, which recreates it before the next attempt.
 	resultStreamKnown atomic.Bool
+	// runnerScope is the runner id appended to resultSubject when results are published
+	// (SetRunnerScope). Empty publishes to resultSubject itself.
+	runnerScope string
+	// verifyOnly stops EnsureStream and the result stream check creating a missing stream or
+	// changing an existing one's size cap (SetVerifyOnly).
+	verifyOnly bool
+}
+
+// ErrVerifyOnlyStreamMissing is returned, wrapping jetstream.ErrStreamNotFound, when a stream is
+// missing and the service is verify-only, so it may not create it.
+var ErrVerifyOnlyStreamMissing = errors.New("stream does not exist and this client may not create streams (verify-only)")
+
+// SetVerifyOnly makes the service only look streams up: a missing stream is an error wrapping
+// ErrVerifyOnlyStreamMissing and jetstream.ErrStreamNotFound, and an existing stream's size cap is
+// left as it is. A customer runner in NATS operator mode has no right to create or update streams;
+// the platform creates them.
+func (s *MessageService) SetVerifyOnly(on bool) {
+	s.verifyOnly = on
+}
+
+// VerifyOnly reports whether SetVerifyOnly is on.
+func (s *MessageService) VerifyOnly() bool {
+	return s != nil && s.verifyOnly
+}
+
+func (s *MessageService) verifyOnlyMissing(streamName string) error {
+	return fmt.Errorf("stream '%s': %w: %w", streamName, ErrVerifyOnlyStreamMissing, jetstream.ErrStreamNotFound)
+}
+
+// SetRunnerScope makes PublishResult publish to <resultSubject>.<runnerID>, so the subject names
+// the runner that sent the result. NATS can then let a customer runner publish results only under
+// its own id, and Zeus checks the id against the run's runner. Zeus must already read the result
+// stream on <resultSubject>.* before a runner turns this on.
+func (s *MessageService) SetRunnerScope(runnerID string) {
+	s.runnerScope = strings.TrimSpace(runnerID)
+}
+
+// resultPublishSubject is the subject PublishResult publishes to.
+func (s *MessageService) resultPublishSubject() string {
+	if s.runnerScope != "" {
+		return s.resultSubject + "." + s.runnerScope
+	}
+	return s.resultSubject
+}
+
+// resultStreamSubjects are the subjects a result stream created here listens on. They match
+// what Zeus creates (zeus/adapters/nats/result_consumer.go), so a stream a runner had to create
+// still takes runner-scoped results.
+func (s *MessageService) resultStreamSubjects() []string {
+	if s.runnerScope != "" {
+		return []string{s.resultSubject, s.resultSubject + ".*"}
+	}
+	return []string{s.resultSubject}
 }
 
 // BlobStorageClient interface for storing large results
@@ -153,12 +206,15 @@ func (s *MessageService) EnsureStream(ctx context.Context, streamName string) er
 	if err != nil {
 		// Stream doesn't exist, create it
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			if s.verifyOnly {
+				return s.verifyOnlyMissing(streamName)
+			}
 			s.logger.Info("Creating JetStream stream",
 				zap.String("stream", streamName))
 
 			subjects := []string{fmt.Sprintf("%s.>", streamName)}
 			if streamName == s.resultStream && s.resultSubject != "" {
-				subjects = []string{s.resultSubject}
+				subjects = s.resultStreamSubjects()
 			}
 
 			streamConfig := WorkStreamConfig(jetstream.StreamConfig{
@@ -192,6 +248,9 @@ func (s *MessageService) EnsureStream(ctx context.Context, streamName string) er
 		s.logger.Info("JetStream stream already exists",
 			zap.String("stream", streamName),
 			zap.Uint64("messages", msgs))
+		if s.verifyOnly {
+			return nil
+		}
 		if err := s.ensureSizeCap(ctx, stream); err != nil {
 			return err
 		}
@@ -298,7 +357,7 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 
 	// Check if stream exists
 	existing, err := s.js.Stream(ctx, streamName)
-	if err == nil {
+	if err == nil && !s.verifyOnly {
 		if capErr := s.ensureSizeCap(ctx, existing); capErr != nil {
 			return capErr
 		}
@@ -306,6 +365,9 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 	if err != nil {
 		// Stream doesn't exist
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			if s.verifyOnly {
+				return s.verifyOnlyMissing(streamName)
+			}
 			s.logger.Info("Creating JetStream stream for subject",
 				zap.String("stream", streamName),
 				zap.String("subject", s.resultSubject),
@@ -313,7 +375,7 @@ func (s *MessageService) ensureResultStream(ctx context.Context) error {
 
 			streamConfig := WorkStreamConfig(jetstream.StreamConfig{
 				Name:     streamName,
-				Subjects: []string{s.resultSubject},
+				Subjects: s.resultStreamSubjects(),
 				Storage:  jetstream.FileStorage,
 				MaxAge:   24 * time.Hour,
 				MaxMsgs:  100000,
@@ -351,9 +413,10 @@ func (s *MessageService) PublishResult(ctx context.Context, resultMsg *ResultMes
 		return sdkerrors.NewValidationError("result message cannot be nil", "INVALID_MESSAGE", nil)
 	}
 
-	// Results publish flat to the configured result subject. The subject is
-	// tenant-free and shared; Zeus correlates results by run/execution ID.
-	publishSubject := s.resultSubject
+	// Results publish to the configured result subject, followed by the runner id when the
+	// service has a runner scope. Zeus correlates results by run/execution ID and, with a runner
+	// id, checks it against the run's runner.
+	publishSubject := s.resultPublishSubject()
 
 	// Ensure result stream exists
 	if err := s.ensureResultStream(ctx); err != nil {

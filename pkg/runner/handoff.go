@@ -194,7 +194,7 @@ func (r *Runner) markQueued(msg *message.Message, workflowID, runID, nodeID, exe
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), heartbeatKVTimeout)
 	defer cancel()
-	key := executionHeartbeatKey(workflowID, runID, nodeID)
+	key := r.heartbeatKey(workflowID, runID, nodeID)
 	var rev uint64
 	entry, err := kv.Get(ctx, key)
 	switch {
@@ -232,7 +232,7 @@ func (r *Runner) setQueuedSeq(msg *message.Message, workflowID, runID, nodeID, e
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), heartbeatKVTimeout)
 	defer cancel()
-	if _, err := kv.Update(ctx, executionHeartbeatKey(workflowID, runID, nodeID), payload, rev); err != nil &&
+	if _, err := kv.Update(ctx, r.heartbeatKey(workflowID, runID, nodeID), payload, rev); err != nil &&
 		!errors.Is(err, jetstream.ErrKeyExists) {
 		r.logger.Warn("Failed to record where the handed-off unit waits; Zeus may see it as silent until it is claimed",
 			zap.String("workflow_id", workflowID), zap.String("run_id", runID), zap.String("node_id", nodeID), zap.Error(err))
@@ -251,7 +251,7 @@ func (r *Runner) restoreRunning(msg *message.Message, workflowID, runID, nodeID,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), heartbeatKVTimeout)
 	defer cancel()
-	if _, err := kv.Update(ctx, executionHeartbeatKey(workflowID, runID, nodeID), payload, rev); err != nil {
+	if _, err := kv.Update(ctx, r.heartbeatKey(workflowID, runID, nodeID), payload, rev); err != nil {
 		r.logger.Warn("Failed to restore the claim after a failed hand-off; the heartbeat rewrites it",
 			zap.String("workflow_id", workflowID), zap.String("run_id", runID), zap.String("node_id", nodeID), zap.Error(err))
 	}

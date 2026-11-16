@@ -13,6 +13,24 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Added: runner scope, verify-only and extra NATS options
+
+All three are off unless a caller turns them on, so existing callers are unchanged. They prepare
+customer runners for NATS operator mode, where a runner may use only subjects carrying its own id
+and may not create or change streams.
+
+- `public:` `Client.SetRunnerScope(runnerID)`: results are published to
+  `<result subject>.<runnerID>`, and `EXECUTION_HEARTBEATS` keys become
+  `<runnerID>.<workflow>.<run>.<node>`. A results stream this client creates also listens on
+  `<result subject>.*`. Zeus must read both forms before a runner turns this on.
+- `public:` `Client.SetVerifyOnly(true)`: the client only looks streams and the heartbeat bucket up.
+  It never creates them or changes their size cap. A missing work stream returns
+  `message.ErrVerifyOnlyStreamMissing` (which also matches `jetstream.ErrStreamNotFound`), and the
+  runner waits and retries until the platform creates it. Durable consumers are still created.
+- `public:` `Client.SetNATSOptions(opts...)`: extra nats.go options, applied after Icarus's own, for
+  credentials (`nats.UserJWT`), an inbox prefix and an error handler. Takes effect on the next
+  `Connect`.
+
 ### Fewer blob round trips: one GET per small archive, once per unit, nothing for an unread file, and a larger connection pool
 
 - `internal:` A result archive of 64 KiB or less is downloaded with one GET and read in memory,
