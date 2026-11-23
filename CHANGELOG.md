@@ -13,6 +13,30 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Added: HTTP Client signs in with OAuth2
+
+A connection with `auth_type` `oauth2` (Nyx's HTTP schema) no longer needs a token pasted into it:
+the node gets one itself (`pkg/embedded/processors/httpclient/oauth2.go`).
+
+- `public:` `auth_type` `oauth2` signs in at `oauth2_token_url` with `oauth2_grant` `password`
+  (`oauth2_username`, `oauth2_password`) or `client_credentials` (`oauth2_client_secret`), with
+  `oauth2_client_id` and an optional `oauth2_scope`, and sends the access token as
+  `Authorization: Bearer`. A field the grant needs, if missing, fails the node with a config error
+  naming it. No other grant, no refresh token and no signed client assertion.
+- `public:` The token is kept per process, keyed by the connection and a hash of every sign-in
+  value, until a tenth of its life before it expires (at most a minute; 300 seconds when the answer
+  has no `expires_in`). Concurrent steps needing the same token sign in once.
+- `public:` A 401 to a kept token drops it, signs in again and sends the request once more, the
+  `payload` file opened again. A 401 to a token fetched for that request is returned as the status.
+- `public:` A refused sign-in fails the node with an `*httpclient.OAuthError` that names the token
+  URL's host, the status and the OAuth2 error code, never a secret, the token or the provider's
+  description. A token endpoint that does not answer, or answers 5xx or 429, is `Transient()`.
+- `public:` The sign-in goes through the same egress policy as the request, follows no redirect and
+  times out after 30 seconds.
+- `internal:` `applyAuth` takes the context and connection id and returns the token it used; the
+  static credentials moved to `applyStaticAuth`. `Process` sends through `send`, which opens the
+  payload for each attempt.
+
 ### Added: the runner refuses server answers stored in its work stream or heartbeat bucket
 
 NATS does not check the reply subject of a request, so another customer's runner can make the

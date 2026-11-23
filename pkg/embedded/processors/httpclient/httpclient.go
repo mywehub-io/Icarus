@@ -98,20 +98,13 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 	}
 
 	// A file a BYTE mapping delivered to "payload" is streamed as the request body, with its
-	// length and, unless a header sets one, its content type.
-	var fileBody io.ReadCloser
-	var fileSize int64
-	var fileType string
-	if ref, ok := input.TrustedFile("payload"); ok {
+	// length and, unless a header sets one, its content type. It is opened for each send, so a
+	// request refused for an expired OAuth2 token can go again with the same body.
+	payload, hasPayload := input.TrustedFile("payload")
+	if hasPayload {
 		if input.Files == nil {
 			return runtime.ErrorOutput(NewConfigError(n.NodeId(), "payload", "payload is a file but file storage is not configured", nil))
 		}
-		rc, openErr := input.Files.Open(input.Ctx, ref)
-		if openErr != nil {
-			return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "failed to open payload file: "+openErr.Error(), openErr, 0, nil))
-		}
-		defer rc.Close()
-		fileBody, fileSize, fileType = rc, ref.Size, payloadContentType(ref)
 	} else if v, present := input.Data["payload"]; present && v != nil {
 		return runtime.ErrorOutput(NewConfigError(n.NodeId(), "payload", "payload must be a file: map a byte port (a file reference) into payload", nil))
 	}
@@ -122,30 +115,25 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 	// A streamed exchange has no overall timeout, only an idle one.
 	ctx, cancel := context.WithCancel(input.Ctx)
 	defer cancel()
-	var reqBody io.Reader
-	if fileBody != nil {
-		ir := newIdleReader(fileBody, streamIdleTimeout, cancel)
-		defer ir.stop()
-		reqBody = ir
-	}
 
-	// Build request
-	req, connHeaders, err := n.buildRequest(ctx, &cfg, input.Data, reqBody, fileSize, fileType)
-	if err != nil {
-		return runtime.ErrorOutput(err)
-	}
-
-	// Execute request
-	client := streamingClient(connHeaders, req.Body != nil && req.Body != http.NoBody)
-	resp, err := client.Do(req)
-	if err != nil {
-		// A refused destination is the workflow's configuration, not a fault a retry clears.
-		var egress *EgressError
-		if errors.As(err, &egress) {
-			return runtime.ErrorOutput(NewConfigError(n.NodeId(), "url", egress.Error(), egress))
+	var resp *http.Response
+	for attempt := 1; ; attempt++ {
+		r, oauth, done, failed := n.send(ctx, cancel, input, &cfg, payload, hasPayload)
+		if failed != nil {
+			return *failed
 		}
-		err = redactURLError(err)
-		return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "request failed: "+err.Error(), err, 0, nil))
+		// A cached OAuth2 token the service refuses has expired or been revoked early: drop it and
+		// send once more with a new one. A token fetched for this very request is not tried again,
+		// since the refusal is then the service's answer to valid credentials.
+		if r.StatusCode == http.StatusUnauthorized && oauth != nil && !oauth.fresh && attempt == 1 {
+			r.Body.Close()
+			done()
+			tokens.drop(oauth.key, oauth.token)
+			continue
+		}
+		resp = r
+		defer done()
+		break
 	}
 	defer resp.Body.Close()
 
@@ -161,6 +149,48 @@ func (n *HTTPClientNode) Process(input runtime.ProcessInput) runtime.ProcessOutp
 		return runtime.ErrorOutput(NewHTTPError(n.NodeId(), "failed to store response body: "+werr.Error(), werr, resp.StatusCode, nil))
 	}
 	return runtime.SuccessOutput(map[string]interface{}{"status": resp.StatusCode, "body": ref})
+}
+
+// send opens the payload, builds the request and sends it. done closes the payload and its idle watch;
+// call it once the response is no longer needed. failed is the node's output when nothing was sent.
+func (n *HTTPClientNode) send(ctx context.Context, cancel context.CancelFunc, input runtime.ProcessInput, cfg *Config,
+	payload fileref.FileRef, hasPayload bool) (resp *http.Response, oauth *oauthUse, done func(), failed *runtime.ProcessOutput) {
+	done = func() {}
+	fail := func(err error) (*http.Response, *oauthUse, func(), *runtime.ProcessOutput) {
+		out := runtime.ErrorOutput(err)
+		return nil, nil, done, &out
+	}
+	var reqBody io.Reader
+	var fileSize int64
+	var fileType string
+	if hasPayload {
+		rc, err := input.Files.Open(input.Ctx, payload)
+		if err != nil {
+			return fail(NewHTTPError(n.NodeId(), "failed to open payload file: "+err.Error(), err, 0, nil))
+		}
+		ir := newIdleReader(rc, streamIdleTimeout, cancel)
+		done = func() { ir.stop(); rc.Close() }
+		reqBody, fileSize, fileType = ir, payload.Size, payloadContentType(payload)
+	}
+
+	req, connHeaders, oauth, err := n.buildRequest(ctx, cfg, input.Data, reqBody, fileSize, fileType)
+	if err != nil {
+		done()
+		return fail(err)
+	}
+	client := streamingClient(connHeaders, req.Body != nil && req.Body != http.NoBody)
+	resp, err = client.Do(req)
+	if err != nil {
+		done()
+		// A refused destination is the workflow's configuration, not a fault a retry clears.
+		var egress *EgressError
+		if errors.As(err, &egress) {
+			return fail(NewConfigError(n.NodeId(), "url", egress.Error(), egress))
+		}
+		err = redactURLError(err)
+		return fail(NewHTTPError(n.NodeId(), "request failed: "+err.Error(), err, 0, nil))
+	}
+	return resp, oauth, done, nil
 }
 
 // redactURLError replaces the URL a *url.Error quotes with its scheme and host: the path and query
@@ -190,24 +220,24 @@ func redactURL(raw string) string {
 // Header order: the connection's custom headers, then the node's headers, then the connection's
 // credential. A node can override a connection's custom header, and nothing a node sets, including a
 // header from the run's data, can replace the credential.
-func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}, fileBody io.Reader, fileSize int64, fileType string) (*http.Request, []string, error) {
+func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map[string]interface{}, fileBody io.Reader, fileSize int64, fileType string) (req *http.Request, connHeaders []string, oauth *oauthUse, err error) {
 	urlStr, usingConnection, conn, err := n.resolveURL(cfg, data)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if usingConnection && cfg.PathFromInput {
 		p, isText := data["path"].(string)
 		if raw, present := data["path"]; present && raw != nil && !isText {
-			return nil, nil, NewConfigError(n.NodeId(), "path", fmt.Sprintf("path from input must be text, not %T", raw), nil)
+			return nil, nil, nil, NewConfigError(n.NodeId(), "path", fmt.Sprintf("path from input must be text, not %T", raw), nil)
 		}
 		if urlStr, err = joinInputPath(n.NodeId(), urlStr, p); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 
 	method, err := n.resolveMethod(cfg, data, usingConnection, conn)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	var body io.Reader
@@ -217,30 +247,29 @@ func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, urlStr, body)
+	req, err = http.NewRequestWithContext(ctx, method, urlStr, body)
 	if err != nil {
 		// The URL is not echoed, nor the parse error, which quotes it or a piece of it: it can come
 		// from the run's data and carry identifiers or tokens.
 		var ue *url.Error
 		if errors.As(err, &ue) {
-			return nil, nil, NewConfigError(n.NodeId(), "url", "invalid URL", nil)
+			return nil, nil, nil, NewConfigError(n.NodeId(), "url", "invalid URL", nil)
 		}
-		return nil, nil, NewConfigError(n.NodeId(), "url", err.Error(), err)
+		return nil, nil, nil, NewConfigError(n.NodeId(), "url", err.Error(), err)
 	}
 	if fileBody != nil && body != nil {
 		req.ContentLength = fileSize
 	}
 
 	// The connection's headers and credential go only with the connection's own URL.
-	var connHeaders []string
 	if usingConnection {
 		if connHeaders, err = applyConnectionHeaders(n.NodeId(), req, conn); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 
 	if err := n.applyHeaders(req, cfg, data); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// A Content-Type header from config or input wins; otherwise the body goes as its file's type.
 	if body != nil && fileType != "" && req.Header.Get("Content-Type") == "" {
@@ -248,16 +277,17 @@ func (n *HTTPClientNode) buildRequest(ctx context.Context, cfg *Config, data map
 	}
 
 	if usingConnection {
-		authHeader, err := applyAuth(n.NodeId(), req, conn)
+		authHeader, use, err := applyAuth(ctx, n.NodeId(), cfg.ConnectionID, req, conn)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if authHeader != "" {
 			connHeaders = append(connHeaders, authHeader)
 		}
+		oauth = use
 	}
 
-	return req, connHeaders, nil
+	return req, connHeaders, oauth, nil
 }
 
 // payloadContentType is the type a payload file is sent as when no header sets one: the type the
