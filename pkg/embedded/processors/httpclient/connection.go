@@ -1,6 +1,7 @@
 package httpclient
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,8 +80,24 @@ func connectionCustomHeaders(nodeID string, conn map[string]interface{}) (map[st
 // none. An auth_type whose credential is missing is refused rather than sent unauthenticated: the
 // connection says the service needs it, so a request without it can only fail, and a 401 is not an error
 // to this node.
-func applyAuth(nodeID string, req *http.Request, conn map[string]interface{}) (string, error) {
+//
+// For oauth2 it also returns the token it used (oauth2.go), so a 401 can drop that token and the request
+// can be sent once more with a new one.
+func applyAuth(ctx context.Context, nodeID, connectionID string, req *http.Request, conn map[string]interface{}) (string, *oauthUse, error) {
 	authType := strings.ToLower(strings.TrimSpace(getString(conn, "auth_type", "")))
+	if authType == "oauth2" {
+		use, err := applyOAuth(ctx, nodeID, connectionID, req, conn)
+		if err != nil {
+			return "", nil, err
+		}
+		return "Authorization", use, nil
+	}
+	header, err := applyStaticAuth(nodeID, authType, req, conn)
+	return header, nil, err
+}
+
+// applyStaticAuth sets a credential the connection holds as it is: a bearer token, Basic, or an API key.
+func applyStaticAuth(nodeID, authType string, req *http.Request, conn map[string]interface{}) (string, error) {
 	switch authType {
 	case "", "none":
 		return "", nil
