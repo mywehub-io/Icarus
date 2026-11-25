@@ -1,0 +1,154 @@
+// iriswire.proto: the Iris messages the platform jobs client sends and receives.
+//
+// Copied from the protos repo (services/iris/iris.proto and services/iris/events.proto), which is
+// the source of truth. Field names, numbers and types are identical to the originals, so the
+// binary encoding and the protojson encoding (UseProtoNames) of every message here match Iris's
+// own. Only the proto package differs: a separate package means this file can never collide in
+// protoregistry with a service's own generated iris package, which protobuf-go would refuse at
+// start by default.
+//
+// Messages only: no services and no HTTP options. The client calls the Iris RPCs by full method
+// name (see platform/jobs). A test in platform/jobs checks every field here against a table
+// copied from the Iris protos, so drift fails the build.
+
+syntax = "proto3";
+
+package wehub.platform.iriswire.v1;
+
+option go_package = "github.com/wehubfusion/Icarus/platform/jobs/iriswire;iriswire";
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+message JobResource {
+  string type = 1;
+  string id = 2;
+}
+
+message JobProgress {
+  int32 percent = 1;
+  string message = 2;
+}
+
+message JobError {
+  string code = 1;
+  string message = 2;
+}
+
+message Job {
+  string job_id = 1;
+  string client_id = 2;
+  string kind = 3;
+  string producer = 4;
+  string status = 5;
+  reserved 6;
+  reserved "progress";
+  JobError error = 7;
+  google.protobuf.Struct metadata = 8;
+  JobResource resource = 9;
+  string idempotency_key = 10;
+  uint64 last_seq = 11;
+  string user_id = 12;
+  string user_display_name = 22;
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+  google.protobuf.Timestamp started_at = 15;
+  google.protobuf.Timestamp finished_at = 16;
+  int64 duration_ms = 17;
+  JobSchema schema = 18;
+  string parent_job_id = 19;
+  repeated Job children = 21;
+}
+
+message JobSchemaField {
+  string key = 1;
+  string label = 2;
+  string type = 3;
+  string section = 4;
+  int32 order = 5;
+  reserved 6, 7;
+  reserved "url_template", "hidden";
+  bool copyable = 8;
+  bool truncate = 9;
+}
+
+message JobSchemaSection {
+  string key = 1;
+  string label = 2;
+}
+
+message JobSchema {
+  string kind = 1;
+  string producer = 2;
+  string display_name = 3;
+  repeated JobSchemaField fields = 4;
+  repeated JobSchemaSection sections = 5;
+}
+
+message ResourceLock {
+  string client_id = 1;
+  JobResource resource = 2;
+  string job_id = 3;
+  string kind = 4;
+  string producer = 5;
+  string user_id = 6;
+  int64 fence = 7;
+  int32 ttl_seconds = 8;
+  google.protobuf.Timestamp acquired_at = 9;
+  google.protobuf.Timestamp renewed_at = 10;
+  google.protobuf.Timestamp expires_at = 11;
+}
+
+message CreateJobWithLeaseRequest {
+  string client_id = 1;
+  string kind = 2;
+  string producer = 3;
+  string request_id = 4;
+  JobResource resource = 5;
+  string user_id = 6;
+  google.protobuf.Struct data = 7;
+  int32 ttl_seconds = 8;
+  string parent_job_id = 9;
+}
+
+message CreateJobWithLeaseResponse {
+  bool acquired = 1;
+  Job job = 2;
+  repeated ResourceLock locks = 3;
+  bool reentrant = 4;
+  ResourceLock holder = 5;
+}
+
+message RenewResourceLockRequest {
+  string client_id = 1;
+  JobResource resource = 2;
+  string job_id = 3;
+  int32 ttl_seconds = 4;
+}
+
+message RenewResourceLockResponse {
+  bool renewed = 1;
+  repeated ResourceLock locks = 2;
+}
+
+// JobUpdateMessage is the JetStream payload on the jobs update subject, encoded with protojson
+// (UseProtoNames).
+message JobUpdateMessage {
+  string id = 1;
+  string v = 2;
+  string job_id = 3;
+  uint64 seq = 4;
+  string type = 5;
+  string timestamp = 6;
+  string client_id = 7;
+  string producer = 8;
+  string status = 9;
+  JobProgress progress = 10;
+  JobError error = 11;
+  google.protobuf.Struct data = 12;
+  string kind = 13;
+  JobResource resource = 14;
+  string idempotency_key = 15;
+  string user_id = 16;
+  string parent_job_id = 17;
+}
