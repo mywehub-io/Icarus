@@ -13,6 +13,14 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Added: the platform module
+
+- `public:` A nested module, `github.com/wehubfusion/Icarus/platform`, released on its own
+  `platform/vX.Y.Z` tags, holds the library WeHub services use to publish audit events and to
+  create and update Iris jobs. It never requires the root module, so nothing changes for runners
+  or for services pinned to an Icarus SDK version. See `platform/README.md` and
+  `platform/CHANGELOG.md`.
+
 ### Added: HTTP Client signs in with OAuth2
 
 A connection with `auth_type` `oauth2` (Nyx's HTTP schema) no longer needs a token pasted into it:
