@@ -31,6 +31,13 @@ A clean, future-proof Go SDK for messaging over NATS JetStream with idiomatic pa
 go get github.com/wehubfusion/Icarus
 ```
 
+## Platform module
+
+`platform/` is a separate Go module, `github.com/wehubfusion/Icarus/platform`, for WeHub's own
+services rather than runners: it publishes audit events and creates and updates Iris jobs. It
+never requires this root module, so adopting it does not move a service's Icarus SDK pin, and it
+is released on its own `platform/vX.Y.Z` tags. See [platform/README.md](platform/README.md).
+
 ## Quick Start
 
 ### 1. Connect to NATS

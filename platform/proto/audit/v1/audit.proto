@@ -1,0 +1,137 @@
+// Vendored copy. The protos repo (services/audit/v1/audit.proto) is the source of truth: change it there first, then copy it here and run make proto.
+//
+// audit.proto — the audit event every WeHub service publishes on the AUDIT stream.
+//
+// One Event records one action: who did what to which resource, and with what outcome.
+// Producers publish it with the Icarus platform library
+// (github.com/wehubfusion/Icarus/platform/audit), binary protobuf encoded, on subject
+// <prefix>.<service> (prefix audit.v1 unless configured otherwise), with Nats-Msg-Id set to
+// the event id. Athena consumes the stream and appends each event to its organisation's hash
+// chain.
+//
+// Keep events small. The library caps an encoded Event at 1 KiB, trimming attrs and then
+// user_agent, and sets truncated when it does. No field may hold a name, an email address,
+// free text, a request or response body, a payload, an NHS number, a token or a secret.
+// Names are resolved when the event is read.
+//
+// Go code for this file is generated only into the Icarus platform module. A proto that
+// imports it maps it to that package with an M option instead of generating its own copy:
+// two generated copies in one binary panic at start.
+//
+// See: Olympus/docs/security/audit-logging.md
+
+syntax = "proto3";
+
+package audit.v1;
+
+option go_package = "github.com/wehubfusion/Icarus/platform/audit/auditpb;auditpb";
+
+// Event is one audit record.
+message Event {
+  // UUIDv7, 16 bytes. Its canonical string form is the Nats-Msg-Id, and Athena's dedupe key
+  // within an organisation's chain.
+  bytes event_id = 1;
+  // Producer clock, Unix milliseconds. Informational: Athena orders a chain by receipt.
+  int64 occurred_at_ms = 2;
+  // Organisation, a 16-byte UUID. Empty for the platform chain: actions with no organisation,
+  // or whose claimed organisation cannot be trusted.
+  bytes client_id = 3;
+  Actor actor = 4;
+  // What happened, at most 64 characters: <service>.<Method> for an RPC
+  // (hermes.PublishWorkflow), job.<event> for a job lifecycle event (job.succeeded), and
+  // audit.<event> or producer.<event> for the pipeline itself.
+  string action = 5;
+  Resource resource = 6;
+  Outcome outcome = 7;
+  // gRPC status code of the call; 0 is OK.
+  uint32 code = 8;
+  // Machine-readable reason, such as LEASE_EXPIRED. Never free text. At most 32 characters.
+  string reason = 9;
+  // Iris job the action started or concerns, when there is one.
+  string job_id = 10;
+  // Idempotency-Key, else X-Request-Id, of the call. At most 64 characters.
+  string request_id = 11;
+  // OpenTelemetry trace id, 16 bytes.
+  bytes trace_id = 12;
+  // Caller address, 4 or 16 bytes.
+  bytes source_ip = 13;
+  // Caller user agent, cut to 64 characters.
+  string user_agent = 14;
+  // The authorisation check that decided the call, when there was one.
+  Decision decision = 15;
+  Producer producer = 16;
+  // Typed per action: at most 6 keys, each value at most 64 characters, ids and enums only.
+  map<string, string> attrs = 17;
+  // Set when the library trimmed attrs or user_agent to keep the event within its size cap.
+  bool truncated = 18;
+  Category category = 19;
+}
+
+// Actor is who performed the action.
+message Actor {
+  // Entra object id of a person or service account, or the service name for SYSTEM. At most
+  // 64 characters.
+  string id = 1;
+  ActorType type = 2;
+}
+
+// ActorType says what kind of principal the actor is.
+enum ActorType {
+  ACTOR_TYPE_UNSPECIFIED = 0;
+  ACTOR_TYPE_USER = 1;
+  ACTOR_TYPE_SERVICE_ACCOUNT = 2;
+  // The platform itself, such as a sweeper or a Temporal workflow with no person behind it.
+  ACTOR_TYPE_SYSTEM = 3;
+}
+
+// Resource is what the action was performed on.
+message Resource {
+  // Cerberus resource type where one applies, such as workflow. At most 32 characters.
+  string type = 1;
+  // At most 64 characters.
+  string id = 2;
+}
+
+// Outcome is how the action ended.
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_OK = 1;
+  // Refused by authentication or authorisation.
+  OUTCOME_DENIED = 2;
+  // Accepted but failed.
+  OUTCOME_FAILED = 3;
+  // Refused for another reason, such as a resource lease held by another job.
+  OUTCOME_REFUSED = 4;
+}
+
+// Category groups events the way cloud audit logs do.
+enum Category {
+  CATEGORY_UNSPECIFIED = 0;
+  // A change. Always recorded.
+  CATEGORY_WRITE = 1;
+  // A read of something sensitive, such as a secret or the audit log itself.
+  CATEGORY_SENSITIVE_READ = 2;
+  // A call refused by authentication or authorisation. Always recorded.
+  CATEGORY_DENIAL = 3;
+  // An action the platform took on its own, or an event about the audit pipeline.
+  CATEGORY_SYSTEM = 4;
+}
+
+// Decision is the authorisation check that decided a call.
+message Decision {
+  string resource_type = 1;
+  string action = 2;
+  string resource_id = 3;
+  bool granted = 4;
+}
+
+// Producer identifies the process that published the event, so Athena can detect gaps.
+message Producer {
+  // Service name, such as hermes.
+  string service = 1;
+  // UUID the process made at start, 16 bytes.
+  bytes instance_id = 2;
+  // Per-instance sequence, from 1. It increases for every event the process builds, including
+  // one it fails to publish, so a lost event shows as a gap.
+  uint64 seq = 3;
+}
