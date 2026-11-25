@@ -25,6 +25,15 @@ type Collector struct {
 	attrs     map[string]string
 	reason    string
 	truncated bool
+	identity  *Identity
+}
+
+// Identity is the caller of one request, as the service's authentication worked it out.
+type Identity struct {
+	ActorID   string
+	ActorType auditpb.ActorType
+	// ClientID is the organisation UUID the caller named, as a string. It may be empty.
+	ClientID string
 }
 
 // Snapshot is a copy of what a Collector holds.
@@ -47,6 +56,8 @@ type Snapshot struct {
 	Reason string
 	// Truncated reports that SetAttr calls were ignored because MaxAttrs keys were already set.
 	Truncated bool
+	// Identity is the caller recorded with SetIdentity, or nil when none was.
+	Identity *Identity
 }
 
 // WithCollector returns a context carrying a new Collector, and the Collector.
@@ -138,6 +149,19 @@ func SetReason(ctx context.Context, reason string) {
 	}
 }
 
+// SetIdentity records the caller of the request. Call it after the service's own authentication
+// has run, typically from grpcaudit.IdentityRecorder placed after the auth interceptor, so the
+// audit hook, which wraps every other interceptor, still learns who called. It does nothing when
+// ctx has no collector.
+func SetIdentity(ctx context.Context, id Identity) {
+	if c := CollectorFrom(ctx); c != nil {
+		c.mu.Lock()
+		cp := id
+		c.identity = &cp
+		c.mu.Unlock()
+	}
+}
+
 // Snapshot returns a copy of what c holds. A nil Collector returns the zero Snapshot.
 func (c *Collector) Snapshot() Snapshot {
 	if c == nil {
@@ -153,6 +177,10 @@ func (c *Collector) Snapshot() Snapshot {
 		ResourceID:   c.resID,
 		Reason:       c.reason,
 		Truncated:    c.truncated,
+	}
+	if c.identity != nil {
+		id := *c.identity
+		s.Identity = &id
 	}
 	if d := c.decision; d != nil {
 		s.Decision = &auditpb.Decision{

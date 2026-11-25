@@ -15,8 +15,10 @@
 // names one of Config.EntryPrincipals.
 //
 // Put the interceptor first in the chain, so it sees the refusals of the authentication
-// interceptor. Identity then runs on the context the interceptor received, so it must derive the
-// caller from the incoming metadata, not from values an inner interceptor adds.
+// interceptor, and put IdentityRecorder straight after the authentication interceptor, so the
+// caller it worked out reaches the record. When no identity was recorded (authentication refused
+// the call, or the service has no recorder), Config.Identity runs on the context this interceptor
+// received, so it may only use the incoming metadata.
 package grpcaudit
 
 import (
@@ -61,15 +63,10 @@ const (
 	mdUserAgent      = "user-agent"
 )
 
-// Identity is the caller of one request.
-type Identity struct {
-	// ActorID is the Entra object id of the person or service account. Empty means unknown,
-	// recorded as ACTOR_TYPE_UNSPECIFIED.
-	ActorID   string
-	ActorType auditpb.ActorType
-	// ClientID is the organisation id (a UUID string) the caller named. May be empty.
-	ClientID string
-}
+// Identity is the caller of one request. ActorID is the Entra object id of the person or service
+// account; empty means unknown, recorded as ACTOR_TYPE_UNSPECIFIED. ClientID is the organisation
+// id (a UUID string) the caller named, and may be empty.
+type Identity = audit.Identity
 
 // IdentityFunc returns the caller of the request in ctx.
 type IdentityFunc func(ctx context.Context) Identity
@@ -299,8 +296,12 @@ func record(ctx context.Context, cfg Config, rec *hook.Recorder, principals hook
 		return
 	}
 
+	snap := col.Snapshot()
 	var id Identity
-	if cfg.Identity != nil {
+	switch {
+	case snap.Identity != nil:
+		id = *snap.Identity
+	case cfg.Identity != nil:
 		id = safeIdentity(ctx, cfg)
 	}
 
@@ -323,8 +324,21 @@ func record(ctx context.Context, cfg Config, rec *hook.Recorder, principals hook
 		RequestID: firstOf(md, mdIdempotencyKey, mdRequestID),
 		UserAgent: firstOf(md, mdGatewayUA, mdUserAgent),
 		SourceIP:  hook.SourceIP(firstOf(md, mdEnvoyExternal), md.Get(mdForwardedFor), peerAddr),
-		Snapshot:  col.Snapshot(),
+		Snapshot:  snap,
 	})
+}
+
+// IdentityRecorder returns an interceptor that records the caller in the request's audit
+// collector. Place it straight after the service's authentication interceptor: fn then runs on the
+// context that interceptor built, so it can use the service's own auth getters. A panic in fn is
+// treated as an unknown caller.
+func IdentityRecorder(fn IdentityFunc) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if fn != nil && audit.CollectorFrom(ctx) != nil {
+			audit.SetIdentity(ctx, safeIdentity(ctx, Config{Identity: fn}))
+		}
+		return handler(ctx, req)
+	}
 }
 
 // safeIdentity calls cfg.Identity, treating a panic as an unknown caller.

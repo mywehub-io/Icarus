@@ -30,6 +30,9 @@ The interceptor builds at most one event per call, after the handler returns:
   named a valid organisation id and at least one authorisation check granted something;
   otherwise it goes to the platform chain with the claimed id in `attrs`, at most once a minute
   per claimed organisation, source address and method.
+- Any other failed call follows the same rule, so a forged `X-Client-Id` on a call that fails
+  before any check can neither land in nor flood that organisation's chain. A call that succeeded
+  is recorded against the organisation it named.
 - A write at an entry is recorded as a `WRITE`, waiting for the stream's acknowledgement.
 - A sensitive read at an entry is recorded as a `SENSITIVE_READ`, asynchronously.
 - Anything else, including a write one service makes on another, is not recorded.
@@ -39,8 +42,12 @@ or none, unless the service's override table says otherwise. A call is an entry 
 this process's gateway marker (`EntryMarker`) or when the last `x-forwarded-client-cert` element
 names one of the configured entry principals.
 
-Put the interceptor first in the chain so it sees the authentication interceptor's refusals.
-Its `Identity` callback then has to read the caller from the incoming metadata. The gateway must
+Put the interceptor first in the chain so it sees the authentication interceptor's refusals, and
+put `grpcaudit.IdentityRecorder` straight after the authentication interceptor: its callback runs
+on the context authentication built, so it can use the service's own auth getters, and it records
+the caller in the request's collector. `Config.Identity` is only the fallback for calls where
+nothing was recorded (authentication refused them), so it may read only the incoming metadata. An
+HTTP service records the caller from its own auth middleware with `audit.SetIdentity`. The gateway must
 reach the gRPC server through a client connection, not `Register...HandlerServer`, or no
 interceptor runs for REST calls.
 

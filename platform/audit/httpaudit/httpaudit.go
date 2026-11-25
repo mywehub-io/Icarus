@@ -30,7 +30,8 @@ type Config struct {
 	Emitter *audit.Emitter
 	// Service names the service in each action: <Service>.<METHOD> <route>.
 	Service string
-	// Identity returns the caller. Nil means every caller is unknown.
+	// Identity returns the caller when the service's auth middleware did not record one with
+	// audit.SetIdentity. Nil means such callers are unknown.
 	Identity func(*http.Request) grpcaudit.Identity
 	// Route returns the route template, such as /v1/runners/{id}. It is called after the
 	// handler, so a router has filled in its match. Default: the request's net/http pattern
@@ -95,7 +96,11 @@ func record(cfg Config, rec *hook.Recorder, r *http.Request, status int, col *au
 		return
 	}
 	var id grpcaudit.Identity
-	if cfg.Identity != nil {
+	switch snap := col.Snapshot(); {
+	case snap.Identity != nil:
+		// The service's own auth middleware recorded the caller with audit.SetIdentity.
+		id = *snap.Identity
+	case cfg.Identity != nil:
 		id = cfg.Identity(r)
 	}
 	outcome, code := outcomeFor(status)

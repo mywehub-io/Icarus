@@ -85,10 +85,13 @@ func Recorded(kind Kind, entry, denied bool) bool {
 //   - a sensitive read at an entry is recorded, ModeAsync;
 //   - anything else is not.
 //
-// A denial goes to the organisation's chain only when the caller named a valid organisation id
-// and at least one authorisation check granted something; otherwise it goes to the platform
-// chain with the claimed id in attrs, at most once a minute per claimed organisation, source
-// address and method. Any panic is logged and swallowed: audit never fails the call.
+// A denial or any other failed call goes to the organisation's chain only when the caller named a
+// valid organisation id and at least one authorisation check granted something; otherwise it goes
+// to the platform chain with the claimed id in attrs, at most once a minute per claimed
+// organisation, source address and method. So a forged X-Client-Id on a call that fails before
+// any check can neither land in, nor flood, that organisation's chain. A call that succeeded is
+// recorded against the organisation it named. Any panic is logged and swallowed: audit never
+// fails the call.
 func (r *Recorder) Record(ctx context.Context, c Call) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -137,13 +140,14 @@ func (r *Recorder) Record(ctx context.Context, c Call) {
 
 	extra := map[string]string{}
 	org, valid := ClientIDBytes(c.ClientID)
-	trusted := valid && (!c.Denied || s.Granted)
+	failed := c.Denied || c.Outcome != auditpb.Outcome_OUTCOME_OK
+	trusted := valid && (!failed || s.Granted)
 	if trusted {
 		ev.ClientId = org
 	} else if c.ClientID != "" {
 		extra[AttrClaimedClientID] = c.ClientID
 	}
-	if c.Denied && !trusted {
+	if failed && !trusted {
 		key := c.ClientID + "\x00" + IPString(c.SourceIP) + "\x00" + c.LimitKey
 		ok, suppressed := r.limiter.Allow(key)
 		if !ok {

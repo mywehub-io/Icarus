@@ -378,6 +378,57 @@ func TestFailedWriteOutcome(t *testing.T) {
 	assert.Equal(t, uint32(codes.Internal), events[0].GetCode())
 }
 
+// A write that fails before any authorisation check granted anything may carry a forged
+// X-Client-Id, so it goes to the platform chain, rate limited; with a grant it is the
+// organisation's own failure and goes to its chain.
+func TestFailedWriteWithoutGrantGoesToPlatformChain(t *testing.T) {
+	h := newHarness(t, Identity{ActorID: "user-1", ActorType: auditpb.ActorType_ACTOR_TYPE_USER, ClientID: orgID})
+	fail := func(context.Context) error { return status.Error(codes.InvalidArgument, "bad") }
+	require.Error(t, h.call(entryCtx(), "CreateThing", fail))
+	require.Error(t, h.call(entryCtx(), "CreateThing", fail)) // suppressed within the minute
+	require.Error(t, h.call(entryCtx(), "CreateThing", func(ctx context.Context) error {
+		audit.RecordDecision(ctx, "thing", "create", "", true)
+		return status.Error(codes.InvalidArgument, "bad")
+	}))
+
+	events := h.events()
+	require.Len(t, events, 2)
+	assert.Empty(t, events[0].GetClientId())
+	assert.Equal(t, orgID, events[0].GetAttrs()["claimed_client_id"])
+	assert.Equal(t, auditpb.Category_CATEGORY_WRITE, events[0].GetCategory())
+	org := uuid.MustParse(orgID)
+	assert.Equal(t, org[:], events[1].GetClientId())
+	assert.NotContains(t, events[1].GetAttrs(), "claimed_client_id")
+}
+
+// IdentityRecorder, placed after the service's authentication, wins over Config.Identity, which
+// only sees the incoming metadata.
+func TestIdentityRecorderTakesPrecedence(t *testing.T) {
+	h := newHarness(t, Identity{ActorID: "from-metadata", ClientID: orgID})
+	type authKey struct{}
+	recorder := IdentityRecorder(func(ctx context.Context) Identity {
+		id, _ := ctx.Value(authKey{}).(string)
+		return Identity{ActorID: id, ActorType: auditpb.ActorType_ACTOR_TYPE_USER, ClientID: orgID}
+	})
+	err := h.call(entryCtx(), "CreateThing", func(ctx context.Context) error {
+		ctx = context.WithValue(ctx, authKey{}, "from-auth") // what the auth interceptor would add
+		_, err := recorder(ctx, nil, &grpc.UnaryServerInfo{FullMethod: full("CreateThing")},
+			func(context.Context, any) (any, error) { return nil, nil })
+		return err
+	})
+	require.NoError(t, err)
+	events := h.events()
+	require.Len(t, events, 1)
+	assert.Equal(t, "from-auth", events[0].GetActor().GetId())
+	assert.Equal(t, auditpb.ActorType_ACTOR_TYPE_USER, events[0].GetActor().GetType())
+
+	// Without a recorded identity the metadata fallback is used.
+	require.NoError(t, h.call(entryCtx(), "UpdateThing", func(context.Context) error { return nil }))
+	events = h.events()
+	require.Len(t, events, 2)
+	assert.Equal(t, "from-metadata", events[1].GetActor().GetId())
+}
+
 func TestDenialWithGrantGoesToOrganisationChain(t *testing.T) {
 	h := newHarness(t, Identity{ActorID: "user-1", ActorType: auditpb.ActorType_ACTOR_TYPE_USER, ClientID: orgID})
 	// Not an entry: denials are recorded at any hop.
