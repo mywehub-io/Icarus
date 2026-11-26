@@ -290,3 +290,58 @@ func TestNoopAndNilEmitters(t *testing.T) {
 		assert.Equal(t, audit.Stats{}, em.Stats())
 	}
 }
+
+func TestPublishWaitsForTheAckAndSendsNoSeq(t *testing.T) {
+	srv := testnats.Start(t)
+	srv.CreateStream(t, "AUDIT", "audit.v1.>")
+	em := newEmitter(t, srv.Conn, nil)
+
+	id := uuid.NewSHA1(uuid.NameSpaceURL, []byte("job-1:job.succeeded:1"))
+	ev := writeEvent()
+	ev.Action = "job.succeeded"
+	ev.EventId = id[:]
+	require.NoError(t, em.Publish(context.Background(), ev))
+	require.NoError(t, em.Publish(context.Background(), ev), "a retry after a lost ack is no error")
+
+	msgs := srv.Messages(t, "AUDIT")
+	require.Len(t, msgs, 1, "the event id is the Nats-Msg-Id, so the retry is deduplicated")
+	assert.Equal(t, id.String(), msgs[0].Header.Get(jetstream.MsgIDHeader))
+	events := decode(t, msgs)
+	assert.Equal(t, "hermes", events[0].GetProducer().GetService())
+	assert.Len(t, events[0].GetProducer().GetInstanceId(), 16)
+	assert.Zero(t, events[0].GetProducer().GetSeq(), "no producer sequence, so a retry never shows as a gap")
+	st := em.Stats()
+	assert.Zero(t, st.Seq, "Publish takes no sequence number")
+	assert.Equal(t, uint64(2), st.Published)
+	assert.Zero(t, st.Dropped)
+}
+
+func TestPublishReturnsFailuresWithoutQueueingOrCounting(t *testing.T) {
+	srv := testnats.Start(t)
+	em := newEmitter(t, srv.Conn, nil)
+
+	err := em.Publish(context.Background(), writeEvent())
+	require.Error(t, err, "no stream: the failure is returned")
+
+	big := writeEvent()
+	big.JobId = strings.Repeat("j", 2*audit.MaxEventBytes)
+	assert.ErrorIs(t, em.Publish(context.Background(), big), audit.ErrEventTooLarge)
+
+	st := em.Stats()
+	assert.Zero(t, st.Dropped, "the caller keeps its copy, so nothing is dropped")
+	assert.Zero(t, st.QueueDepth)
+	assert.Zero(t, st.Published)
+}
+
+func TestPublishOnAnInactiveEmitter(t *testing.T) {
+	for _, em := range []*audit.Emitter{audit.NewNoopEmitter(), nil} {
+		assert.ErrorIs(t, em.Publish(context.Background(), writeEvent()), audit.ErrEmitterInactive)
+	}
+
+	srv := testnats.Start(t)
+	srv.CreateStream(t, "AUDIT", "audit.v1.>")
+	em := newEmitter(t, srv.Conn, nil)
+	require.NoError(t, em.Close(context.Background()))
+	assert.ErrorIs(t, em.Publish(context.Background(), writeEvent()), audit.ErrEmitterInactive)
+	assert.Empty(t, srv.Messages(t, "AUDIT"))
+}

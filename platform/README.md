@@ -13,7 +13,7 @@ never see it in their module graph.
 
 | Package | What it does |
 | --- | --- |
-| `audit` | `Emitter`: builds, limits and publishes audit events, with a bounded retry queue, producer heartbeats and OTel metrics. `Collector`: the request-scoped record handlers fill with `RecordDecision`, `SetJobID`, `SetResource`, `SetAttr` and `SetReason`. |
+| `audit` | `Emitter`: builds, limits and publishes audit events, with a bounded retry queue, producer heartbeats and OTel metrics; `Publish` returns the stream's answer for a caller with its own outbox. `Collector`: the request-scoped record handlers fill with `RecordDecision`, `SetJobID`, `SetResource`, `SetAttr` and `SetReason`. |
 | `audit/auditpb` | Go code for the audit event proto (`proto/audit/v1/audit.proto`). |
 | `audit/grpcaudit` | `UnaryServerInterceptor`, the hook at the gRPC API layer, plus `EntryMarker` and `HeaderMatcher` for the gRPC-Gateway and `Classify`. |
 | `audit/grpcaudit/grpcaudittest` | `AssertAllClassified`, for a test in each service that fails when an RPC is unclassified. |

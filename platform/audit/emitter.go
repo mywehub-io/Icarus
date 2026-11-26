@@ -8,6 +8,11 @@
 // dropped and counted. The producer sequence increases for every event built, dropped or not, so
 // a lost event shows as a gap where the stream is consumed.
 //
+// Publish is the one exception to failing open, for a caller that keeps its own durable copy of
+// each event until it is acknowledged, such as a transactional outbox. It returns the result,
+// queues and retries nothing, and sends the event without a producer sequence, so a retry after a
+// failure never shows as a gap.
+//
 // The emitter never creates or updates the stream. The service that consumes the stream owns it,
 // and a missing stream is a publish failure like any other, visible in the metrics.
 //
@@ -361,6 +366,47 @@ func (e *Emitter) Emit(ctx context.Context, ev *auditpb.Event, mode Mode) {
 	e.countPublished()
 }
 
+// Errors Publish returns besides the stream's own.
+var (
+	// ErrEventTooLarge is an event that cannot be trimmed to MaxEventBytes.
+	ErrEventTooLarge = errors.New("audit: event over the size cap")
+	// ErrEmitterInactive is a Publish on a no-op, nil or closed emitter: nothing was sent.
+	ErrEmitterInactive = errors.New("audit: emitter is not publishing")
+)
+
+// Publish builds ev like Emit and publishes it, waiting for the stream's acknowledgement within
+// Options.PublishTimeout, and returns the result. It is for a caller that keeps its own durable
+// copy of the event until Publish succeeds, such as a transactional outbox, so it differs from
+// Emit:
+//   - nothing is queued or retried, and a failure is returned, never counted as a drop;
+//   - the event carries no producer sequence (seq 0), so retrying it after a failure never shows
+//     as a gap where the stream is consumed;
+//   - a no-op, nil or closed emitter returns ErrEmitterInactive, so the caller keeps its copy.
+//
+// Give the event a stable event_id: it is the Nats-Msg-Id, so a retry after a lost
+// acknowledgement is deduplicated by the stream within its duplicate window, and an id derived
+// from what the event records (a UUIDv5) is deduplicated by the consumer after that.
+func (e *Emitter) Publish(ctx context.Context, ev *auditpb.Event) error {
+	if e.inactive() {
+		return ErrEmitterInactive
+	}
+	e.qmu.RLock()
+	closed := e.closed
+	e.qmu.RUnlock()
+	if closed {
+		return ErrEmitterInactive
+	}
+	data, msgID, err := e.encode(ctx, ev, 0)
+	if err != nil {
+		return err
+	}
+	if err := e.publish(ctx, data, msgID); err != nil {
+		return fmt.Errorf("audit: publish %s: %w", ev.GetAction(), err)
+	}
+	e.countPublished()
+	return nil
+}
+
 // Stats returns the emitter's counters. A no-op emitter returns zeros.
 func (e *Emitter) Stats() Stats {
 	if e.inactive() {
@@ -390,8 +436,27 @@ func systemEvent(service, action string, attrs map[string]string) *auditpb.Event
 	}
 }
 
-// build fills, limits and encodes a copy of in. ok is false when the event was dropped.
+// build fills, limits and encodes a copy of in for Emit. ok is false when the event was dropped,
+// which is counted.
 func (e *Emitter) build(ctx context.Context, in *auditpb.Event, seq uint64) (data []byte, msgID string, ok bool) {
+	data, msgID, err := e.encode(ctx, in, seq)
+	switch {
+	case errors.Is(err, ErrEventTooLarge):
+		e.drop(1, "event over size cap")
+		e.logger.Warn("audit event dropped: over size cap", zap.String("action", in.GetAction()),
+			zap.Uint64("seq", seq), zap.Error(err))
+		return nil, "", false
+	case err != nil:
+		e.drop(1, "encode failed")
+		e.logger.Warn("audit event dropped: encode failed", zap.String("action", in.GetAction()), zap.Error(err))
+		return nil, "", false
+	}
+	return data, msgID, true
+}
+
+// encode fills, limits and encodes a copy of in with the given producer sequence (0 for none).
+// It returns ErrEventTooLarge when the event cannot be trimmed to MaxEventBytes.
+func (e *Emitter) encode(ctx context.Context, in *auditpb.Event, seq uint64) (data []byte, msgID string, err error) {
 	var ev *auditpb.Event
 	if in == nil {
 		ev = &auditpb.Event{}
@@ -425,19 +490,14 @@ func (e *Emitter) build(ctx context.Context, in *auditpb.Event, seq uint64) (dat
 
 	enforceLimits(ev)
 	if !fitSize(ev) {
-		e.drop(1, "event over size cap")
-		e.logger.Warn("audit event dropped: over size cap",
-			zap.String("action", ev.GetAction()), zap.Uint64("seq", seq), zap.Int("size", proto.Size(ev)))
-		return nil, "", false
+		return nil, "", fmt.Errorf("%w: %s is %d bytes", ErrEventTooLarge, ev.GetAction(), proto.Size(ev))
 	}
 
 	data, err = proto.MarshalOptions{Deterministic: true}.Marshal(ev)
 	if err != nil {
-		e.drop(1, "encode failed")
-		e.logger.Warn("audit event dropped: encode failed", zap.String("action", ev.GetAction()), zap.Error(err))
-		return nil, "", false
+		return nil, "", fmt.Errorf("audit: encode %s: %w", ev.GetAction(), err)
 	}
-	return data, id.String(), true
+	return data, id.String(), nil
 }
 
 // publish sends one encoded event and waits for its PubAck, within PublishTimeout.
