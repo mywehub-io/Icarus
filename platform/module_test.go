@@ -1,7 +1,6 @@
 package platform
 
 import (
-	"bufio"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,12 +10,14 @@ import (
 
 const (
 	rootModule = "github.com/wehubfusion/Icarus"
-	thisModule = rootModule + "/platform"
+	thisTree   = rootModule + "/platform"
 )
 
-// allowedDirect lists the modules go.mod may require directly. Anything else needs a deliberate
-// change here, because every producer inherits this module's graph.
-var allowedDirect = map[string]bool{
+// allowedModules lists the modules the platform packages may import from. Anything else needs a
+// deliberate change here, because every producer links what these packages import. The rest of
+// the Icarus SDK is not on the list: the platform packages keep their own copies (jobs/contract.go)
+// rather than import it.
+var allowedModules = map[string]bool{
 	"github.com/google/uuid":                    true,
 	"github.com/grpc-ecosystem/grpc-gateway/v2": true,
 	"github.com/nats-io/nats.go":                true,
@@ -36,7 +37,7 @@ var allowedDirect = map[string]bool{
 var testOnly = []string{"github.com/nats-io/nats-server/v2", "github.com/stretchr/testify"}
 
 // testSupport is the one non-test package allowed to import the test-only modules.
-const testSupport = thisModule + "/internal/testnats"
+const testSupport = thisTree + "/internal/testnats"
 
 func goCmd(t *testing.T, args ...string) string {
 	t.Helper()
@@ -53,66 +54,31 @@ func goCmd(t *testing.T, args ...string) string {
 	return string(out)
 }
 
-type requirement struct {
-	path     string
-	indirect bool
-}
-
-func readRequirements(t *testing.T) []requirement {
-	t.Helper()
-	f, err := os.Open("go.mod")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	var out []requirement
-	inBlock := false
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		switch {
-		case line == "require (":
-			inBlock = true
-			continue
-		case inBlock && line == ")":
-			inBlock = false
-			continue
-		case strings.HasPrefix(line, "require "):
-			line = strings.TrimPrefix(line, "require ")
-		case !inBlock:
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		out = append(out, requirement{path: fields[0], indirect: strings.Contains(line, "// indirect")})
-	}
-	if err := sc.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return out
-}
-
-// The module must never require the root Icarus module, even in tests: producers adopt it
-// without moving their Icarus SDK pin, and customer runners never see it.
-func TestNeverRequiresRootModule(t *testing.T) {
-	for _, r := range readRequirements(t) {
-		if r.path == rootModule {
-			t.Fatalf("go.mod requires %s", rootModule)
+// Every import of a platform package, tests included, is the standard library, another platform
+// package, or a package of an allowed module.
+func TestImportsOnlyAllowedModules(t *testing.T) {
+	imports := map[string]bool{}
+	for _, line := range strings.Split(goCmd(t, "list", "-f",
+		"{{join .Imports \"\\n\"}}\n{{join .TestImports \"\\n\"}}\n{{join .XTestImports \"\\n\"}}", "./..."), "\n") {
+		if p := strings.TrimSpace(line); p != "" && p != thisTree && !strings.HasPrefix(p, thisTree+"/") {
+			imports[p] = true
 		}
 	}
-	for _, line := range strings.Split(goCmd(t, "list", "-m", "all"), "\n") {
-		if f := strings.Fields(line); len(f) > 0 && f[0] == rootModule {
-			t.Fatalf("the module graph includes %s: %s", rootModule, line)
-		}
+	if len(imports) == 0 {
+		t.Fatal("go list found no imports")
 	}
-}
-
-func TestDirectRequirementsAreAllowed(t *testing.T) {
-	for _, r := range readRequirements(t) {
-		if !r.indirect && !allowedDirect[r.path] {
-			t.Errorf("go.mod requires %s directly, which is not on the allowed list", r.path)
+	var paths []string
+	for p := range imports {
+		paths = append(paths, p)
+	}
+	args := append([]string{"list", "-f", "{{.ImportPath}} {{.Standard}} {{if .Module}}{{.Module.Path}}{{end}}"}, paths...)
+	for _, line := range strings.Split(strings.TrimSpace(goCmd(t, args...)), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[1] == "true" {
+			continue
+		}
+		if len(f) < 3 || !allowedModules[f[2]] {
+			t.Errorf("a platform package imports %s, which is not in an allowed module", f[0])
 		}
 	}
 }

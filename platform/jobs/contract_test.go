@@ -9,8 +9,8 @@ import (
 	"github.com/wehubfusion/Icarus/platform/jobs/iriswire"
 )
 
-// The values must match github.com/wehubfusion/Icarus/pkg/jobs and Iris exactly; this module
-// keeps its own copy so it never requires the root module.
+// The values must match github.com/wehubfusion/Icarus/pkg/jobs and Iris exactly; this package
+// keeps its own copy so it imports nothing else from Icarus.
 func TestContractConstantsAreGolden(t *testing.T) {
 	golden := map[string]string{
 		ContractVersion:         "v1",

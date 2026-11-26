@@ -12,8 +12,8 @@ package jobs
 
 import "strconv"
 
-// The jobs update contract, copied from the root Icarus module's pkg/jobs so this module never
-// requires it. Tests pin every value.
+// The jobs update contract, copied from Icarus's pkg/jobs so the platform packages import nothing
+// else from Icarus. Tests pin every value.
 const (
 	ContractVersion = "v1"
 

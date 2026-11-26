@@ -31,12 +31,13 @@ A clean, future-proof Go SDK for messaging over NATS JetStream with idiomatic pa
 go get github.com/wehubfusion/Icarus
 ```
 
-## Platform module
+## Platform packages
 
-`platform/` is a separate Go module, `github.com/wehubfusion/Icarus/platform`, for WeHub's own
-services rather than runners: it publishes audit events and creates and updates Iris jobs. It
-never requires this root module, so adopting it does not move a service's Icarus SDK pin, and it
-is released on its own `platform/vX.Y.Z` tags. See [platform/README.md](platform/README.md).
+`platform/...` holds the library WeHub's own services use rather than runners: it publishes
+audit events and creates and updates Iris jobs. It is part of this module and released on the
+same `vX.Y.Z` tags. Until v0.40.0 it was a nested module with its own `platform/vX.Y.Z` tags; a
+service that required `github.com/wehubfusion/Icarus/platform` drops that requirement when it
+moves to v0.40.0. See [platform/README.md](platform/README.md).
 
 ## Sentry
 
