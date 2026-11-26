@@ -49,7 +49,7 @@ func NewTimeoutError(message, code string, cause error) *AppError
 parameter only: `MetaData: <metaData>` and `Code: <code>`. The message and the cause never go to
 Sentry, because either can quote the workflow message the error happened on. Put identifiers in
 `metaData` (for example `service=zeus run_id=abc`), never message content; pass `""` to omit it.
-Services start Sentry with the [sentryscrub module](../../sentryscrub/README.md), which enforces
+Services start Sentry with the [sentryscrub package](../sentryscrub/README.md), which enforces
 the same rule for every event.
 
 ## gRPC conversion

@@ -20,10 +20,10 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
   workflow message the error happened on, no longer leave the process; they stay on the returned
   `AppError`. A Sentry issue that showed `Message: ... Code: ... Error: ...` now shows the code,
   and its stack trace (with `sentryscrub.ClientOptions`) says where it was raised.
-- `public:` A nested module, `github.com/wehubfusion/Icarus/sentryscrub`, released on its own
-  `sentryscrub/vX.Y.Z` tags: `ClientOptions` and the `Scrub` hook remove error text, requests,
-  users, breadcrumbs and extra data from every event, whatever Icarus version a service pins.
-  It requires only sentry-go. See `sentryscrub/README.md`.
+- `public:` A new package, `pkg/sentryscrub`: services pass `ClientOptions` to `sentry.Init`,
+  and its `Scrub` hook removes error text, requests, users, breadcrumbs and extra data from every
+  event, including the old `Message: ... Error: ...` format of earlier Icarus versions. It imports
+  only sentry-go. See `pkg/sentryscrub/README.md`.
 
 ### Added: the platform module
 

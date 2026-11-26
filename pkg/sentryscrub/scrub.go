@@ -16,8 +16,8 @@
 // sets tags or contexts must use codes, identifiers and numbers only, never text taken from a
 // message or an error.
 //
-// The module requires sentry-go and nothing else, never the root Icarus module, so a service
-// adopts it without moving its Icarus SDK pin.
+// The package imports sentry-go and no other Icarus package, so pkg/errors builds its Sentry
+// message here.
 package sentryscrub
 
 import (

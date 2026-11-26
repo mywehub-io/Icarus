@@ -38,13 +38,11 @@ services rather than runners: it publishes audit events and creates and updates 
 never requires this root module, so adopting it does not move a service's Icarus SDK pin, and it
 is released on its own `platform/vX.Y.Z` tags. See [platform/README.md](platform/README.md).
 
-## Sentryscrub module
+## Sentry
 
-`sentryscrub/` is a separate Go module, `github.com/wehubfusion/Icarus/sentryscrub`, that keeps
-message content out of Sentry: services pass `sentryscrub.ClientOptions` to `sentry.Init`, and
-its `BeforeSend` hook removes error text, requests, users, breadcrumbs and extra data from every
-event. It requires only sentry-go, never this root module, and is released on its own
-`sentryscrub/vX.Y.Z` tags. See [sentryscrub/README.md](sentryscrub/README.md).
+`pkg/sentryscrub` keeps message content out of Sentry: services pass `sentryscrub.ClientOptions`
+to `sentry.Init`, and its `BeforeSend` hook removes error text, requests, users, breadcrumbs and
+extra data from every event. See [pkg/sentryscrub/README.md](pkg/sentryscrub/README.md).
 
 ## Quick Start
 

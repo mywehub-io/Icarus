@@ -1,18 +1,18 @@
-# Icarus sentryscrub module
+# sentryscrub
 
-`github.com/wehubfusion/Icarus/sentryscrub` keeps message content out of Sentry. Every WeHub
+`github.com/wehubfusion/Icarus/pkg/sentryscrub` keeps message content out of Sentry. Every WeHub
 service that reports to Sentry starts it with this module's options:
 
 ```go
-import "github.com/wehubfusion/Icarus/sentryscrub"
+import "github.com/wehubfusion/Icarus/pkg/sentryscrub"
 
 if err := sentry.Init(sentryscrub.ClientOptions(cfg.Sentry.DSN, environment)); err != nil {
 	// ...
 }
 ```
 
-It is a nested module, released on its own `sentryscrub/vX.Y.Z` tags. It requires sentry-go and
-nothing else, so a service adopts it without moving its Icarus SDK pin.
+It imports sentry-go and no other Icarus package. `pkg/errors` builds its internal error message
+with `InternalErrorMessage`.
 
 ## Why
 
