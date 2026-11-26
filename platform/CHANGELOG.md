@@ -5,6 +5,16 @@ documented here. Releases are tagged `platform/vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- `audit`: `Emitter.Publish` publishes one event and returns the stream's answer, for a caller
+  that keeps its own durable copy until it is acknowledged, such as a transactional outbox. It
+  queues and retries nothing, counts no drops, and sends no producer sequence, so a retry never
+  shows as a gap. It returns `ErrEventTooLarge` for an event over the size cap and
+  `ErrEmitterInactive` on a no-op, nil or closed emitter.
+
+## [0.1.0] — 2026-11-25
+
 ### First version
 
 - `audit`: `Emitter` publishes audit events on `<prefix>.<service>` with the event id as
