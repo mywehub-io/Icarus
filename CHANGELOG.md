@@ -13,6 +13,18 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Changed: no message content in Sentry
+
+- `public:` `NewInternalError` sends Sentry the code and the metadata only
+  (`MetaData: <metadata>\nCode: <code>`). The message and the cause's text, which can quote the
+  workflow message the error happened on, no longer leave the process; they stay on the returned
+  `AppError`. A Sentry issue that showed `Message: ... Code: ... Error: ...` now shows the code,
+  and its stack trace (with `sentryscrub.ClientOptions`) says where it was raised.
+- `public:` A nested module, `github.com/wehubfusion/Icarus/sentryscrub`, released on its own
+  `sentryscrub/vX.Y.Z` tags: `ClientOptions` and the `Scrub` hook remove error text, requests,
+  users, breadcrumbs and extra data from every event, whatever Icarus version a service pins.
+  It requires only sentry-go. See `sentryscrub/README.md`.
+
 ### Added: the platform module
 
 - `public:` A nested module, `github.com/wehubfusion/Icarus/platform`, released on its own

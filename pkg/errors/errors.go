@@ -194,24 +194,36 @@ func NewTimeoutError(message string, code string, cause error) *AppError {
 }
 
 // NewInternalError constructs an AppError with Type == Internal and captures
-// the event in Sentry. metaData is an optional structured string prepended to
-// the Sentry message (e.g. "service=zeus run_id=abc"); pass "" to omit it.
-// NewInternalError MUST NOT be called in hot paths because it synchronously
-// invokes the Sentry SDK.
+// the event in Sentry. NewInternalError MUST NOT be called in hot paths because
+// it synchronously invokes the Sentry SDK.
+//
+// Sentry gets the code and metaData only, never message or cause: either can
+// quote the workflow message the error happened on (callers often put the
+// cause's text in message), and that is patient data in real use. metaData is
+// an optional structured string of identifiers (e.g. "service=zeus run_id=abc");
+// pass "" to omit it. The full error stays on the returned AppError for logs.
+// Services also start Sentry with the sentryscrub module, which enforces the
+// same rule for every event, whatever Icarus version wrote it.
 func NewInternalError(metaData string, message string, code string, cause error) *AppError {
-	var errorMessage string
-	if metaData != "" {
-		errorMessage = fmt.Sprintf("MetaData: %s\nMessage: %s\nCode: %s\nError: %v", metaData, message, code, cause)
-	} else {
-		errorMessage = fmt.Sprintf("Message: %s\nCode: %s\nError: %v", message, code, cause)
-	}
-	sentry.CaptureMessage(errorMessage)
+	sentry.CaptureMessage(internalErrorSentryMessage(metaData, code))
 	return &AppError{
 		Type:    Internal,
 		Message: message,
 		Code:    code,
 		Err:     cause,
 	}
+}
+
+// internalErrorSentryMessage is the Sentry message for an internal error:
+// "MetaData: <metaData>\nCode: <code>", or "Code: <code>" without metaData. It
+// is the shape sentryscrub.InternalErrorMessage writes and sentryscrub.Scrub
+// keeps; the root module does not import sentryscrub, so the shape is repeated
+// here.
+func internalErrorSentryMessage(metaData, code string) string {
+	if metaData != "" {
+		return "MetaData: " + metaData + "\nCode: " + code
+	}
+	return "Code: " + code
 }
 
 // ToGRPCError converts the AppError to a gRPC status error suitable for
