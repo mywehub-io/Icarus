@@ -1,4 +1,4 @@
-// Package platform is the root of the WeHub platform module: the shared library WeHub services
+// Package platform is the root of the WeHub platform packages: the shared library WeHub services
 // use to publish audit events and to create and update Iris jobs.
 //
 // The packages:
@@ -10,8 +10,7 @@
 //   - audit/httpaudit: the same rules as net/http middleware.
 //   - jobs: the Iris client that creates a job with its lease and publishes its updates.
 //
-// Two rules hold for the whole module. It never requires the root Icarus module, even in tests,
-// so producers can adopt it without moving their Icarus SDK pin. And it reads no environment
-// variables: every setting is an option the service passes in from its own configuration.
-// Tests in this package enforce both.
+// Two rules hold for every platform package. It imports nothing else from Icarus, even in tests,
+// so a service links only what it uses. And it reads no environment variables: every setting is
+// an option the service passes in from its own configuration. Tests in this package enforce both.
 package platform

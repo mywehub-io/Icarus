@@ -1,13 +1,15 @@
-# Icarus platform module
+# Icarus platform packages
 
-`github.com/wehubfusion/Icarus/platform` is the shared library WeHub services use to:
+`github.com/wehubfusion/Icarus/platform/...` is the shared library WeHub services use to:
 
 - publish audit events to a NATS JetStream stream, one event per API call; and
 - create Iris jobs with their resource lease, and publish the jobs' updates.
 
-It is a nested module, versioned on its own. It is separate from the root Icarus module (the
-runner SDK), so a service can adopt it without moving its Icarus SDK pin, and customer runners
-never see it in their module graph.
+The packages are part of the root Icarus module and ship in its `vX.Y.Z` releases. Until
+Icarus v0.40.0 they were a nested module with its own `platform/vX.Y.Z` tags (the last is
+`platform/v0.2.0`). A service that required `github.com/wehubfusion/Icarus/platform` drops that
+requirement when it moves to v0.40.0 or later; with both required, the build fails with
+"ambiguous import". The import paths are unchanged.
 
 ## Packages
 
@@ -53,15 +55,16 @@ interceptor runs for REST calls.
 
 ## Rules
 
-Tests in this module enforce each of these.
+Tests in this directory (`module_test.go`) enforce each of these.
 
-- **Never require the root module.** `go.mod` must not require `github.com/wehubfusion/Icarus`,
-  not even for tests. The job contract constants are copied into `jobs`, with golden tests.
+- **Nothing else from Icarus.** The platform packages import no other Icarus package, not even
+  in tests, so a service links only what it uses. The job contract constants are copied into
+  `jobs`, with golden tests.
 - **No environment variables.** The library reads none: every setting (stream and subject names,
   timeouts, queue sizes, entry principals) is an option the service passes from its own config.
-- **A short dependency list.** `go.mod` may require directly only the modules listed in
+- **A short dependency list.** The packages import only from the modules listed in
   `module_test.go`; `nats-server` and `testify` stay in tests.
-- **Nothing sensitive.** The module is public through the Go module proxy, so it holds no
+- **Nothing sensitive.** Icarus is public through the Go module proxy, so it holds no
   secrets, hostnames or environment values. Services pass their own service token through
   `jobs.TokenSource`.
 - **No stream ownership.** Neither the audit emitter nor the jobs coordinator creates or updates
@@ -97,6 +100,5 @@ external services.
 
 ## Releases
 
-Tag a release as `platform/vX.Y.Z` on the commit to release, for example `platform/v0.1.0`. The
-`platform/` prefix is what Go uses to find a nested module's versions. Record each release in
-`CHANGELOG.md`.
+The packages are released with the rest of Icarus, on its `vX.Y.Z` tags; record changes in the
+root `CHANGELOG.md`. `platform/CHANGELOG.md` keeps the history of the two nested-module versions.

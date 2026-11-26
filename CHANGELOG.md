@@ -25,13 +25,20 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
   event, including the old `Message: ... Error: ...` format of earlier Icarus versions. It imports
   only sentry-go. See `pkg/sentryscrub/README.md`.
 
-### Added: the platform module
+### Changed: the platform packages are part of this module
 
-- `public:` A nested module, `github.com/wehubfusion/Icarus/platform`, released on its own
-  `platform/vX.Y.Z` tags, holds the library WeHub services use to publish audit events and to
-  create and update Iris jobs. It never requires the root module, so nothing changes for runners
-  or for services pinned to an Icarus SDK version. See `platform/README.md` and
-  `platform/CHANGELOG.md`.
+- `public:` `github.com/wehubfusion/Icarus/platform/...`, the library WeHub services use to
+  publish audit events and to create and update Iris jobs, is part of the root module and
+  released on its `vX.Y.Z` tags, from v0.40.0. It was a nested module with its own tags,
+  `platform/v0.1.0` and `platform/v0.2.0`; those stay published, and no further `platform/` tags
+  are made. A service that required `github.com/wehubfusion/Icarus/platform` drops that
+  requirement when it moves to v0.40.0: with both, the build fails with "ambiguous import". The
+  import paths are unchanged. See `platform/README.md`, and `platform/CHANGELOG.md` for the two
+  nested versions.
+- `internal:` The platform packages still import nothing else from Icarus, and only from the
+  modules `platform/module_test.go` allows.
+- `internal:` `google.golang.org/protobuf` v1.36.11, the version the platform packages were
+  built and tested with.
 
 ### Added: HTTP Client signs in with OAuth2
 

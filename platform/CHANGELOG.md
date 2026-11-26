@@ -1,9 +1,10 @@
 # Changelog
 
-All notable changes to the platform module (`github.com/wehubfusion/Icarus/platform`) are
-documented here. Releases are tagged `platform/vX.Y.Z`.
+The two versions of `github.com/wehubfusion/Icarus/platform` released as a nested module, on
+`platform/vX.Y.Z` tags. From Icarus v0.40.0 the packages are part of the root module, released on
+its `vX.Y.Z` tags, and their changes are recorded in the root `CHANGELOG.md`.
 
-## [Unreleased]
+## [0.2.0] — 2026-11-26
 
 ### Added
 
