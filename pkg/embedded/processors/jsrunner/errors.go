@@ -13,7 +13,8 @@ import (
 // maxExceptionMessageRunes bounds the exception message a script error carries. The message is
 // the script's own text, and a script can put the item's values in it (`throw new Error("no ward
 // for " + input.nhsNumber)`, or a runtime message quoting a value); the error becomes node output,
-// log text, a span attribute and a Sentry event. 120 runes (counted with the type prefix) keeps a
+// log text and a span attribute. (Not Sentry text: NewInternalError sends Sentry only the code, and
+// sentryscrub.Scrub removes error text from every event.) 120 runes (counted with the type prefix) keeps a
 // typical engine message such as "TypeError: Cannot read property 'x' of undefined" whole while
 // cutting long dumps of data. It does not stop a short value from appearing: a script that puts
 // data in what it throws still leaks that data.

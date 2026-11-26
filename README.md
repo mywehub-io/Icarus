@@ -38,6 +38,12 @@ services rather than runners: it publishes audit events and creates and updates 
 never requires this root module, so adopting it does not move a service's Icarus SDK pin, and it
 is released on its own `platform/vX.Y.Z` tags. See [platform/README.md](platform/README.md).
 
+## Sentry
+
+`pkg/sentryscrub` keeps message content out of Sentry: services pass `sentryscrub.ClientOptions`
+to `sentry.Init`, and its `BeforeSend` hook removes error text, requests, users, breadcrumbs and
+extra data from every event. See [pkg/sentryscrub/README.md](pkg/sentryscrub/README.md).
+
 ## Quick Start
 
 ### 1. Connect to NATS
